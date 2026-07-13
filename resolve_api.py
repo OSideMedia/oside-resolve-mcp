@@ -147,6 +147,10 @@ def build_timeline(project, media_pool, name: str, video_items: list, markers: l
     ]
     if name in existing:
         raise ResolveError(f"A timeline named {name!r} already exists — pick another name.")
+    # a timeline is created in the CURRENT bin — after imports that's VO, so
+    # file it where it belongs: the template's TIMELINES bin (root fallback)
+    home = find_bin(media_pool, "TIMELINES") or media_pool.GetRootFolder()
+    media_pool.SetCurrentFolder(home)
     timeline = media_pool.CreateEmptyTimeline(name)
     if timeline is None:
         raise ResolveError(f"CreateEmptyTimeline failed for {name!r}.")
