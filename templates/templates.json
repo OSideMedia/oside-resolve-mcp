@@ -1,0 +1,10 @@
+{
+  "cinematic": {
+    "resolveProject": "YT-4K- 23.976FPS",
+    "drp": "YT-4K-23.976FPS.drp"
+  },
+  "explainer": {
+    "resolveProject": "YT-4K -60FPS",
+    "drp": "YT-4K-60FPS.drp"
+  }
+}
