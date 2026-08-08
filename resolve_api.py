@@ -168,12 +168,54 @@ def build_timeline(project, media_pool, name: str, video_items: list, markers: l
     return timeline
 
 
-def append_audio(media_pool, timeline, audio_items: list) -> bool:
-    """Lay VO at the head of the timeline (A1). Falls back to a plain append —
-    the clip still arrives, just not at 00:00 — and reports which happened."""
-    placed_at_head = True
-    start = timeline.GetStartFrame()
-    for item in audio_items:
+def video_start_frames(timeline, video_items: list) -> dict:
+    """Where each appended clip actually LANDED on V1: {clip name -> recordFrame}.
+
+    The caller already has the media-pool items in append order and Resolve
+    lays them in that same order, so zipping the track items back against them
+    is the same correspondence the marker loop above relies on.
+
+    Exists so shot-attached audio can sit UNDER its clip instead of stacking at
+    00:00. Keyed by the media-pool item's own name (which is the filename), so
+    the caller can look up by manifest basename.
+    """
+    track_items = timeline.GetItemListInTrack("video", 1) or []
+    frames = {}
+    for pool_item, track_item in zip(video_items, track_items):
+        try:
+            frames[pool_item.GetName()] = int(track_item.GetStart())
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return frames
+
+
+def append_audio(media_pool, timeline, placements: list) -> dict:
+    """Lay each VO clip on A1 — UNDER ITS OWN SHOT when the package says which
+    shot it belongs to, at the head otherwise.
+
+    placements: [{"item": mediaPoolItem, "recordFrame": int | None, "label": str}]
+      recordFrame None  -> the head of the timeline (a board-wide VO, or a pin
+                           whose shot has no clip in this package).
+
+    WHY THIS EXISTS. OSIDE's DaVinci export pins narration takes to individual
+    shots and writes `manifest.audio[].placements` naming the owning scene, shot
+    and clip file. This end used to ignore all of that and stamp every clip at
+    `timeline.GetStartFrame()`, so a board with four shot-attached takes handed
+    the editor four clips piled on top of each other at 00:00 — the files were
+    right, the timeline was not, and the only fix was dragging each one by hand
+    [council 2026-08-07].
+
+    Returns a report rather than a bool: with per-shot placement there are now
+    three outcomes worth telling the editor apart — placed under its shot,
+    parked at the head, or appended loose because Resolve refused the frame.
+    """
+    start = int(timeline.GetStartFrame())
+    report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": []}
+
+    for p in placements:
+        item = p["item"]
+        target = p.get("recordFrame")
+        at_head = target is None
         frames = item.GetClipProperty("Frames")
         try:
             end = int(frames) if frames else None
@@ -183,12 +225,19 @@ def append_audio(media_pool, timeline, audio_items: list) -> bool:
             "mediaPoolItem": item,
             "trackIndex": 1,
             "mediaType": 2,  # audio-only
-            "recordFrame": int(start),
+            "recordFrame": start if at_head else int(target),
         }
         if end:
             clip_info.update({"startFrame": 0, "endFrame": end - 1})
-        if not media_pool.AppendToTimeline([clip_info]):
-            placed_at_head = False
-            if not media_pool.AppendToTimeline([item]):
-                raise ResolveError(f"Could not add VO clip {item.GetName()!r} to the timeline.")
-    return placed_at_head
+        if media_pool.AppendToTimeline([clip_info]):
+            report["atHead" if at_head else "underShot"] += 1
+            continue
+        # Resolve refused the exact frame (an occupied slot on A1 is the usual
+        # cause). The clip still has to ARRIVE — a silent drop is the one
+        # outcome worse than a misplaced clip.
+        if not media_pool.AppendToTimeline([item]):
+            raise ResolveError(f"Could not add VO clip {item.GetName()!r} to the timeline.")
+        report["loose"] += 1
+        report["looseLabels"].append(p.get("label") or item.GetName())
+
+    return report

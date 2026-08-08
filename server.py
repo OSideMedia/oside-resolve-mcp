@@ -176,7 +176,9 @@ def import_package(manifest_path: str) -> dict:
 def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01") -> dict:
     """Build a NEW timeline in the currently open project: the package's clips
     in manifest (shot) order on V1, one marker per shot carrying its number +
-    description, and any VO laid at the head of A1. Run import_package first."""
+    description, and each VO clip on A1 UNDER THE SHOT it is pinned to (a
+    board-wide VO, or a pin whose shot has no clip here, still goes to the
+    head). Run import_package first."""
     try:
         manifest, _base = _load_manifest(manifest_path)
         resolve = rapi.connect()
@@ -209,29 +211,55 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01") -> dict:
 
         timeline = rapi.build_timeline(project, media_pool, timeline_name, items, markers)
 
+        # WHERE EACH VO CLIP GOES. OSIDE pins narration takes to individual
+        # shots and writes `audio[].placements` naming the owning scene, shot
+        # and the videos[] file it sits against. Resolve it to a real timeline
+        # frame so the take lands UNDER its shot; anything unplaceable (a
+        # board-wide VO with no placements, or a pin whose shot has no clip in
+        # this package) still goes to the head, as before [council 2026-08-07].
         audio_entries = manifest.get("audio") or []
-        vo_at_head = True
+        frames_by_clip = rapi.video_start_frames(timeline, items)
+        vo_report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": []}
         vo_count = 0
         if audio_entries:
             vo_bin = rapi.find_bin(media_pool, audio_entries[0].get("bin") or "VO")
-            vo_items = []
+            placements = []
             if vo_bin:
                 by_vo_name = rapi.clips_by_filename(vo_bin)
-                vo_items = [
-                    by_vo_name[os.path.basename(a["file"])]
-                    for a in audio_entries
-                    if os.path.basename(a["file"]) in by_vo_name
-                ]
-            vo_count = len(vo_items)
-            if vo_items:
-                vo_at_head = rapi.append_audio(media_pool, timeline, vo_items)
+                for a in audio_entries:
+                    item = by_vo_name.get(os.path.basename(a["file"]))
+                    if item is None:
+                        continue
+                    # One narration can be pinned to SEVERAL shots. The file is
+                    # imported once; lay it once per shot it belongs to.
+                    targets = [
+                        frames_by_clip.get(os.path.basename(p["videoFile"]))
+                        for p in (a.get("placements") or [])
+                        if p.get("videoFile")
+                    ]
+                    targets = [f for f in targets if f is not None]
+                    if targets:
+                        for f in targets:
+                            placements.append(
+                                {"item": item, "recordFrame": f, "label": a.get("label")}
+                            )
+                    else:
+                        placements.append(
+                            {"item": item, "recordFrame": None, "label": a.get("label")}
+                        )
+            vo_count = len(placements)
+            if placements:
+                vo_report = rapi.append_audio(media_pool, timeline, placements)
 
         return _ok(
             timeline=timeline_name,
             clips=len(items),
             markers=len(markers),
             voClips=vo_count,
-            voAtHead=vo_at_head,
+            voUnderShot=vo_report["underShot"],
+            voAtHead=vo_report["atHead"],
+            voLoose=vo_report["loose"],
+            voLooseLabels=vo_report["looseLabels"],
         )
     except Exception as e:  # noqa: BLE001
         return _err(e)
