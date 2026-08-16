@@ -1,0 +1,4 @@
+Scene,Shot,Speaker,Line,Est s,File,Audio,Outcome
+THE DINER,2,Ada,"Two coffees, please.",1.0,videos/scene01_shot2.mp4,vo/vo02_scene01-shot2_ada.mp3,pending
+THE DINER,2,Ben,Make mine black.,1.0,videos/scene01_shot2.mp4,vo/vo02_scene01-shot2_ada.mp3,pending
+THE STREET,1,Ben,"I never liked this town, Ada.",2.0,videos/scene02_shot1.mp4,,approved

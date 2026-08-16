@@ -21,6 +21,18 @@ RESOLVE_MODULES = (
 )
 RESOLVE_APP = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
 
+# Marker vocabulary. Shot markers stay Blue points (the 2026-07 contract);
+# dialogue cues are RANGE markers in any other Resolve colour, one colour per
+# speaker. Both carry a customData tag so verify_import can tell them apart
+# without leaning on colour.
+SHOT_MARKER_COLOR = "Blue"
+SHOT_TAG = "oside:shot"
+CUE_TAG = "oside:cue"
+CUE_MARKER_COLORS = (
+    "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia", "Rose",
+    "Lavender", "Sky", "Mint", "Lemon", "Sand", "Cocoa", "Cream",
+)
+
 
 class ResolveError(RuntimeError):
     pass
@@ -158,14 +170,100 @@ def build_timeline(project, media_pool, name: str, video_items: list, markers: l
     if video_items:
         if not media_pool.AppendToTimeline(video_items):
             raise ResolveError("AppendToTimeline failed for the video clips.")
-    # markers ride the timeline start of each appended clip
+    # markers ride the timeline start of each appended clip. Tagged through
+    # customData so verify_import can tell a shot marker from a cue marker by
+    # something firmer than its colour.
     timeline = project.GetCurrentTimeline()
     start = timeline.GetStartFrame()
     track_items = timeline.GetItemListInTrack("video", 1) or []
     for item, marker in zip(track_items, markers):
         frame = int(item.GetStart()) - int(start)
-        timeline.AddMarker(frame, "Blue", marker["name"], marker.get("note", ""), 1)
+        timeline.AddMarker(frame, SHOT_MARKER_COLOR, marker["name"], marker.get("note", ""), 1, SHOT_TAG)
     return timeline
+
+
+def add_range_markers(timeline, rows: list[dict]) -> dict:
+    """Range markers for dialogue cues — one per scripted line, under its shot.
+
+    rows: [{"frame": int, "duration": int, "color": str, "name": str, "note": str}]
+      frame is TIMELINE-RELATIVE (0 = the timeline's first frame), the same
+      reference the shot markers use.
+
+    Resolve keys markers by frame — one marker per frame, and AddMarker simply
+    answers False when the slot is taken. A cue whose computed frame is already
+    occupied (a long line running past its clip into the next shot's Blue
+    marker, or a colliding cue) is nudged forward a few frames before it is
+    given up on; a skipped cue is REPORTED, never silently dropped.
+    """
+    # ponytail: 4-frame nudge window; a proper free-slot search if cue-dense boards need it
+    placed, skipped = 0, []
+    for r in rows:
+        frame = r.get("frame")
+        if frame is None:
+            skipped.append({"name": r["name"], "reason": "no frame (shot has no clip on V1)"})
+            continue
+        ok = False
+        for bump in range(0, 4):
+            if timeline.AddMarker(int(frame) + bump, r["color"], r["name"], r.get("note", ""), max(1, int(r.get("duration") or 1)), CUE_TAG):
+                ok = True
+                break
+        if ok:
+            placed += 1
+        else:
+            skipped.append({"name": r["name"], "frame": frame, "reason": "AddMarker refused (frame occupied)"})
+    return {"placed": placed, "skipped": skipped}
+
+
+def timeline_by_name(project, name: str | None):
+    """The named timeline (or the current one when name is None) WITHOUT
+    switching the current timeline — verify_import must not move the editor."""
+    if name is None:
+        return project.GetCurrentTimeline()
+    for i in range(project.GetTimelineCount()):
+        tl = project.GetTimelineByIndex(i + 1)
+        if tl is not None and tl.GetName() == name:
+            return tl
+    return None
+
+
+def observe_timeline(timeline) -> dict:
+    """Read a timeline into plain data (timeline-relative frames) so the verify
+    checks are pure functions of the manifest + this dict, testable without
+    Resolve."""
+    start = int(timeline.GetStartFrame())
+
+    def items(track_type: str, index: int) -> list[dict]:
+        out = []
+        for it in timeline.GetItemListInTrack(track_type, index) or []:
+            try:
+                out.append({
+                    "name": it.GetName(),
+                    "start": int(it.GetStart()) - start,
+                    "duration": int(it.GetDuration()),
+                })
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return out
+
+    markers = {}
+    for frame, m in (timeline.GetMarkers() or {}).items():
+        markers[int(frame)] = {
+            "color": m.get("color"),
+            "name": m.get("name"),
+            "note": m.get("note"),
+            "duration": m.get("duration"),
+            "customData": m.get("customData") or "",
+        }
+    return {"name": timeline.GetName(), "v1": items("video", 1), "a1": items("audio", 1), "markers": markers}
+
+
+def clip_duration_frames(item) -> int | None:
+    """A media-pool item's length in frames, or None when Resolve won't say."""
+    try:
+        frames = item.GetClipProperty("Frames")
+        return int(frames) if frames else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def video_start_frames(timeline, video_items: list) -> dict:
@@ -216,11 +314,7 @@ def append_audio(media_pool, timeline, placements: list) -> dict:
         item = p["item"]
         target = p.get("recordFrame")
         at_head = target is None
-        frames = item.GetClipProperty("Frames")
-        try:
-            end = int(frames) if frames else None
-        except (TypeError, ValueError):
-            end = None
+        end = clip_duration_frames(item)
         clip_info = {
             "mediaPoolItem": item,
             "trackIndex": 1,

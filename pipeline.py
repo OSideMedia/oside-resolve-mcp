@@ -2,10 +2,15 @@
 # pipeline.py — the whole handoff as ONE command (no agent required):
 #
 #   .venv/bin/python pipeline.py <manifest.json> [--name NAME] [--timeline NAME]
+#                                                [--dry-run] [--no-cues]
 #
 # launch Resolve (if closed) → create project from the manifest's kind
 # template → import into bins → build the timeline → verify. Prints a JSON
-# report to stdout; exit 0 only when every step succeeded AND verify is clean.
+# report to stdout; exit 0 only when every step succeeded AND verify PASSES.
+#
+# --dry-run touches nothing (and never launches Resolve): it prints the
+# build plan for the package — clip order, VO placement, markers, what is
+# missing — and exits 0 only when the plan says it would build.
 #
 # This is what the studio's "Build in Resolve" button spawns; the MCP tools in
 # server.py expose the same steps individually for agent-driven sessions.
@@ -23,7 +28,10 @@ def main() -> int:
     ap.add_argument("manifest", help="path to the package's manifest.json")
     ap.add_argument("--name", help="Resolve project name (default: the board name)")
     ap.add_argument("--timeline", default="EDIT 01", help="timeline name (default: EDIT 01)")
+    ap.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
+    ap.add_argument("--no-cues", action="store_true", help="skip dialogue-cue range markers")
     args = ap.parse_args()
+    cues = not args.no_cues
 
     report = {"ok": False, "steps": {}}
 
@@ -45,16 +53,27 @@ def main() -> int:
     report["project"] = name
     report["kind"] = kind
 
+    if args.dry_run:
+        plan = server.build_timeline(args.manifest, args.timeline, dry_run=True, cues=cues)
+        report["dryRun"] = True
+        report["ok"] = bool(step("plan", plan) and plan.get("wouldBuild"))
+        if plan.get("ok") and not plan.get("wouldBuild"):
+            report["error"] = f"plan: {len(plan.get('missing') or [])} package file(s) missing — see steps.plan.missing"
+        print(json.dumps(report))
+        return 0 if report["ok"] else 1
+
     done = (
         step("launch", server.launch_resolve())
         and step("create", server.create_project(kind, name))
         and step("import", server.import_package(args.manifest))
-        and step("timeline", server.build_timeline(args.manifest, args.timeline))
-        and step("verify", server.verify_import(args.manifest))
+        and step("timeline", server.build_timeline(args.manifest, args.timeline, cues=cues))
+        and step("verify", server.verify_import(args.manifest, args.timeline, cues=cues))
     )
-    clean = bool(report["steps"].get("verify", {}).get("clean"))
+    verify = report["steps"].get("verify", {})
+    clean = verify.get("overall") == "PASS"
     if done and not clean:
-        report["error"] = "verify: package and project do not match"
+        failed = [c["check"] for c in verify.get("checks", []) if not c.get("pass")]
+        report["error"] = "verify FAIL: " + (", ".join(failed) or "package and project do not match")
     report["ok"] = done and clean
     print(json.dumps(report))
     return 0 if report["ok"] else 1

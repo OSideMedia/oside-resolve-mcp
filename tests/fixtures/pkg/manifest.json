@@ -1,0 +1,21 @@
+{
+  "format": "oside-davinci/v1",
+  "kind": "cinematic",
+  "suggestedTemplate": "YT-4K- 23.976FPS",
+  "project": { "id": "00000000-0000-0000-0000-000000000000", "name": "FIXTURE BOARD" },
+  "exportedAt": "2026-08-16T00:00:00.000Z",
+  "videos": [
+    { "file": "videos/scene01_shot1A.mp4", "bin": "VIDEOS", "sceneIndex": 1, "sceneName": "THE DINER", "shotIndex": 1, "shotNumber": "1A", "shotName": "Wide", "description": "Ada enters the diner.", "generationId": "g1", "outcome": "approved", "tcStart": null, "tcEnd": null, "vo": null },
+    { "file": "videos/scene01_shot2.mp4", "bin": "VIDEOS", "sceneIndex": 1, "sceneName": "THE DINER", "shotIndex": 2, "shotNumber": "2", "shotName": "Two-shot", "description": "Ada and Ben at the counter.", "generationId": "g2", "outcome": "pending", "tcStart": null, "tcEnd": null, "vo": null },
+    { "file": "videos/scene02_shot1.mp4", "bin": "VIDEOS", "sceneIndex": 2, "sceneName": "THE STREET", "shotIndex": 1, "shotNumber": "1", "shotName": "Exterior", "description": "Ben crosses the street.", "generationId": "g3", "outcome": "approved", "tcStart": null, "tcEnd": null, "vo": null }
+  ],
+  "audio": [
+    { "file": "vo/vo01_narrator.mp3", "bin": "VO", "label": "Narrator", "narrationId": "n1", "durationSeconds": 12.0, "placements": [] },
+    { "file": "vo/vo02_scene01-shot2_ada.mp3", "bin": "VO", "label": "Ada", "narrationId": "n2", "durationSeconds": 3.1,
+      "placements": [ { "sceneIndex": 1, "sceneName": "THE DINER", "shotIndex": 2, "shotNumber": "2", "videoFile": "videos/scene01_shot2.mp4" } ] },
+    { "file": "vo/vo03_scene02-shot9_ben.mp3", "bin": "VO", "label": "Ben", "narrationId": "n3", "durationSeconds": 2.0,
+      "placements": [ { "sceneIndex": 2, "sceneName": "THE STREET", "shotIndex": 9, "shotNumber": "9", "videoFile": null } ] }
+  ],
+  "csv": "shotlist.csv",
+  "cues": "dialogue-cues.csv"
+}
