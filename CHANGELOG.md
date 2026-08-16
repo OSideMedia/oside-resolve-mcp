@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0 — 2026-08-16
+
+**"Look travels"** — the film's starting balance rides into Resolve.
+
+- New tool `apply_look(manifest_path, timeline_name=None, dry_run=False)`:
+  when the manifest carries a `look` block (OSIDE writes one from the project's
+  Style Constant — colour-law hexes + words + derived L*/b*/C* targets), it
+  reads the `look-cdl.json` Depth Converter measured beside the manifest
+  (`depthc look-compare --manifest --emit-cdl`) and sets each clip's ASC CDL on
+  node 1 of its V1 item. Key, temperature, saturation only — never palette
+  content, never a creative grade. Idempotent; refuses (and says why) without a
+  look block or CDL file; per-clip rows + `missing` + `extra`; `dry_run` plan.
+- Capability feature `look` in `resolve_status().capabilities.features`; recipe
+  step 3b in the `handoff` prompt (never blocks the gate).
+- Live-proved 2026-08-16 (Resolve Studio, throwaway project deleted after):
+  8 clips, 8/8 applied, re-run idempotent; the render re-scored by Depth
+  Converter went from ΔL* −7…+9.5 to ±0.4 and Δb* to ±1.7 against the look with
+  palette distance unchanged (9.9 → 9.6) — which is the whole promise.
+- Pure half (`handoff.load_look_cdl`, `plan_look`, `cdl_payload`) offline-
+  tested; 24 tests.
+
 ## 0.2.1 — 2026-08-16
 
 **VO on its own track** — Resolve's `AppendToTimeline` returns truthy on a
