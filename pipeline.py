@@ -33,7 +33,10 @@ def main() -> int:
     args = ap.parse_args()
     cues = not args.no_cues
 
-    report = {"ok": False, "steps": {}}
+    # The capability block rides at the top level too: OSIDE's Build-in-Resolve
+    # dialog reads report.features to warn about an older MCP (v0.2.0 handshake).
+    caps = server.capabilities()
+    report = {"ok": False, "steps": {}, "capabilities": caps, "features": caps["features"]}
 
     def step(key: str, result: dict) -> bool:
         report["steps"][key] = result
