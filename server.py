@@ -465,6 +465,55 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
         return _err(e)
 
 
+@mcp.tool(annotations=IDEMPOTENT_WRITE)
+def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bool = False) -> dict:
+    """"Look travels": put the film's starting balance on every clip. Reads the
+    manifest's `look` block and the `look-cdl.json` Depth Converter measured
+    beside it (`depthc look-compare --manifest --emit-cdl`), and sets that
+    clip's ASC CDL on NODE 1 of each V1 item (slope/offset/power/saturation —
+    key, temperature, saturation only; never palette content, never a
+    creative grade). Idempotent: absolute values, a re-run resets node 1 to
+    the same CDL. Refuses — applies nothing — when the manifest has no look
+    block or the CDL file is missing/unreadable. `dry_run=True` returns the
+    plan without touching Resolve. Returns per-clip rows {clip, shot, applied,
+    identity, cdl}, `missing` (manifest clips it could not grade), `extra` (V1
+    items the manifest does not know — untouched). Resolve exposes no CDL
+    getter, so `applied` is what SetCDL returned, not a read-back."""
+    try:
+        manifest, base = _load_manifest(manifest_path)
+        cdl_doc, why = handoff.load_look_cdl(manifest, base)
+        if cdl_doc is None:
+            return _ok(applied=0, refused=True, reason=why, rows=[], missing=[], extra=[])
+        if dry_run:
+            names = [{"name": _basename_of(v["file"])} for v in manifest.get("videos") or []]
+            plan = handoff.plan_look(manifest, cdl_doc, names)
+            return _ok(dryRun=True, look=manifest["look"].get("name"), rows=plan["rows"], missing=plan["missing"], extra=plan["extra"])
+        resolve = rapi.connect()
+        _pm, project = _open_project(resolve)
+        timeline = rapi.timeline_by_name(project, timeline_name)
+        if timeline is None:
+            raise rapi.ResolveError("No timeline — run build_timeline first.")
+        items = timeline.GetItemListInTrack("video", 1) or []
+        v1 = [{"name": it.GetName()} for it in items]
+        plan = handoff.plan_look(manifest, cdl_doc, v1)
+        by_name = {it.GetName(): it for it in items}
+        rows = []
+        for r in plan["rows"]:
+            it = by_name[r["clip"]]
+            ok = bool(it.SetCDL(r["set"]))
+            rows.append({"clip": r["clip"], "shot": r["shot"], "applied": ok, "identity": r["identity"], "cdl": r["cdl"], "measured": r["measured"]})
+        applied = sum(1 for r in rows if r["applied"])
+        return _ok(look=manifest["look"].get("name"), applied=applied, of=len(rows), rows=rows,
+                   missing=plan["missing"], extra=plan["extra"],
+                   note="node 1 CDL = starting balance (key/temperature/saturation). Not a read-back: Resolve has no CDL getter.")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+def _basename_of(rel: str) -> str:
+    return os.path.basename(rel)
+
+
 @mcp.prompt(name="handoff", description="The OSIDE → Resolve handoff recipe, step by step.")
 def handoff_prompt(manifest_path: str = "<package>/manifest.json") -> str:
     """The four-step handoff, in the order the tools expect it."""
@@ -483,6 +532,10 @@ def handoff_prompt(manifest_path: str = "<package>/manifest.json") -> str:
         f"build_timeline({manifest_path!r}) for real. A NEW timeline: clips in shot order on V1, one Blue "
         "marker per shot, each pinned VO under its shot on its OWN audio track named VO (never A1 — the "
         "shot clips' embedded audio fills it), dialogue cues as range markers.\n"
+        f"3b. (when the manifest carries a `look` block) apply_look({manifest_path!r}) — the film's starting "
+        "balance on node 1 of every V1 clip, from the look-cdl.json Depth Converter measured beside the "
+        "manifest (`depthc look-compare --manifest --emit-cdl`). Key, temperature, saturation only — never "
+        "a palette fix, never a creative grade. If it `refused`, say why and move on; it never blocks the gate.\n"
         f"4. verify_import({manifest_path!r}) — the gate. Report `overall` first (PASS or FAIL) and quote "
         "the failing rows of `checks` verbatim; a FAIL is a FAIL, name the delta.\n\n"
         "Never render, never delete, never overwrite; name any partial project left behind."

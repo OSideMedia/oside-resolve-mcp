@@ -618,7 +618,7 @@ def test_tool_annotations_prompt_and_capabilities():
     assert body.index("dry_run=True") < body.index("create_project(kind, name)")
     caps = server.capabilities()
     assert caps["manifest"] == "oside-davinci/v1"
-    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track"]
+    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -795,6 +795,79 @@ def test_dry_run_before_create_is_unknown_not_missing():
         assert project.GetTimelineCount() == 0
     finally:
         restore()
+
+
+
+# ---------------------------------------------------------------------------
+# "look travels" — apply_look's pure half (load_look_cdl / plan_look / cdl_payload)
+# ---------------------------------------------------------------------------
+
+def _look_pkg(tmpdir: str, with_look=True, with_cdl=True, schema="oside-look-cdl/1"):
+    manifest = {
+        "format": "oside-davinci/v1", "kind": "cinematic",
+        "videos": [
+            {"file": "videos/scene01_shot1A.mp4", "sceneIndex": 1, "shotNumber": "1A"},
+            {"file": "videos/scene01_shot2A.mp4", "sceneIndex": 1, "shotNumber": "2A"},
+            {"file": "videos/scene01_shot3A.mp4", "sceneIndex": 1, "shotNumber": "3A"},
+        ],
+    }
+    if with_look:
+        manifest["look"] = {"schema": "oside-look/1", "name": "Test look", "hex": ["#3d4245", "#847262", "#c6ab91"]}
+    if with_cdl:
+        doc = {"schema": schema, "look": "Test look", "clips": [
+            {"file": "videos/scene01_shot1A.mp4", "identity": False, "measured": {"luma": 12.0},
+             "cdl": {"slope": [1, 1, 1], "offset": [-0.0878, -0.0572, -0.0267], "power": [1, 1, 1], "saturation": 0.806}},
+            {"file": "videos/scene01_shot2A.mp4", "identity": True, "measured": {"luma": 0.1},
+             "cdl": {"slope": [1, 1, 1], "offset": [0, 0, 0], "power": [1, 1, 1], "saturation": 1.0}},
+            {"file": "videos/scene01_shot3A.mp4", "error": "unreadable"},
+        ]}
+        with open(os.path.join(tmpdir, "look-cdl.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+    return manifest
+
+
+def test_look_refuses_without_block_or_cdl_file():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        m = _look_pkg(d, with_look=False)
+        doc, why = handoff.load_look_cdl(m, d)
+        assert doc is None and "no `look` block" in why
+    with tempfile.TemporaryDirectory() as d:
+        m = _look_pkg(d, with_look=True, with_cdl=False)
+        doc, why = handoff.load_look_cdl(m, d)
+        assert doc is None and "look-cdl.json is missing" in why and "--emit-cdl" in why
+    with tempfile.TemporaryDirectory() as d:
+        m = _look_pkg(d, schema="oside-look-cdl/9")
+        doc, why = handoff.load_look_cdl(m, d)
+        assert doc is None and "schema" in why
+
+
+def test_look_plan_matches_by_clip_name_and_reports_missing_and_extra():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        m = _look_pkg(d)
+        doc, why = handoff.load_look_cdl(m, d)
+        assert doc and why is None
+        v1 = [{"name": "scene01_shot1A.mp4"}, {"name": "scene01_shot2A.mp4"}, {"name": "stray.mov"}]
+        plan = handoff.plan_look(m, doc, v1)
+        assert [r["clip"] for r in plan["rows"]] == ["scene01_shot1A.mp4", "scene01_shot2A.mp4"]
+        assert plan["rows"][0]["identity"] is False and plan["rows"][1]["identity"] is True
+        assert plan["rows"][0]["shot"] == "scene 1 shot 1A"
+        assert plan["missing"] == [{"clip": "scene01_shot3A.mp4", "why": "no CDL for this clip in look-cdl.json (measured file missing or unreadable)"}]
+        assert plan["extra"] == ["stray.mov"]
+        # 3A present on V1 but with no CDL is still 'missing', never graded blind
+        plan2 = handoff.plan_look(m, doc, v1 + [{"name": "scene01_shot3A.mp4"}])
+        assert any(x["clip"] == "scene01_shot3A.mp4" for x in plan2["missing"])
+
+
+def test_cdl_payload_is_the_setcdl_shape():
+    p = handoff.cdl_payload({"slope": [1, 1, 1], "offset": [-0.0878, -0.0572, -0.0267], "power": [1, 1, 1], "saturation": 0.806})
+    assert p == {"NodeIndex": "1", "Slope": "1.0000 1.0000 1.0000", "Offset": "-0.0878 -0.0572 -0.0267",
+                 "Power": "1.0000 1.0000 1.0000", "Saturation": "0.806"}
+
+
+def test_capabilities_advertise_look():
+    assert "look" in server.capabilities()["features"]
 
 
 if __name__ == "__main__":

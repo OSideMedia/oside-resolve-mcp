@@ -35,6 +35,20 @@ project:
    Only when NAME is the open project do the bins count. Every VO placement in
    a real build is confirmed by re-reading the VO track — Resolve's
    `AppendToTimeline` answers a truthy list on a silent drop.
+3b. `apply_look(manifest_path, timeline_name=None, dry_run=False)` — **"look
+   travels"** (0.3.0). When the manifest carries a `look` block (the studio
+   project had a Style Constant with colour-law hexes), reads the
+   `look-cdl.json` Depth Converter measured beside it (`depthc look-compare
+   --manifest <manifest.json> --emit-cdl`) and sets each clip's ASC CDL on
+   **node 1** of its V1 item — key, temperature, saturation only. A matched
+   starting balance for the colourist; **never a palette fix, never a creative
+   grade** (measured live 2026-08-16: 8 clips went from ΔL* −7…+9.5 to ±0.4
+   against the look, palette distance unchanged). Idempotent (absolute
+   values). Refuses — applies nothing — without a look block or the CDL file,
+   and says why. Returns per-clip rows `{clip, shot, applied, identity, cdl,
+   measured}`, `missing`, `extra` (V1 items the manifest does not know stay
+   untouched). Resolve has no CDL getter, so `applied` is SetCDL's answer,
+   not a read-back. `dry_run=True` returns the plan without touching Resolve.
 4. `verify_import(manifest_path, timeline_name=None, cues=True)` — the
    acceptance gate: a per-check table `checks: [{check, expected, found,
    pass, …}]` and `overall: PASS|FAIL`. Checks: every package file in its bin;
@@ -120,6 +134,8 @@ Claude: resolve_status()                          ← preconditions + capabiliti
         create_project("cinematic", "MY FILM")   ← or explainer
         import_package("/Volumes/.../manifest.json")
         build_timeline("/Volumes/.../manifest.json")   ← V1 + VO track + markers
+        (depthc look-compare --manifest /Volumes/.../manifest.json --emit-cdl)   ← Depth Converter, when the manifest has a look
+        apply_look("/Volumes/.../manifest.json")       ← node-1 CDL per clip: starting balance, key/temp/sat only
         verify_import("/Volumes/.../manifest.json")    ← overall PASS|FAIL, VO rows name their track
 ```
 

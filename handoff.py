@@ -15,6 +15,7 @@
 # ============================================================================
 
 import csv
+import json
 import os
 import shutil
 import subprocess
@@ -22,7 +23,7 @@ import subprocess
 from resolve_api import CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, VO_TRACK_NAME
 
 MANIFEST_FORMAT = "oside-davinci/v1"
-FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track"]
+FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look"]
 
 # The template a kind maps to fixes the timeline rate. templates/templates.json
 # carries each template's `fps` (server reads it); this is the last-resort
@@ -454,3 +455,84 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
 
     overall = "PASS" if all(c["pass"] for c in checks) else "FAIL"
     return {"checks": checks, "overall": overall, "report": report}
+
+
+# ---------------------------------------------------------------------------
+# "look travels" (2026-08-16) — the look block + the per-clip CDL file
+# ---------------------------------------------------------------------------
+
+LOOK_CDL_FILE = "look-cdl.json"
+LOOK_CDL_SCHEMA = "oside-look-cdl/1"
+
+
+def _fmt3(v) -> str:
+    return " ".join(f"{float(x):.4f}" for x in v)
+
+
+def cdl_payload(cdl: dict, node: int = 1) -> dict:
+    """An ASC CDL dict {slope,offset,power,saturation} → the SetCDL argument
+    Resolve's scripting API takes (strings, node index as a string)."""
+    return {
+        "NodeIndex": str(node),
+        "Slope": _fmt3(cdl["slope"]),
+        "Offset": _fmt3(cdl["offset"]),
+        "Power": _fmt3(cdl["power"]),
+        "Saturation": f"{float(cdl['saturation']):.3f}",
+    }
+
+
+def load_look_cdl(manifest: dict, base: str) -> tuple[dict | None, str | None]:
+    """The per-clip CDL file Depth Converter writes beside the manifest
+    (`depthc look-compare --manifest --emit-cdl`). Returns (doc, reason):
+    no `look` block → (None, why); file missing → (None, why); wrong schema →
+    (None, why). The reason is the sentence the tool refuses with — a look that
+    cannot be applied honestly is not applied at all."""
+    if not manifest.get("look"):
+        return None, "manifest carries no `look` block — the studio project had no Style Constant with hexes; nothing to apply"
+    path = os.path.join(base, LOOK_CDL_FILE)
+    if not os.path.isfile(path):
+        return None, (f"{LOOK_CDL_FILE} is missing beside the manifest — run "
+                      "`depthc look-compare --manifest <manifest.json> --emit-cdl` first (Depth Converter measures each clip; this tool only applies)")
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"{LOOK_CDL_FILE} unreadable: {e}"
+    if doc.get("schema") != LOOK_CDL_SCHEMA:
+        return None, f"{LOOK_CDL_FILE} schema {doc.get('schema')!r} is not {LOOK_CDL_SCHEMA}"
+    return doc, None
+
+
+def plan_look(manifest: dict, cdl_doc: dict, v1_items: list[dict]) -> dict:
+    """Decide, from the manifest + the CDL file + the observed V1 items, what
+    apply_look will do — offline-testable. Rows match by clip NAME (the file's
+    basename, which is what Resolve names an imported clip). Returns
+    {rows, missing, extra}: rows carry the CDL to set per timeline item;
+    `missing` = manifest clips with no CDL or not on V1; `extra` = V1 items
+    the manifest does not know (left untouched, never graded)."""
+    by_file = {}
+    for c in cdl_doc.get("clips") or []:
+        if c.get("cdl"):
+            by_file[_basename(c["file"])] = c
+    on_v1 = {it["name"]: it for it in v1_items}
+    rows, missing = [], []
+    for v in manifest.get("videos") or []:
+        name = _basename(v["file"])
+        c = by_file.get(name)
+        if c is None:
+            missing.append({"clip": name, "why": "no CDL for this clip in look-cdl.json (measured file missing or unreadable)"})
+            continue
+        if name not in on_v1:
+            missing.append({"clip": name, "why": "not on V1 of the timeline"})
+            continue
+        rows.append({
+            "clip": name,
+            "shot": display_name(manifest, v),
+            "identity": bool(c.get("identity")),
+            "measured": c.get("measured") or {},
+            "cdl": c["cdl"],
+            "set": cdl_payload(c["cdl"]),
+        })
+    known = {_basename(v["file"]) for v in manifest.get("videos") or []}
+    extra = [n for n in on_v1 if n not in known]
+    return {"rows": rows, "missing": missing, "extra": extra}
