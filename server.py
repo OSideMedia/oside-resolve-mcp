@@ -59,6 +59,19 @@ def _templates() -> dict:
         return json.load(f)
 
 
+def _template_fps(manifest: dict) -> float:
+    """The timeline rate the manifest's kind will get — from templates.json
+    (`fps` per template), the kind default when the file cannot be read. This
+    is what a dry run reports when the target project is not the open one:
+    the CURRENT project's rate says nothing about a project not built yet."""
+    kind = manifest.get("kind") or "cinematic"
+    try:
+        fps = _templates().get(kind, {}).get("fps")
+        return float(fps) if fps else handoff.kind_fps(manifest)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return handoff.kind_fps(manifest)
+
+
 def _load_manifest(manifest_path: str) -> tuple[dict, str]:
     if not os.path.isfile(manifest_path):
         raise rapi.ResolveError(f"Manifest not found: {manifest_path}")
@@ -218,51 +231,25 @@ def import_package(manifest_path: str) -> dict:
         return _err(e)
 
 
-def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool) -> tuple[dict, list, dict]:
-    """The plan for this package: from the media pool when Resolve answers,
-    from the manifest + disk alone when it does not. Returns (plan, cues, ctx)
-    where ctx carries the live objects for the real build (empty offline)."""
+def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool,
+          project_name: str | None = None) -> tuple[dict, list, dict]:
+    """The plan for this package: from the media pool when Resolve answers
+    AND the open project is the one being planned for, from the manifest +
+    disk alone otherwise. Returns (plan, cues, ctx) where ctx carries the
+    live objects for the real build (empty offline / when the target project
+    is not the open one).
+
+    project_name: the project the plan is FOR. When it is not the open project
+    (typically: not created yet — pipeline.py's dry run happens before
+    create_project) bin presence is reported unknown, never missing, and the
+    fps comes from the kind's template rather than whatever project happens
+    to be open."""
     cues, cue_warning = handoff.load_cues(manifest, base) if cues_on else ([], None)
     ctx: dict = {}
-    try:
-        resolve = rapi.connect()
-        _pm, project = _open_project(resolve)
-        media_pool = project.GetMediaPool()
-        videos = manifest.get("videos") or []
-        audio = manifest.get("audio") or []
-        video_bin = rapi.find_bin(media_pool, (videos[0].get("bin") if videos else None) or "VIDEOS")
-        vo_bin = rapi.find_bin(media_pool, (audio[0].get("bin") if audio else None) or "VO")
-        by_name = {
-            "videos": rapi.clips_by_filename(video_bin) if video_bin else {},
-            "audio": rapi.clips_by_filename(vo_bin) if vo_bin else {},
-        }
-        try:
-            fps = float(project.GetSetting("timelineFrameRate"))
-            fps_source = "resolve"
-        except (TypeError, ValueError):
-            fps, fps_source = handoff.kind_fps(manifest), "kind-default"
-        ctx = {"resolve": resolve, "project": project, "media_pool": media_pool, "by_name": by_name}
+    target: dict | None = None
+    bin_unknown = handoff.BIN_UNKNOWN_OFFLINE
 
-        def bin_lookup(kind, fname):
-            return fname in by_name[kind]
-
-        def duration_lookup(_v, abs_path):
-            item = by_name["videos"].get(os.path.basename(abs_path))
-            frames = rapi.clip_duration_frames(item) if item is not None else None
-            if frames is not None:
-                return frames, "resolve"
-            secs = handoff.probe_duration_seconds(abs_path)
-            return handoff.seconds_to_frames(secs, fps), ("ffprobe" if secs is not None else "unknown")
-
-        connected = True
-    except rapi.ResolveError as e:
-        fps, fps_source = handoff.kind_fps(manifest), "kind-default"
-        connected = False
-        ctx = {"error": str(e)}
-
-        def bin_lookup(_kind, _fname):
-            return None
-
+    def offline_duration_lookup(fps):
         def duration_lookup(v, abs_path):
             secs = handoff.probe_duration_seconds(abs_path)
             if secs is not None:
@@ -270,38 +257,102 @@ def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool) -> tuple
             if v.get("tcStart") is not None and v.get("tcEnd") is not None:
                 return handoff.seconds_to_frames(float(v["tcEnd"]) - float(v["tcStart"]), fps), "beat"
             return None, "unknown"
+        return duration_lookup
+
+    def no_bin_lookup(_kind, _fname):
+        return None
+
+    try:
+        resolve = rapi.connect()
+        pm = rapi.project_manager(resolve)
+        project = pm.GetCurrentProject()
+        current_name = project.GetName() if project is not None else None
+        connected = True
+        if project_name is not None and current_name != project_name:
+            exists = project_name in rapi.project_names(pm)
+            target = {"name": project_name, "exists": exists, "current": False}
+            bin_unknown = handoff.BIN_UNKNOWN_NOT_OPEN if exists else handoff.BIN_UNKNOWN_NOT_IMPORTED
+            fps, fps_source = _template_fps(manifest), "template"
+            bin_lookup, duration_lookup = no_bin_lookup, offline_duration_lookup(fps)
+            ctx = {"error": f"Target project {project_name!r} is not the open project "
+                            f"({'exists but not open' if exists else 'not created yet'})."}
+        else:
+            if project is None:
+                raise rapi.ResolveError("No project is open — run create_project first.")
+            if project_name is not None:
+                target = {"name": project_name, "exists": True, "current": True}
+            media_pool = project.GetMediaPool()
+            videos = manifest.get("videos") or []
+            audio = manifest.get("audio") or []
+            video_bin = rapi.find_bin(media_pool, (videos[0].get("bin") if videos else None) or "VIDEOS")
+            vo_bin = rapi.find_bin(media_pool, (audio[0].get("bin") if audio else None) or "VO")
+            by_name = {
+                "videos": rapi.clips_by_filename(video_bin) if video_bin else {},
+                "audio": rapi.clips_by_filename(vo_bin) if vo_bin else {},
+            }
+            try:
+                fps = float(project.GetSetting("timelineFrameRate"))
+                fps_source = "resolve"
+            except (TypeError, ValueError):
+                fps, fps_source = _template_fps(manifest), "template"
+            ctx = {"resolve": resolve, "project": project, "media_pool": media_pool, "by_name": by_name}
+
+            def bin_lookup(kind, fname):
+                return fname in by_name[kind]
+
+            def duration_lookup(_v, abs_path):
+                item = by_name["videos"].get(os.path.basename(abs_path))
+                frames = rapi.clip_duration_frames(item) if item is not None else None
+                if frames is not None:
+                    return frames, "resolve"
+                secs = handoff.probe_duration_seconds(abs_path)
+                return handoff.seconds_to_frames(secs, fps), ("ffprobe" if secs is not None else "unknown")
+
+    except rapi.ResolveError as e:
+        fps, fps_source = _template_fps(manifest), "template"
+        connected = False
+        ctx = {"error": str(e)}
+        bin_lookup, duration_lookup = no_bin_lookup, offline_duration_lookup(fps)
 
     plan = handoff.plan_timeline(
-        manifest, base, timeline_name, cues, fps, fps_source, connected, bin_lookup, duration_lookup
+        manifest, base, timeline_name, cues, fps, fps_source, connected, bin_lookup, duration_lookup,
+        bin_unknown=bin_unknown, target_project=target,
     )
     plan["cuesEnabled"] = cues_on
     plan["cuesFile"] = manifest.get("cues") if cues_on else None
     if cue_warning:
         plan["cueWarning"] = cue_warning
-    if not connected:
+    if "project" not in ctx:
         plan["resolveError"] = ctx.get("error")
     return plan, cues, ctx
 
 
 @mcp.tool(annotations=CREATES)
 def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
-                   dry_run: bool = False, cues: bool = True) -> dict:
+                   dry_run: bool = False, cues: bool = True,
+                   project: str | None = None) -> dict:
     """Build a NEW timeline in the currently open project: the package's clips
     in manifest (shot) order on V1, one Blue marker per shot carrying its
-    number + description, each VO clip on A1 UNDER THE SHOT it is pinned to
-    (a board-wide VO, or a pin whose shot has no clip here, still goes to the
-    head), and — when the manifest names a dialogue-cues file and `cues` is
-    on — one RANGE marker per scripted line under its shot (name = speaker,
-    note = the line, colour per speaker). Run import_package first.
+    number + description, each VO clip on ITS OWN audio track named "VO" (added
+    to the timeline; never A1, which the shot clips' embedded audio fills)
+    UNDER THE SHOT it is pinned to (a board-wide VO, or a pin whose shot has no
+    clip here, still goes to the head), and — when the manifest names a
+    dialogue-cues file and `cues` is on — one RANGE marker per scripted line
+    under its shot (name = speaker, note = the line, colour per speaker). Every
+    VO placement is confirmed by re-reading the VO track, not by Resolve's
+    return value. Run import_package first.
 
     dry_run=True touches nothing: it returns the full plan (clip order with
-    on-disk / in-bin presence, VO placement per take, shot + cue markers, a
-    `missing` list and `wouldBuild`) in the same shape the real build reports,
-    so the two can be diffed. Works without Resolve running (bin presence is
-    then reported as unknown)."""
+    on-disk / in-bin presence, VO placement per take with `track: "VO"`, shot +
+    cue markers, a `missing` list and `wouldBuild`) in the same shape the real
+    build reports, so the two can be diffed. Works without Resolve running (bin
+    presence is then reported as unknown). `project` names the project the plan
+    is FOR: when it is not the open one (not created yet), bin presence is
+    "unknown — not imported yet" (never missing), `wouldBuild` is judged on
+    disk presence and fps comes from the kind's template."""
     try:
         manifest, base = _load_manifest(manifest_path)
-        plan, cue_list, ctx = _plan(manifest, base, timeline_name, cues)
+        plan, cue_list, ctx = _plan(manifest, base, timeline_name, cues, project)
         if dry_run:
             return _ok(dryRun=True, **handoff.summarize(plan), wouldBuild=plan["wouldBuild"],
                        missing=plan["missing"], plan=plan)
@@ -344,7 +395,7 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
         vo_on_disk = {os.path.basename(r["file"]): r["onDisk"] for r in plan["vo"]}
         vo_in_bin = {os.path.basename(r["file"]): r["inBin"] for r in plan["vo"]}
         plan["vo"] = handoff.vo_rows(manifest, landed, set(landed), vo_on_disk, vo_in_bin)
-        vo_report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": []}
+        vo_report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": [], "track": None, "trackName": None}
         placements = []
         for r in plan["vo"]:
             item = by_name["audio"].get(os.path.basename(r["file"]))
@@ -353,7 +404,13 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             record = None if r["mode"] == "atHead" else tl_start + int(r["startFrame"])
             placements.append({"item": item, "recordFrame": record, "label": r.get("label")})
         if placements:
-            vo_report = rapi.append_audio(media_pool, timeline, placements)
+            # narration gets its own track — A1 is already full of the shot
+            # clips' embedded audio, and Resolve answers truthy on a silent drop
+            vo_track = rapi.ensure_vo_track(timeline)
+            vo_report = rapi.append_audio(media_pool, timeline, placements, vo_track)
+            for r in plan["vo"]:
+                r["track"] = vo_report["trackName"]
+                r["trackIndex"] = vo_report["track"]
 
         plan["cueMarkers"] = handoff.cue_rows(manifest, cue_list, landed, lengths, plan["fps"])
         cue_report = rapi.add_range_markers(timeline, plan["cueMarkers"]) if plan["cueMarkers"] else {"placed": 0, "skipped": []}
@@ -365,6 +422,8 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             voAtHead=vo_report["atHead"],
             voLoose=vo_report["loose"],
             voLooseLabels=vo_report["looseLabels"],
+            voTrack=vo_report["trackName"],
+            voTrackIndex=vo_report["track"],
             cueMarkers=cue_report["placed"],
             cueMarkersSkipped=cue_report["skipped"],
         )
@@ -380,7 +439,8 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
     returns a per-check table `checks: [{check, expected, found, pass, ...}]`
     plus `overall: PASS|FAIL`: every package file in its bin; V1 clip count,
     order (by clip name) and no strays; every pinned VO take on its shot's
-    first frame (0-frame tolerance, delta reported) and unpinned VO at the
+    first frame (0-frame tolerance, delta reported; looked for on EVERY audio
+    track, the row names the track it sits on) and unpinned VO at the
     head; one shot marker per shot, each on its shot's first frame; cue
     markers == scripted lines (0 when `cues` is off). `timeline_name` picks a
     timeline without switching to it (default: the current one). The old
@@ -413,13 +473,16 @@ def handoff_prompt(manifest_path: str = "<package>/manifest.json") -> str:
         "0. Preconditions: call resolve_status. Resolve STUDIO must be running with "
         "Preferences → System → General → External scripting = Local (launch_resolve opens it). "
         "Compare resolve_status.capabilities.features with what the package needs.\n"
-        f"1. create_project(kind, name) — kind is manifest.kind ('cinematic' → 23.976 fps template, "
+        f"1. build_timeline({manifest_path!r}, dry_run=True, project=name) — the plan BEFORE anything is "
+        "created: clip order, VO placement, markers, missing. With the target project not created yet, "
+        "bin presence reads 'unknown — not imported yet' (that is not missing) and wouldBuild is judged "
+        "on disk presence; fps comes from the kind's template.\n"
+        f"2. create_project(kind, name) — kind is manifest.kind ('cinematic' → 23.976 fps template, "
         f"'explainer' → 60 fps). An existing project name is refused: choose another, never overwrite.\n"
-        f"2. import_package({manifest_path!r}) — clips into the VIDEOS bin, narration into VO.\n"
-        f"3. build_timeline({manifest_path!r}, dry_run=True) first and read the plan (clip order, VO "
-        "placement, markers, missing); then build_timeline(...) for real. A NEW timeline: clips in shot "
-        "order on V1, one Blue marker per shot, each pinned VO under its shot on A1, dialogue cues as "
-        "range markers.\n"
+        f"3. import_package({manifest_path!r}) — clips into the VIDEOS bin, narration into VO. Then "
+        f"build_timeline({manifest_path!r}) for real. A NEW timeline: clips in shot order on V1, one Blue "
+        "marker per shot, each pinned VO under its shot on its OWN audio track named VO (never A1 — the "
+        "shot clips' embedded audio fills it), dialogue cues as range markers.\n"
         f"4. verify_import({manifest_path!r}) — the gate. Report `overall` first (PASS or FAIL) and quote "
         "the failing rows of `checks` verbatim; a FAIL is a FAIL, name the delta.\n\n"
         "Never render, never delete, never overwrite; name any partial project left behind."

@@ -11,33 +11,45 @@ project:
 2. `import_package(manifest_path)` — videos into the VIDEOS bin, narration
    mp3s into the VO bin.
 3. `build_timeline(manifest_path, timeline_name="EDIT 01", dry_run=False,
-   cues=True)` — clips in shot order on V1, one Blue point marker per shot
-   carrying its number + description (+ VO line for explainers), each pinned
-   VO take on A1 under its own shot (unpinned VO at the head), and — when the
+   cues=True, project=None)` — clips in shot order on V1, one Blue point
+   marker per shot carrying its number + description (+ VO line for
+   explainers), each pinned VO take under its own shot **on its own audio
+   track named `VO`** (added to the timeline — never A1, which the shot clips'
+   embedded audio fills; unpinned VO at the head of that track), and — when the
    manifest names a `dialogue-cues.csv` — one **range marker per scripted
    line** under its shot: name = speaker, note = the line, length = the line's
    estimate (the shot's length when a cue has none), one colour per speaker
    (deterministic per project, never Blue). `cues=False` skips them.
    **`dry_run=True` touches nothing** and returns the full plan — ordered clip
    list with on-disk / in-bin presence, VO placement per take (`underShot` /
-   `atHead`, target shot, start frame), shot + cue markers, a `missing` list
-   and `wouldBuild` — in the same shape the real call reports (`plan` on
-   both), so the two can be diffed. It works with Resolve closed (bin presence
-   is then `"unknown — Resolve not connected"`; clip lengths come from
-   `ffprobe` when it is on PATH, or an explainer's beat timing).
+   `atHead`, target shot, start frame, `track: "VO"`), shot + cue markers, a
+   `missing` list and `wouldBuild` — in the same shape the real call reports
+   (`plan` on both), so the two can be diffed. It works with Resolve closed
+   (bin presence is then `"unknown — Resolve not connected"`; clip lengths
+   come from `ffprobe` when it is on PATH, or an explainer's beat timing).
+   `project=NAME` makes the plan **project-aware**: when NAME is not the open
+   project (the usual case — the dry run comes before `create_project`), bin
+   presence reads `"unknown — not imported yet"` (never `missing`),
+   `wouldBuild` is judged on disk presence, and `fps` comes from the kind's
+   template (`templates.json`), not from whatever project happens to be open.
+   Only when NAME is the open project do the bins count. Every VO placement in
+   a real build is confirmed by re-reading the VO track — Resolve's
+   `AppendToTimeline` answers a truthy list on a silent drop.
 4. `verify_import(manifest_path, timeline_name=None, cues=True)` — the
    acceptance gate: a per-check table `checks: [{check, expected, found,
    pass, …}]` and `overall: PASS|FAIL`. Checks: every package file in its bin;
    V1 clip count; V1 clip order == manifest order (by clip name); no stray V1
    clips; every **pinned** VO take on its shot's first frame (tolerance 0,
-   `delta` reported; unpinned takes pass on presence, since two head takes
-   cannot share frame 0 on A1); one shot marker per shot, each on its shot's
+   `delta` reported; looked for on **every** audio track, and each VO row
+   names the `track` it sits on, e.g. `"A2 VO"`; unpinned takes pass on
+   presence, since two head takes cannot share frame 0); one shot marker per
+   shot, each on its shot's
    first frame; cue markers == scripted lines (0 when `cues=False`). The
    pre-v2 `clean` + `report` fields stay (`clean` now means overall PASS).
 
 Plus `resolve_status` (with a `capabilities` block — `{"manifest":
-"oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2"],
-"version"}` — returned even when Resolve is unreachable, so OSIDE can compare
+"oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2",
+"vo_track"], "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
 before it relies on a feature), `launch_resolve`, `list_templates`, and
 `export_template(kind)` (snapshot a live template project to `templates/`).
 One MCP prompt, `handoff`, carries the recipe below. Every tool declares MCP
@@ -50,7 +62,12 @@ pre-0.2 timeline still counts as a shot marker.
 
 `pipeline.py <manifest.json> [--name] [--timeline] [--dry-run] [--no-cues]`
 runs the whole thing as one command (what the studio's **Build in Resolve**
-button spawns); `--dry-run` prints the plan and never launches Resolve.
+button spawns); `--dry-run` prints the plan and never launches Resolve. The
+dry run is planned for the target project **by name** (`--name`, or the
+manifest's project name): before that project exists, bins read `unknown —
+not imported yet`, `wouldBuild` is judged on disk and fps comes from the
+kind's template — Resolve being open on some other project no longer turns
+every file into `missing where:"bin"`.
 
 ## Self-test
 
@@ -60,7 +77,12 @@ button spawns); `--dry-run` prints the plan and never launches Resolve.
 ```
 
 Drives the dry run against `tests/fixtures/pkg` (a fixture package with empty
-media files) and the whole build → verify path against a fake Resolve.
+media files) and the whole build → verify path against a fake Resolve. The
+fake reproduces two behaviours measured on Resolve 21.0.4.5: a video clip
+with embedded audio also fills A1, and a clip-info append aimed at an
+occupied frame answers a truthy `[<PyRemoteObject>]` while placing nothing.
+`OSIDE_RESOLVE_OFFLINE=1` (set by the test module) keeps the offline cases
+offline even with a real Resolve running.
 
 This is deliberately NOT general Resolve remote control —
 [samuelgursky/davinci-resolve-mcp](https://github.com/samuelgursky/davinci-resolve-mcp)
@@ -91,11 +113,14 @@ project → Export Project → save into `templates/` with the names in
 ```
 Studio: board → DaVinci → attach VO → Export package (to the working drive)
 Claude: resolve_status()                          ← preconditions + capabilities
+        build_timeline("/Volumes/.../manifest.json", dry_run=True, project="MY FILM")
+                                                  ← the plan BEFORE anything exists:
+                                                    bins "unknown — not imported yet",
+                                                    wouldBuild on disk, fps from template
         create_project("cinematic", "MY FILM")   ← or explainer
         import_package("/Volumes/.../manifest.json")
-        build_timeline("/Volumes/.../manifest.json", dry_run=True)   ← read the plan
-        build_timeline("/Volumes/.../manifest.json")
-        verify_import("/Volumes/.../manifest.json")                 ← overall PASS|FAIL
+        build_timeline("/Volumes/.../manifest.json")   ← V1 + VO track + markers
+        verify_import("/Volumes/.../manifest.json")    ← overall PASS|FAIL, VO rows name their track
 ```
 
 ## Guardrails
@@ -125,6 +150,9 @@ appear in the tool's `error` field.
 | `Imported but could not open 'X'.` | the project imported but `LoadProject` failed — usually a modal in Resolve | dismiss the dialog, then open the project by hand or rerun with a new name |
 | `A timeline named 'X' already exists — pick another name.` | same guardrail, timeline level | pass a different `timeline_name` |
 | `No project is open — run create_project first.` | `import_package` / `build_timeline` / `verify_import` need the target project open | `create_project` first, or open it in Resolve |
+| `AddTrack('audio') failed — could not create the VO track.` / `… the track count did not grow.` | Resolve refused to add the narration's own audio track to the new timeline | check the timeline is not locked / a modal is not open; retry with a new `timeline_name` |
+| `Could not add VO clip 'X' to the timeline (track N): Resolve placed nothing at the pinned frame or at the track tail.` | the VO track was re-read after both attempts and the take is not there — this server never counts a placement it cannot see | check the VO clip opens in Resolve; retry with a new `timeline_name` |
+| `Target project 'X' is not the open project (…).` | a **real** `build_timeline(…, project=X)` while some other project is open — the build is refused rather than laid into the wrong project | open X (or `create_project` it), or drop `project` to build into the open one |
 | `Clips not in the media pool (run import_package first): …` | the timeline build reads clips from the VIDEOS bin and they are not there | run `import_package`; a `build_timeline(dry_run=True)` shows exactly which are missing |
 | `Package file missing on disk: …` | a file the manifest names is gone (drive not mounted, package moved) | mount the drive / restore the package; export again from the studio |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |
