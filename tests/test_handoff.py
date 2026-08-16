@@ -18,6 +18,9 @@ import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+# the offline cases must stay offline even when a real Resolve is running on
+# this machine (the fake-Resolve cases patch rapi.connect and are unaffected)
+os.environ["OSIDE_RESOLVE_OFFLINE"] = "1"
 
 import handoff  # noqa: E402
 import resolve_api as rapi  # noqa: E402
@@ -49,9 +52,12 @@ class FakeItem:
 
 
 class FakeTimeline:
-    def __init__(self, name="EDIT 01", start=86400, v1=(), a1=(), markers=None):
+    def __init__(self, name="EDIT 01", start=86400, v1=(), a1=(), markers=None, audio_tracks=1):
         self._name, self._start = name, start
         self._tracks = {("video", 1): list(v1), ("audio", 1): list(a1)}
+        for i in range(2, audio_tracks + 1):
+            self._tracks[("audio", i)] = []
+        self._names = {}
         self._markers = dict(markers or {})
 
     def GetName(self):
@@ -59,6 +65,23 @@ class FakeTimeline:
 
     def GetStartFrame(self):
         return self._start
+
+    def GetTrackCount(self, kind):
+        return sum(1 for k, _ in self._tracks if k == kind)
+
+    def AddTrack(self, kind, *_):
+        idx = self.GetTrackCount(kind) + 1
+        self._tracks[(kind, idx)] = []
+        return True
+
+    def SetTrackName(self, kind, idx, name):
+        if (kind, idx) not in self._tracks:
+            return False
+        self._names[(kind, idx)] = name
+        return True
+
+    def GetTrackName(self, kind, idx):
+        return self._names.get((kind, idx), f"{'Audio' if kind == 'audio' else 'Video'} {idx}")
 
     def GetItemListInTrack(self, kind, index):
         return self._tracks.get((kind, index), [])
@@ -73,16 +96,37 @@ class FakeTimeline:
         return True
 
 
+def _tc(frames, fps):
+    base = int(round(fps))
+    s_, f = divmod(int(frames), base)
+    m, s_ = divmod(s_, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s_:02d}:{f:02d}"
+
+
 class FakeClip:
-    """A media-pool item: name = filename, Frames = length."""
-    def __init__(self, name, frames):
-        self._n, self._f = name, frames
+    """A media-pool item: name = filename. Video clips answer `Frames` and
+    (Seedance 2.x default) carry EMBEDDED AUDIO; audio clips answer '' for
+    Frames and only a `Duration` timecode at `FPS` — exactly what Resolve
+    21.0.4 hands back [live walk 2026-08-16]."""
+    def __init__(self, name, frames, fps=24.0, embedded_audio=None):
+        self._n, self._f, self._fps = name, frames, fps
+        self._audio_only = name.endswith((".mp3", ".wav"))
+        self._embedded = (not self._audio_only) if embedded_audio is None else embedded_audio
 
     def GetName(self):
         return self._n
 
     def GetClipProperty(self, key):
-        return str(self._f) if key == "Frames" else None
+        if key == "Frames":
+            return "" if self._audio_only else str(self._f)
+        if key == "Duration":
+            return _tc(self._f, self._fps)
+        if key == "FPS":
+            return self._fps
+        if key == "Type":
+            return "Audio" if self._audio_only else ("Video + Audio" if self._embedded else "Video")
+        return None
 
 
 class FakeFolder:
@@ -99,10 +143,21 @@ class FakeFolder:
         return self._subs
 
 
+class _RemoteObject:
+    """Stands in for the `<PyRemoteObject>` Resolve returns from AppendToTimeline."""
+
+
 class FakeMediaPool:
     """Enough of MediaPool for build_timeline: bins, CreateEmptyTimeline and
     AppendToTimeline in both of its shapes (a list of items, or clip-info dicts
-    with an explicit recordFrame)."""
+    with an explicit recordFrame + trackIndex).
+
+    Two Resolve behaviours reproduced on purpose, both measured live on
+    21.0.4.5 (2026-08-16):
+      * appending a video clip with embedded audio ALSO fills A1;
+      * a clip-info append aimed at an OCCUPIED frame answers a truthy
+        `[<PyRemoteObject>]` and places NOTHING (never False).
+    """
     def __init__(self, project, root):
         self._project, self._root, self._current = project, root, root
 
@@ -120,27 +175,42 @@ class FakeMediaPool:
 
     def AppendToTimeline(self, items):
         tl = self._project.GetCurrentTimeline()
+        out = []
         for it in items:
             if isinstance(it, dict):
                 clip = it["mediaPoolItem"]
-                track = ("audio", 1) if it.get("mediaType") == 2 else ("video", 1)
+                kind = "audio" if it.get("mediaType") == 2 else "video"
+                track = (kind, int(it.get("trackIndex") or 1))
                 start = it["recordFrame"]
-                length = (it["endFrame"] - it["startFrame"] + 1) if "endFrame" in it else int(clip.GetClipProperty("Frames"))
-                if any(x.GetStart() == start for x in tl._tracks[track]):
-                    return False  # occupied slot — the case append_audio calls "loose"
-                tl._tracks[track].append(FakeItem(clip.GetName(), start, length))
+                if "endFrame" in it:
+                    length = it["endFrame"] - it["startFrame"]  # endFrame exclusive, as Resolve does it
+                else:
+                    length = rapi.clip_duration_frames(clip)
+                lane = tl._tracks.setdefault(track, [])
+                if any(x.GetStart() == start for x in lane):
+                    out.append(_RemoteObject())   # truthy — and nothing placed
+                    continue
+                item = FakeItem(clip.GetName(), start, length)
+                lane.append(item)
+                out.append(item)
             else:
                 # a plain append lands at the tail of the track its media type owns
-                track = ("audio", 1) if it.GetName().endswith(".mp3") else ("video", 1)
+                audio_only = it.GetClipProperty("Type") == "Audio"
+                track = ("audio", 1) if audio_only else ("video", 1)
                 lane = tl._tracks[track]
                 end = max((x.GetStart() + x.GetDuration() for x in lane), default=tl.GetStartFrame())
-                lane.append(FakeItem(it.GetName(), end, int(it.GetClipProperty("Frames"))))
-        return True
+                length = rapi.clip_duration_frames(it)
+                item = FakeItem(it.GetName(), end, length)
+                lane.append(item)
+                out.append(item)
+                if not audio_only and it.GetClipProperty("Type") == "Video + Audio":
+                    tl._tracks[("audio", 1)].append(FakeItem(it.GetName(), end, length))
+        return out
 
 
 class FakeProject:
-    def __init__(self, media_pool_factory, fps="23.976"):
-        self._timelines, self._current, self._fps = [], None, fps
+    def __init__(self, media_pool_factory, fps="23.976", name="FIXTURE"):
+        self._timelines, self._current, self._fps, self._name = [], None, fps, name
         self._pool = media_pool_factory(self)
 
     def GetMediaPool(self):
@@ -163,21 +233,29 @@ class FakeProject:
         return self._current
 
     def GetName(self):
-        return "FIXTURE"
+        return self._name
 
 
-def _fake_resolve(monkeypatch_target=server, videos_frames=(120, 96, 200), audio_frames=(288, 74, 48)):
+def _fake_resolve(monkeypatch_target=server, videos_frames=(120, 96, 200), audio_frames=(288, 74, 48),
+                  project_name="FIXTURE", with_bins=True, projects=None):
     """Wire server/rapi to a fake Resolve holding the fixture's clips in
-    VIDEOS / VO bins. Returns (project, restore_fn)."""
+    VIDEOS / VO bins (or an empty pool with with_bins=False). Returns
+    (project, restore_fn)."""
     manifest, _ = _fixture()
     vclips = [FakeClip(os.path.basename(v["file"]), f) for v, f in zip(manifest["videos"], videos_frames)]
     aclips = [FakeClip(os.path.basename(a["file"]), f) for a, f in zip(manifest["audio"], audio_frames)]
-    root = FakeFolder("Master", subs=[FakeFolder("VIDEOS", vclips), FakeFolder("VO", aclips), FakeFolder("TIMELINES")])
-    project = FakeProject(lambda p: FakeMediaPool(p, root))
+    if with_bins:
+        root = FakeFolder("Master", subs=[FakeFolder("VIDEOS", vclips), FakeFolder("VO", aclips), FakeFolder("TIMELINES")])
+    else:
+        root = FakeFolder("Master", subs=[FakeFolder("VIDEOS"), FakeFolder("VO"), FakeFolder("TIMELINES")])
+    project = FakeProject(lambda p: FakeMediaPool(p, root), name=project_name)
 
     class PM:
         def GetCurrentProject(self):
             return project
+
+        def GetProjectListInCurrentFolder(self):
+            return list(projects if projects is not None else [project_name])
 
     class Resolve:
         def GetProjectManager(self):
@@ -218,8 +296,13 @@ def test_real_build_and_verify_against_fake_resolve():
         assert real["clips"] == 3 and real["markers"] == 3
         assert real["voClips"] == 3 and real["voUnderShot"] == 1 and real["voAtHead"] == 1
         # Ben's pin has no clip AND the narrator already sits at the head → the
-        # second head clip finds A1 occupied → laid loose, reported by label
+        # second head clip finds the VO track occupied → laid loose (still on
+        # the VO track, at its tail), reported by label
         assert real["voLoose"] == 1 and real["voLooseLabels"] == ["Ben"]
+        # narration rides its OWN track named VO (A2 on a fresh timeline);
+        # A1 holds the shot clips' embedded audio and nothing else
+        assert real["voTrack"] == "VO" and real["voTrackIndex"] == 2
+        assert all(r["track"] == "VO" and r["trackIndex"] == 2 for r in real["plan"]["vo"])
         assert real["cueMarkers"] == 3 and real["cueMarkersSkipped"] == []
         # dry and real plans agree on the rows that matter
         for key in ("clips", "markers", "vo", "cueMarkers"):
@@ -229,6 +312,11 @@ def test_real_build_and_verify_against_fake_resolve():
 
         tl = project.GetCurrentTimeline()
         assert tl.GetName() == "EDIT 01"
+        assert tl.GetTrackName("audio", 2) == "VO"
+        assert [x.GetName() for x in tl.GetItemListInTrack("audio", 1)] == [
+            "scene01_shot1A.mp4", "scene01_shot2.mp4", "scene02_shot1.mp4"]
+        assert [(x.GetName(), x.GetStart() - 86400, x.GetDuration()) for x in tl.GetItemListInTrack("audio", 2)] == [
+            ("vo01_narrator.mp3", 0, 288), ("vo02_scene01-shot2_ada.mp3", 120, 74), ("vo03_scene02-shot9_ben.mp3", 288, 48)]
         marks = tl.GetMarkers()
         assert {f for f, m in marks.items() if m["customData"] == rapi.SHOT_TAG} == {0, 120, 216}
         assert {f for f, m in marks.items() if m["customData"] == rapi.CUE_TAG} == {121, 145, 217}
@@ -243,13 +331,16 @@ def test_real_build_and_verify_against_fake_resolve():
         assert ver["overall"] == "PASS", [c for c in ver["checks"] if not c["pass"]]
         ben = next(c for c in ver["checks"] if c["check"] == "VO vo03_scene02-shot9_ben.mp3 @ head")
         assert ben["expected"] == 0 and ben["found"] == 288 and ben["delta"] == 288 and ben["pass"]
+        assert ben["track"] == "A2 VO"
+        ada0 = next(c for c in ver["checks"] if c["check"].startswith("VO vo02"))
+        assert ada0["found"] == 120 and ada0["delta"] == 0 and ada0["track"] == "A2 VO"
         assert ver["clean"] is True
         # a PINNED take one frame off is a FAIL — zero tolerance
-        tl.GetItemListInTrack("audio", 1)[1]._s += 1  # Ada's clip
+        tl.GetItemListInTrack("audio", 2)[1]._s += 1  # Ada's clip, on the VO track
         ver2 = server.verify_import(FIXTURE, "EDIT 01")
         ada = next(c for c in ver2["checks"] if c["check"].startswith("VO vo02"))
         assert ver2["overall"] == "FAIL" and ada["delta"] == 1 and not ada["pass"]
-        tl.GetItemListInTrack("audio", 1)[1]._s -= 1
+        tl.GetItemListInTrack("audio", 2)[1]._s -= 1
 
         # a second build under the same name is refused (create-only guardrail)
         again = server.build_timeline(FIXTURE, "EDIT 01")
@@ -295,7 +386,7 @@ def test_dry_run_offline_plan():
     assert res["dryRun"] is True
     plan = res["plan"]
     assert plan["resolveConnected"] is False
-    assert plan["fpsSource"] == "kind-default" and abs(plan["fps"] - 23.976) < 1e-6
+    assert plan["fpsSource"] == "template" and abs(plan["fps"] - 23.976) < 1e-6
     # ordered clip list, shot order, all on disk, bin unknown
     assert [c["file"] for c in plan["clips"]] == [
         "videos/scene01_shot1A.mp4", "videos/scene01_shot2.mp4", "videos/scene02_shot1.mp4"]
@@ -520,11 +611,14 @@ def test_tool_annotations_prompt_and_capabilities():
     assert [p.name for p in prompts] == ["handoff"]
     text = asyncio.run(server.mcp.get_prompt("handoff", {"manifest_path": "/x/manifest.json"}))
     body = text.messages[0].content.text
-    for step in ("create_project", "import_package", "build_timeline", "verify_import", "dry_run"):
+    for step in ("create_project", "import_package", "build_timeline", "verify_import", "dry_run", "project=name",
+                 "not imported yet", "OWN audio track named VO"):
         assert step in body
+    # the dry run comes BEFORE create_project in the recipe
+    assert body.index("dry_run=True") < body.index("create_project(kind, name)")
     caps = server.capabilities()
     assert caps["manifest"] == "oside-davinci/v1"
-    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2"]
+    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -540,6 +634,167 @@ def test_pipeline_dry_run_cli():
     rep = json.loads(out.stdout.strip().splitlines()[-1])
     assert out.returncode == 0 and rep["ok"] and rep["dryRun"] is True
     assert rep["steps"]["plan"]["wouldBuild"] is True
+
+
+def test_vo_lands_on_own_track_when_embedded_audio_fills_a1():
+    """THE 2026-08-16 LIVE DEFECT. Every shot clip carries embedded audio, so
+    appending the video fills A1. The pre-0.2.1 code then asked for
+    trackIndex 1 at an occupied frame; Resolve answered a truthy list and
+    placed NOTHING, and build_timeline reported voUnderShot 1 / voAtHead 1
+    over an empty timeline (verify_v2 caught it: VO rows found:null).
+
+    The fake reproduces both behaviours. On the old code this test goes RED
+    (nothing on any audio track but the embedded audio; the VO rows in
+    verify find null); on the fix it is green: a track named VO is added and
+    every take is on it at its frame, confirmed by re-reading the track."""
+    project, restore = _fake_resolve(audio_frames=(47, 121, 30))
+    try:
+        media_pool = project.GetMediaPool()
+        real = server.build_timeline(FIXTURE, "EDIT 01")
+        assert real["ok"], real
+        tl = project.GetCurrentTimeline()
+        # A1 is full of the shot clips' embedded audio at exactly the shot frames…
+        a1 = [(x.GetName(), x.GetStart() - 86400) for x in tl.GetItemListInTrack("audio", 1)]
+        assert a1 == [("scene01_shot1A.mp4", 0), ("scene01_shot2.mp4", 120), ("scene02_shot1.mp4", 216)]
+        # …which is precisely why an A1 append at 0 or 120 is a silent drop:
+        # truthy answer, nothing placed (the trap the old code fell into)
+        narrator = rapi.clips_by_filename(rapi.find_bin(media_pool, "VO"))["vo01_narrator.mp3"]
+        before = len(tl.GetItemListInTrack("audio", 1))
+        answer = media_pool.AppendToTimeline([{"mediaPoolItem": narrator, "trackIndex": 1, "mediaType": 2, "recordFrame": 86400}])
+        assert bool(answer) is True and len(tl.GetItemListInTrack("audio", 1)) == before
+        # the fix: a VO track exists, named, and holds every take at its frame
+        assert tl.GetTrackCount("audio") == 2 and tl.GetTrackName("audio", 2) == "VO"
+        vo = [(x.GetName(), x.GetStart() - 86400, x.GetDuration()) for x in tl.GetItemListInTrack("audio", 2)]
+        # Ben's pin has no clip → head → frame 0 is the narrator's → laid at
+        # the VO track's tail (241 = Ada's end), still on the VO track
+        assert vo == [("vo01_narrator.mp3", 0, 47), ("vo02_scene01-shot2_ada.mp3", 120, 121),
+                      ("vo03_scene02-shot9_ben.mp3", 241, 30)]
+        assert real["voUnderShot"] == 1 and real["voAtHead"] == 1 and real["voLoose"] == 1
+        assert real["voTrack"] == "VO" and real["voTrackIndex"] == 2
+        # the counts are backed by placements, not by return values: observe
+        # agrees, and the gate finds every VO row on the VO track
+        obs = rapi.observe_timeline(tl)
+        assert [t["name"] for t in obs["audioTracks"]] == ["Audio 1", "VO"]
+        assert obs["a1"] == obs["audioTracks"][0]["items"]
+        ver = server.verify_import(FIXTURE, "EDIT 01")
+        rows = [c for c in ver["checks"] if c["check"].startswith("VO ")]
+        assert len(rows) == 3 and all(c["pass"] and c["track"] == "A2 VO" for c in rows), rows
+        assert ver["overall"] == "PASS", [c for c in ver["checks"] if not c["pass"]]
+        # the dry-run plan says where narration goes: track VO, every row
+        dry = server.build_timeline(FIXTURE, "EDIT 02", dry_run=True)
+        assert dry["plan"]["voTrack"] == "VO" and all(r["track"] == "VO" for r in dry["plan"]["vo"])
+    finally:
+        restore()
+
+
+def test_append_audio_never_trusts_the_return_value():
+    """append_audio judges a placement by re-reading the track. A pool that
+    answers truthy but places nothing at BOTH the pinned frame and the tail
+    is an error, never a counted clip."""
+    class DeafPool:
+        def AppendToTimeline(self, items):
+            return [_RemoteObject()]  # truthy, nothing placed
+    tl = FakeTimeline(audio_tracks=2)
+    tl.SetTrackName("audio", 2, "VO")
+    clip = FakeClip("vo.mp3", 40)
+    try:
+        rapi.append_audio(DeafPool(), tl, [{"item": clip, "recordFrame": 86400, "label": "x"}], 2)
+    except rapi.ResolveError as e:
+        assert "placed nothing" in str(e)
+    else:
+        raise AssertionError("a silent drop was counted as a placement")
+
+
+def test_ensure_vo_track_reuses_named_track_else_adds_one():
+    tl = FakeTimeline(audio_tracks=3)
+    tl.SetTrackName("audio", 3, "VO")
+    assert rapi.ensure_vo_track(tl) == 3 and tl.GetTrackCount("audio") == 3
+    tl2 = FakeTimeline()
+    assert rapi.ensure_vo_track(tl2) == 2 and tl2.GetTrackName("audio", 2) == "VO"
+
+
+def test_clip_duration_frames_reads_audio_timecode():
+    """Audio media-pool items answer '' for Frames — the length comes from the
+    Duration timecode at the clip's FPS (00:00:05:01 @ 23.976 = 121)."""
+    assert rapi.timecode_to_frames("00:00:05:01", 23.976) == 121
+    assert rapi.timecode_to_frames("00:00:01:23", 23.976) == 47
+    assert rapi.timecode_to_frames("00:01:00:00", 60) == 3600
+    assert rapi.timecode_to_frames("garbage", 24) is None
+    assert rapi.clip_duration_frames(FakeClip("vo.mp3", 121, fps=23.976)) == 121
+    assert rapi.clip_duration_frames(FakeClip("v.mp4", 240)) == 240
+
+
+def test_verify_finds_vo_on_any_audio_track_and_names_it():
+    manifest, base = _fixture()
+    v1, _a1, markers = _good_timeline()
+    markers = {f: m for f, m in markers.items() if m["customData"] == rapi.SHOT_TAG}
+    tracks = [
+        {"index": 1, "name": "Audio 1", "items": [{"name": n, "start": s} for n, s in
+                                                  (("scene01_shot1A.mp4", 0), ("scene01_shot2.mp4", 120), ("scene02_shot1.mp4", 216))]},
+        {"index": 2, "name": "VO", "items": [{"name": "vo01_narrator.mp3", "start": 0},
+                                              {"name": "vo02_scene01-shot2_ada.mp3", "start": 120},
+                                              {"name": "vo03_scene02-shot9_ben.mp3", "start": 300}]},
+    ]
+    obs = _observed(v1, [], markers)
+    obs["timeline"]["audioTracks"] = tracks
+    out = handoff.evaluate_verify(manifest, [], obs, cues_expected=False)
+    by = {c["check"]: c for c in out["checks"]}
+    assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
+    assert by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]["track"] == "A2 VO"
+    assert by["VO vo01_narrator.mp3 @ head"]["track"] == "A2 VO"
+    # a VO track that is EMPTY (the live defect) → found null, FAIL, even
+    # though A1 is full of embedded audio
+    tracks[1]["items"] = []
+    out2 = handoff.evaluate_verify(manifest, [], obs, cues_expected=False)
+    by2 = {c["check"]: c for c in out2["checks"]}
+    assert out2["overall"] == "FAIL"
+    assert by2["VO vo01_narrator.mp3 @ head"]["found"] is None and by2["VO vo01_narrator.mp3 @ head"]["track"] is None
+
+
+def test_dry_run_before_create_is_unknown_not_missing():
+    """pipeline.py plans BEFORE create/import. With Resolve open on some OTHER
+    project, planning for a project that does not exist yet must say
+    'unknown — not imported yet' (never missing), judge wouldBuild on disk,
+    and take fps from the kind's template — not the open project's."""
+    project, restore = _fake_resolve(project_name="SOMETHING ELSE", with_bins=False, projects=["SOMETHING ELSE"])
+    project._fps = "60"  # the open project is a 60fps explainer; the fixture is cinematic
+    try:
+        # the pre-fix reading (no project named): the open project IS the target,
+        # its empty bins count → every file 'missing where bin', wouldBuild False
+        naive = server.build_timeline(FIXTURE, "EDIT 01", dry_run=True)
+        assert naive["ok"] and naive["wouldBuild"] is False
+        assert all(m["where"] == "bin" for m in naive["missing"]) and len(naive["missing"]) == 6
+        assert naive["plan"]["fps"] == 60.0 and naive["plan"]["fpsSource"] == "resolve"
+        # project-aware: not created yet
+        aware = server.build_timeline(FIXTURE, "EDIT 01", dry_run=True, project="NEW PROJECT")
+        assert aware["ok"], aware
+        assert aware["wouldBuild"] is True and aware["missing"] == []
+        plan = aware["plan"]
+        assert plan["resolveConnected"] is True
+        assert plan["targetProject"] == {"name": "NEW PROJECT", "exists": False, "current": False}
+        assert all(c["inBin"] == "unknown — not imported yet" for c in plan["clips"])
+        assert all(r["inBin"] == "unknown — not imported yet" for r in plan["vo"])
+        assert plan["fpsSource"] == "template" and abs(plan["fps"] - 23.976) < 1e-6
+        assert all(c["onDisk"] for c in plan["clips"])
+        # exists but not open: still unknown, worded so
+        restore()
+        project, restore = _fake_resolve(project_name="SOMETHING ELSE", with_bins=False,
+                                         projects=["SOMETHING ELSE", "NEW PROJECT"])
+        aware2 = server.build_timeline(FIXTURE, "EDIT 01", dry_run=True, project="NEW PROJECT")
+        assert aware2["plan"]["targetProject"] == {"name": "NEW PROJECT", "exists": True, "current": False}
+        assert all(c["inBin"] == "unknown — target project exists but is not open" for c in aware2["plan"]["clips"])
+        # target IS the open project → the bins count again (here: empty → missing)
+        restore()
+        project, restore = _fake_resolve(project_name="NEW PROJECT", with_bins=False)
+        cur = server.build_timeline(FIXTURE, "EDIT 01", dry_run=True, project="NEW PROJECT")
+        assert cur["plan"]["targetProject"] == {"name": "NEW PROJECT", "exists": True, "current": True}
+        assert cur["wouldBuild"] is False and len(cur["missing"]) == 6
+        # a real build for the wrong project is refused, not run against the open one
+        wrong = server.build_timeline(FIXTURE, "EDIT 01", project="ANOTHER")
+        assert wrong["ok"] is False and "not the open project" in wrong["error"]
+        assert project.GetTimelineCount() == 0
+    finally:
+        restore()
 
 
 if __name__ == "__main__":

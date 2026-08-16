@@ -10,7 +10,12 @@
 #
 # --dry-run touches nothing (and never launches Resolve): it prints the
 # build plan for the package — clip order, VO placement, markers, what is
-# missing — and exits 0 only when the plan says it would build.
+# missing — and exits 0 only when the plan says it would build. The dry run
+# happens BEFORE create/import, so it is planned for the TARGET project by
+# name: until that project exists and is open, bin presence is "unknown — not
+# imported yet" (never missing), wouldBuild is judged on disk presence and the
+# fps comes from the kind's template — not from whatever project happens to
+# be open in Resolve.
 #
 # This is what the studio's "Build in Resolve" button spawns; the MCP tools in
 # server.py expose the same steps individually for agent-driven sessions.
@@ -57,7 +62,7 @@ def main() -> int:
     report["kind"] = kind
 
     if args.dry_run:
-        plan = server.build_timeline(args.manifest, args.timeline, dry_run=True, cues=cues)
+        plan = server.build_timeline(args.manifest, args.timeline, dry_run=True, cues=cues, project=name)
         report["dryRun"] = True
         report["ok"] = bool(step("plan", plan) and plan.get("wouldBuild"))
         if plan.get("ok") and not plan.get("wouldBuild"):

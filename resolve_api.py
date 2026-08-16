@@ -27,6 +27,11 @@ RESOLVE_APP = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
 # without leaning on colour.
 SHOT_MARKER_COLOR = "Blue"
 SHOT_TAG = "oside:shot"
+# Narration lives on ITS OWN audio track. Clips with embedded audio (Seedance
+# 2.x default) fill A1 when the video is appended, and Resolve's
+# AppendToTimeline answers a truthy list for an audio clip aimed at an
+# occupied A1 frame while placing NOTHING [live walk 2026-08-16].
+VO_TRACK_NAME = "VO"
 CUE_TAG = "oside:cue"
 CUE_MARKER_COLORS = (
     "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia", "Rose",
@@ -39,7 +44,12 @@ class ResolveError(RuntimeError):
 
 
 def connect():
-    """Return the Resolve app object, or raise ResolveError with a fix hint."""
+    """Return the Resolve app object, or raise ResolveError with a fix hint.
+    OSIDE_RESOLVE_OFFLINE=1 in the environment makes this raise without
+    looking — the self-test's way of keeping its offline cases offline while a
+    real Resolve is running on the same machine."""
+    if os.environ.get("OSIDE_RESOLVE_OFFLINE"):
+        raise ResolveError("Resolve connection disabled (OSIDE_RESOLVE_OFFLINE is set).")
     if RESOLVE_MODULES not in sys.path:
         sys.path.append(RESOLVE_MODULES)
     os.environ.setdefault("RESOLVE_SCRIPT_API", os.path.dirname(RESOLVE_MODULES))
@@ -226,24 +236,53 @@ def timeline_by_name(project, name: str | None):
     return None
 
 
+def track_items(timeline, track_type: str, index: int, start: int | None = None) -> list[dict]:
+    """The items on one track as plain data, timeline-relative frames."""
+    if start is None:
+        start = int(timeline.GetStartFrame())
+    out = []
+    for it in timeline.GetItemListInTrack(track_type, index) or []:
+        try:
+            out.append({
+                "name": it.GetName(),
+                "start": int(it.GetStart()) - start,
+                "duration": int(it.GetDuration()),
+            })
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return out
+
+
+def track_name(timeline, track_type: str, index: int) -> str:
+    try:
+        return str(timeline.GetTrackName(track_type, index) or "")
+    except (AttributeError, TypeError):
+        return ""
+
+
+def audio_track_count(timeline) -> int:
+    try:
+        return int(timeline.GetTrackCount("audio") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 1
+
+
 def observe_timeline(timeline) -> dict:
     """Read a timeline into plain data (timeline-relative frames) so the verify
     checks are pure functions of the manifest + this dict, testable without
-    Resolve."""
+    Resolve. `audioTracks` lists EVERY audio track (index, name, items) — the
+    VO check reads them all and reports which track each take sits on; `a1`
+    stays for older callers."""
     start = int(timeline.GetStartFrame())
-
-    def items(track_type: str, index: int) -> list[dict]:
-        out = []
-        for it in timeline.GetItemListInTrack(track_type, index) or []:
-            try:
-                out.append({
-                    "name": it.GetName(),
-                    "start": int(it.GetStart()) - start,
-                    "duration": int(it.GetDuration()),
-                })
-            except (AttributeError, TypeError, ValueError):
-                continue
-        return out
+    audio_tracks = []
+    for idx in range(1, audio_track_count(timeline) + 1):
+        audio_tracks.append({
+            "index": idx,
+            "name": track_name(timeline, "audio", idx) or f"A{idx}",
+            "items": track_items(timeline, "audio", idx, start),
+        })
+    if not audio_tracks:
+        audio_tracks = [{"index": 1, "name": "A1", "items": track_items(timeline, "audio", 1, start)}]
 
     markers = {}
     for frame, m in (timeline.GetMarkers() or {}).items():
@@ -254,16 +293,61 @@ def observe_timeline(timeline) -> dict:
             "duration": m.get("duration"),
             "customData": m.get("customData") or "",
         }
-    return {"name": timeline.GetName(), "v1": items("video", 1), "a1": items("audio", 1), "markers": markers}
+    return {
+        "name": timeline.GetName(),
+        "v1": track_items(timeline, "video", 1, start),
+        "a1": audio_tracks[0]["items"],
+        "audioTracks": audio_tracks,
+        "markers": markers,
+    }
+
+
+def timecode_to_frames(tc: str, fps) -> int | None:
+    """'00:00:05:01' at 23.976 → 121. Timecode counts whole frames at the
+    rounded rate (23.976 → 24, 29.97 → 30); drop-frame separators (';') are
+    read the same way — VO clips are seconds long, the drift is nil."""
+    if not tc or not isinstance(tc, str):
+        return None
+    parts = tc.replace(";", ":").split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        h, m, s_, f = (int(x) for x in parts)
+        base = int(round(float(fps))) if fps else 24
+    except (TypeError, ValueError):
+        return None
+    return ((h * 60 + m) * 60 + s_) * base + f
 
 
 def clip_duration_frames(item) -> int | None:
-    """A media-pool item's length in frames, or None when Resolve won't say."""
+    """A media-pool item's length in frames, or None when Resolve won't say.
+
+    Video items answer `Frames`; AUDIO items answer '' there and only carry
+    `Duration` as timecode at the item's `FPS` [live walk 2026-08-16] — read
+    that, and fall back to ffprobe on the file when even that is blank."""
     try:
         frames = item.GetClipProperty("Frames")
-        return int(frames) if frames else None
+        if frames not in (None, ""):
+            return int(frames)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    try:
+        fps = item.GetClipProperty("FPS")
+        n = timecode_to_frames(item.GetClipProperty("Duration"), fps)
+        if n:
+            return n
+    except (AttributeError, TypeError, ValueError):
+        pass
+    try:
+        path = item.GetClipProperty("File Path")
+        fps = float(item.GetClipProperty("FPS") or 0) or None
     except (AttributeError, TypeError, ValueError):
         return None
+    if path and fps:
+        # local import: handoff owns the ffprobe helper and imports this module
+        from handoff import probe_duration_seconds, seconds_to_frames
+        return seconds_to_frames(probe_duration_seconds(path), fps)
+    return None
 
 
 def video_start_frames(timeline, video_items: list) -> dict:
@@ -287,9 +371,49 @@ def video_start_frames(timeline, video_items: list) -> dict:
     return frames
 
 
-def append_audio(media_pool, timeline, placements: list) -> dict:
-    """Lay each VO clip on A1 — UNDER ITS OWN SHOT when the package says which
-    shot it belongs to, at the head otherwise.
+def ensure_vo_track(timeline) -> int:
+    """The index of the timeline's VO audio track — an existing track named
+    VO_TRACK_NAME, else a NEW audio track (named VO when the API can name it).
+    Never A1: the video clips' embedded audio owns A1."""
+    count = audio_track_count(timeline)
+    for idx in range(1, count + 1):
+        if track_name(timeline, "audio", idx).strip().lower() == VO_TRACK_NAME.lower():
+            return idx
+    added = False
+    try:
+        added = bool(timeline.AddTrack("audio"))
+    except (AttributeError, TypeError):
+        added = False
+    if not added:
+        raise ResolveError("AddTrack('audio') failed — could not create the VO track.")
+    idx = audio_track_count(timeline)
+    if idx <= count:
+        raise ResolveError("AddTrack('audio') answered True but the track count did not grow.")
+    try:
+        timeline.SetTrackName("audio", idx, VO_TRACK_NAME)
+    except (AttributeError, TypeError):
+        pass  # unnamed A<n> is still its own track — the placement is what matters
+    return idx
+
+
+def _find_new_item(before: list[dict], after: list[dict], name: str, frame: int | None):
+    """The item that APPEARED between two reads of a track (by name, and at
+    `frame` when one is given). Resolve's AppendToTimeline answers a truthy
+    list for an audio clip aimed at an occupied frame while placing nothing,
+    so its return value is never trusted — the track is re-read instead."""
+    if len(after) <= len(before):
+        return None
+    seen = {(it["name"], it["start"]) for it in before}
+    for it in after:
+        if it["name"] == name and (it["name"], it["start"]) not in seen:
+            if frame is None or it["start"] == frame:
+                return it
+    return None
+
+
+def append_audio(media_pool, timeline, placements: list, track_index: int) -> dict:
+    """Lay each VO clip on the VO track (`track_index`) — UNDER ITS OWN SHOT
+    when the package says which shot it belongs to, at the head otherwise.
 
     placements: [{"item": mediaPoolItem, "recordFrame": int | None, "label": str}]
       recordFrame None  -> the head of the timeline (a board-wide VO, or a pin
@@ -299,39 +423,62 @@ def append_audio(media_pool, timeline, placements: list) -> dict:
     shots and writes `manifest.audio[].placements` naming the owning scene, shot
     and clip file. This end used to ignore all of that and stamp every clip at
     `timeline.GetStartFrame()`, so a board with four shot-attached takes handed
-    the editor four clips piled on top of each other at 00:00 — the files were
-    right, the timeline was not, and the only fix was dragging each one by hand
-    [council 2026-08-07].
+    the editor four clips piled on top of each other at 00:00 [council 2026-08-07].
 
-    Returns a report rather than a bool: with per-shot placement there are now
-    three outcomes worth telling the editor apart — placed under its shot,
-    parked at the head, or appended loose because Resolve refused the frame.
+    WHY ITS OWN TRACK, AND WHY THE TRACK IS RE-READ. On the first live walk
+    (2026-08-16) every shot clip carried embedded audio, so appending the
+    video filled A1; asking for A1 at an occupied frame got `[<PyRemoteObject>]`
+    back — truthy — while Resolve placed NOTHING, and the build reported two
+    VO clips that did not exist. Placement is therefore judged by re-reading
+    the track after each append (a new item, by name, at the frame asked for),
+    never by the return value.
+
+    Returns a report: placed under its shot, parked at the head, or appended
+    loose (still on the VO track, at its tail) because the exact frame was
+    refused — a silent drop is the one outcome worse than a misplaced clip.
     """
     start = int(timeline.GetStartFrame())
-    report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": []}
+    report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": [],
+              "track": track_index, "trackName": track_name(timeline, "audio", track_index) or f"A{track_index}"}
+
+    def read():
+        return track_items(timeline, "audio", track_index, start)
 
     for p in placements:
         item = p["item"]
+        name = item.GetName()
         target = p.get("recordFrame")
         at_head = target is None
         end = clip_duration_frames(item)
+        record = start if at_head else int(target)
         clip_info = {
             "mediaPoolItem": item,
-            "trackIndex": 1,
+            "trackIndex": track_index,
             "mediaType": 2,  # audio-only
-            "recordFrame": start if at_head else int(target),
+            "recordFrame": record,
         }
         if end:
-            clip_info.update({"startFrame": 0, "endFrame": end - 1})
-        if media_pool.AppendToTimeline([clip_info]):
+            # endFrame is EXCLUSIVE (measured 2026-08-16: a 47-frame clip with
+            # endFrame 47 lands as 47 frames, endFrame 46 as 46)
+            clip_info.update({"startFrame": 0, "endFrame": end})
+        before = read()
+        media_pool.AppendToTimeline([clip_info])  # return value NOT trusted
+        if _find_new_item(before, read(), name, record - start) is not None:
             report["atHead" if at_head else "underShot"] += 1
             continue
-        # Resolve refused the exact frame (an occupied slot on A1 is the usual
-        # cause). The clip still has to ARRIVE — a silent drop is the one
-        # outcome worse than a misplaced clip.
-        if not media_pool.AppendToTimeline([item]):
-            raise ResolveError(f"Could not add VO clip {item.GetName()!r} to the timeline.")
+        # The exact frame was refused (an occupied slot on the VO track — two
+        # head takes, or overlapping pins). The clip still has to ARRIVE: lay
+        # it at the VO track's tail and re-read again.
+        tail = max((it["start"] + it["duration"] for it in before), default=0)
+        clip_info["recordFrame"] = start + tail
+        before = read()
+        media_pool.AppendToTimeline([clip_info])
+        if _find_new_item(before, read(), name, tail) is None:
+            raise ResolveError(
+                f"Could not add VO clip {name!r} to the timeline (track {track_index}): "
+                "Resolve placed nothing at the pinned frame or at the track tail."
+            )
         report["loose"] += 1
-        report["looseLabels"].append(p.get("label") or item.GetName())
+        report["looseLabels"].append(p.get("label") or name)
 
     return report

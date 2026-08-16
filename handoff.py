@@ -19,14 +19,20 @@ import os
 import shutil
 import subprocess
 
-from resolve_api import CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG
+from resolve_api import CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, VO_TRACK_NAME
 
 MANIFEST_FORMAT = "oside-davinci/v1"
-FEATURES = ["placements", "cues", "dry_run", "verify_v2"]
+FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track"]
 
-# The template a kind maps to fixes the timeline rate. Only used when Resolve
-# is not there to ask; the templates themselves are the authority.
+# The template a kind maps to fixes the timeline rate. templates/templates.json
+# carries each template's `fps` (server reads it); this is the last-resort
+# default when that file cannot be read.
 KIND_FPS = {"cinematic": 23.976, "explainer": 60.0}
+
+# What the dry run says about bin presence when it cannot look
+BIN_UNKNOWN_OFFLINE = "unknown — Resolve not connected"
+BIN_UNKNOWN_NOT_IMPORTED = "unknown — not imported yet"
+BIN_UNKNOWN_NOT_OPEN = "unknown — target project exists but is not open"
 
 # Resolve keeps ONE marker per frame. A cue laid exactly on its shot's first
 # frame would fight the Blue shot marker there, so cues start one frame in.
@@ -149,13 +155,15 @@ def cumulative_starts(durations: list) -> list:
 def vo_rows(manifest: dict, starts_by_file: dict, planned_files: set,
             on_disk: dict, in_bin: dict) -> list[dict]:
     """One row per VO LAY (a take pinned to several shots is laid once per
-    shot). mode: underShot | atHead — the same split build_timeline reports."""
+    shot). mode: underShot | atHead — the same split build_timeline reports.
+    Every row says `track: "VO"` — narration never rides A1 (the shot clips'
+    embedded audio owns it)."""
     rows = []
     videos_by_file = {_basename(v["file"]): v for v in (manifest.get("videos") or [])}
     for a in manifest.get("audio") or []:
         fname = _basename(a["file"])
         common = {
-            "file": a["file"], "label": a.get("label"),
+            "file": a["file"], "label": a.get("label"), "track": VO_TRACK_NAME,
             "onDisk": on_disk.get(fname), "inBin": in_bin.get(fname),
         }
         placements = a.get("placements") or []
@@ -220,16 +228,21 @@ def cue_rows(manifest: dict, cues: list, starts_by_file: dict, durations_by_file
 
 def plan_timeline(manifest: dict, base: str, timeline_name: str, cues: list,
                   fps: float, fps_source: str, resolve_connected: bool,
-                  bin_lookup, duration_lookup) -> dict:
+                  bin_lookup, duration_lookup, bin_unknown: str = BIN_UNKNOWN_OFFLINE,
+                  target_project: dict | None = None) -> dict:
     """What build_timeline would lay down, decided from the manifest + disk +
     (optionally) the media pool. Never touches Resolve.
 
-    bin_lookup(kind, basename)  -> True | False | None   (None = not connected)
+    bin_lookup(kind, basename)  -> True | False | None   (None = cannot look:
+        Resolve not connected, or the target project is not the open one —
+        `bin_unknown` is the wording the rows then carry, and wouldBuild is
+        judged on disk presence alone)
     duration_lookup(video_entry, abs_path) -> (frames | None, source_str)
+    target_project: {"name", "exists", "current"} when the caller named one
     """
     videos = manifest.get("videos") or []
     audio = manifest.get("audio") or []
-    unknown = "unknown — Resolve not connected"
+    unknown = bin_unknown
 
     clips, missing, durations = [], [], []
     for i, v in enumerate(videos):
@@ -297,6 +310,8 @@ def plan_timeline(manifest: dict, base: str, timeline_name: str, cues: list,
     return {
         "timeline": timeline_name,
         "resolveConnected": resolve_connected,
+        "targetProject": target_project,
+        "voTrack": VO_TRACK_NAME,
         "fps": fps,
         "fpsSource": fps_source,
         "clips": clips,
@@ -342,7 +357,11 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
     """The acceptance gate. observed:
         {"binVideos": set|None, "binAudio": set|None,
          "timeline": {"name", "v1": [{"name","start","duration"}],
-                      "a1": [{"name","start"}], "markers": {frame: {...}}} | None}
+                      "a1": [{"name","start"}],
+                      "audioTracks": [{"index","name","items":[{"name","start"}]}],
+                      "markers": {frame: {...}}} | None}
+    VO takes are looked for on EVERY audio track (`audioTracks`; `a1` alone
+    for older observations) and each VO row names the track the take sits on.
     Returns {"checks": [{check, expected, found, pass, ...}], "overall", "report"}
     — `report` is the pre-v2 shape, kept for callers that read it.
     """
@@ -375,7 +394,9 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
         return {"checks": checks, "overall": "FAIL", "report": report}
 
     v1 = tl.get("v1") or []
-    a1 = tl.get("a1") or []
+    audio_tracks = tl.get("audioTracks")
+    if not audio_tracks:
+        audio_tracks = [{"index": 1, "name": "A1", "items": tl.get("a1") or []}]
     markers = tl.get("markers") or {}
     v1_names = [it["name"] for it in v1]
     report["timeline"] = {"name": tl.get("name"), "videoClips": len(v1), "markers": len(markers)}
@@ -389,18 +410,21 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
     check("no stray V1 clips", [], strays, not strays)
 
     # every pinned VO lay sits on its shot's first frame (zero tolerance).
-    # Unpinned takes (spine, board-wide) are MEANT for the head, but A1 holds
-    # one clip per frame, so a second head take is appended loose by design —
-    # those rows pass on presence and report where the take actually sits.
+    # Unpinned takes (spine, board-wide) are MEANT for the head, but a track
+    # holds one clip per frame, so a second head take is appended loose by
+    # design — those rows pass on presence and report where the take sits.
+    # Takes are looked for on every audio track; the row names the track.
     v1_start = {}
     for it in v1:
         v1_start.setdefault(it["name"], it["start"])
-    a1_by_name: dict = {}
-    for it in a1:
-        a1_by_name.setdefault(it["name"], []).append(it["start"])
+    audio_by_name: dict = {}   # name -> [(start, track label)]
+    for tr in audio_tracks:
+        label = f"A{tr.get('index')} {tr.get('name') or ''}".strip()
+        for it in tr.get("items") or []:
+            audio_by_name.setdefault(it["name"], []).append((it["start"], label))
     for a in audio:
         fname = _basename(a["file"])
-        found_starts = a1_by_name.get(fname, [])
+        found = audio_by_name.get(fname, [])
         targets = []
         for p in a.get("placements") or []:
             vf = _basename(p.get("videoFile") or "")
@@ -410,14 +434,14 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
         if not targets:
             targets = [("head", 0)]
         for label, expected in targets:
-            if found_starts:
-                nearest = min(found_starts, key=lambda s: abs(s - expected))
+            if found:
+                nearest, track = min(found, key=lambda ft: abs(ft[0] - expected))
                 delta = nearest - expected
             else:
-                nearest, delta = None, None
+                nearest, track, delta = None, None, None
             ok = (delta == 0) if pinned else (nearest is not None)
-            check(f"VO {fname} @ {label}", expected, nearest, ok, delta=delta,
-                  rule="pinned: exact frame" if pinned else "unpinned: present on A1 (head when free)")
+            check(f"VO {fname} @ {label}", expected, nearest, ok, delta=delta, track=track,
+                  rule="pinned: exact frame" if pinned else "unpinned: present on an audio track (head when free)")
 
     shot_frames = sorted(f for f, m in markers.items() if _is_shot_marker(m))
     expected_frames = sorted(v1_start[n] for n in video_names if n in v1_start)
