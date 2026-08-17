@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.1 — 2026-08-16
+
+**Film stock travels as INTENT, never as a grade.**
+
+- `apply_look` now reads the manifest look block's optional `stockIntent`
+  (additive on `oside-look/1`; older packages simply do not have it) and writes
+  ONE timeline marker at the head — `Stock intent: <label> (<balance>) —
+  colourist's call, nothing applied`, plus what OSIDE actually measured that
+  stock doing. It adds **no node, no LUT and no Film Look Creator preset**: a
+  film stock IS a creative grade, and this tool sells a starting balance.
+- The marker nudges past shot 1's Blue marker (Resolve keeps one marker per
+  frame) and REPORTS the frame it landed on; a head-dense timeline that leaves
+  no room is reported as skipped, never silently dropped. `dry_run` shows the
+  note before Resolve is touched. Tagged `oside:stock` in customData — the
+  colour palette is fully spoken for, so the tag is the discriminator.
+- A malformed or half-filled `stockIntent` reads as "no stock" rather than
+  putting a broken marker on a colourist's timeline. 4 new tests (28 total).
+
+Earned by OSIDE's two film-stock A/Bs (64 cells, $5.76,
+`DOCS/livefire/LIVEFIRE-2026-08-16-FILM-STOCK-AB{,-CONFIRM}`): naming a stock
+measurably moves the IMAGE MODEL, which is why the words ship — and it is
+still the colourist's call what happens in Resolve.
+
 ## 0.3.0 — 2026-08-16
 
 **"Look travels"** — the film's starting balance rides into Resolve.

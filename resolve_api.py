@@ -37,6 +37,13 @@ CUE_MARKER_COLORS = (
     "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia", "Rose",
     "Lavender", "Sky", "Mint", "Lemon", "Sand", "Cocoa", "Cream",
 )
+# FILM STOCK INTENT — one marker at the head, a note for the colourist and
+# nothing else: no node, no LUT, no Film Look Creator. Resolve's palette is
+# fully spoken for (Blue = shots, the rest = cue speakers), so the COLOUR is
+# not a unique signal here and the customData TAG is what tells them apart —
+# the same contract the shot/cue markers already work under.
+STOCK_TAG = "oside:stock"
+STOCK_MARKER_COLOR = "Cocoa"
 
 
 class ResolveError(RuntimeError):
@@ -222,6 +229,28 @@ def add_range_markers(timeline, rows: list[dict]) -> dict:
         else:
             skipped.append({"name": r["name"], "frame": frame, "reason": "AddMarker refused (frame occupied)"})
     return {"placed": placed, "skipped": skipped}
+
+
+def add_stock_marker(timeline, text: str) -> dict:
+    """The film-stock intent, as ONE marker at the head of the timeline.
+
+    A film stock in Resolve is a CREATIVE GRADE, and `apply_look`'s whole
+    promise is a starting balance — so the stock never becomes a node, a LUT or
+    a Film Look Creator preset. It travels as a note the colourist can read and
+    act on, or ignore.
+
+    Frame 0 normally already holds shot 1's Blue marker (Resolve keeps one
+    marker per frame and AddMarker just answers False when the slot is taken),
+    so this nudges forward a few frames the way the dialogue cues do, and
+    REPORTS the frame it landed on. A marker it could not place is reported as
+    skipped — never silently dropped.
+    """
+    # ponytail: 8-frame nudge window, same shape as the cue nudge; a free-slot
+    # search only if a head-dense timeline ever needs it.
+    for bump in range(0, 8):
+        if timeline.AddMarker(bump, STOCK_MARKER_COLOR, "Stock intent", text, 1, STOCK_TAG):
+            return {"placed": True, "frame": bump, "note": text}
+    return {"placed": False, "reason": "AddMarker refused frames 0-7 (all occupied)", "note": text}
 
 
 def timeline_by_name(project, name: str | None):

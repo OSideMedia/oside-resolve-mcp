@@ -503,6 +503,34 @@ def load_look_cdl(manifest: dict, base: str) -> tuple[dict | None, str | None]:
     return doc, None
 
 
+def stock_intent_note(manifest: dict) -> str | None:
+    """The one line the film-stock marker carries, or None when the manifest
+    names no stock.
+
+    Read defensively: `stockIntent` is an ADDITIVE key on `oside-look/1`, so a
+    manifest written by an older studio build simply will not have it, and a
+    hand-edited one may have it half-filled. Anything unusable reads as "no
+    stock" rather than putting a broken marker on a colourist's timeline.
+    """
+    look = manifest.get("look")
+    if not isinstance(look, dict):
+        return None
+    intent = look.get("stockIntent")
+    if not isinstance(intent, dict):
+        return None
+    label = str(intent.get("label") or "").strip()
+    if not label:
+        return None
+    balance = str(intent.get("balance") or "").strip()
+    note = str(intent.get("note") or "").strip()
+    head = f"Stock intent: {label}" + (f" ({balance})" if balance else "")
+    # The studio's note already carries the evidence AND the "nothing applied"
+    # scope, so the head stays a label — repeating the clause here made the
+    # marker say the same sentence twice. Only a note-less manifest (older or
+    # hand-edited) needs the fallback clause.
+    return f"{head} — {note}" if note else f"{head} — colourist's call, nothing applied."
+
+
 def plan_look(manifest: dict, cdl_doc: dict, v1_items: list[dict]) -> dict:
     """Decide, from the manifest + the CDL file + the observed V1 items, what
     apply_look will do — offline-testable. Rows match by clip NAME (the file's

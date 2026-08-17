@@ -49,6 +49,12 @@ project:
    measured}`, `missing`, `extra` (V1 items the manifest does not know stay
    untouched). Resolve has no CDL getter, so `applied` is SetCDL's answer,
    not a read-back. `dry_run=True` returns the plan without touching Resolve.
+   **Film stock (0.3.1):** when the look block carries `stockIntent`, one
+   marker goes on the head of the timeline — `Stock intent: <label>
+   (<balance>) — colourist's call, nothing applied`. No node, no LUT, no
+   Film Look Creator: a stock IS a creative grade and this tool sells a
+   starting balance. It nudges past shot 1's marker and reports the frame
+   it used; no room means a reported skip, never a silent drop.
 4. `verify_import(manifest_path, timeline_name=None, cues=True)` — the
    acceptance gate: a per-check table `checks: [{check, expected, found,
    pass, …}]` and `overall: PASS|FAIL`. Checks: every package file in its bin;
