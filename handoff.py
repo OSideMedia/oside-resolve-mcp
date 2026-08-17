@@ -20,10 +20,12 @@ import os
 import shutil
 import subprocess
 
-from resolve_api import CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, VO_TRACK_NAME
+from resolve_api import (
+    CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, TEXT_TASK_TAG, VO_TRACK_NAME,
+)
 
 MANIFEST_FORMAT = "oside-davinci/v1"
-FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look"]
+FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "text_tasks"]
 
 # The template a kind maps to fixes the timeline rate. templates/templates.json
 # carries each template's `fps` (server reads it); this is the last-resort
@@ -38,6 +40,10 @@ BIN_UNKNOWN_NOT_OPEN = "unknown — target project exists but is not open"
 # Resolve keeps ONE marker per frame. A cue laid exactly on its shot's first
 # frame would fight the Blue shot marker there, so cues start one frame in.
 CUE_FRAME_OFFSET = 1
+# In-frame-text markers sit behind the cues on a shot that has them, and one
+# frame further in than a cue on a shot that does not — so a silent shot's text
+# task never lands on frame 1 where a cue would go if dialogue were added later.
+TEXT_TASK_FRAME_OFFSET = 2
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +136,36 @@ def load_cues(manifest: dict, base: str) -> tuple[list[dict], str | None]:
                 "estSeconds": est_s,
             })
     return cues, None
+
+
+def load_text_tasks(manifest: dict, base: str) -> tuple[list[dict], str | None]:
+    """The in-frame-text worklist named by manifest.textTasks (a CSV written by
+    the studio's export: Scene, Shot, Text, Where it lands, File, Outcome).
+
+    Same contract as load_cues, and for the same reason: no key → ([], None),
+    named but missing on disk → ([], reason). The worklist is advisory — its
+    absence never blocks a build, because a package exported before the studio
+    learned to write it is still a valid package.
+    """
+    name = manifest.get("textTasks")
+    if not name or not isinstance(name, str):
+        return [], None
+    path = os.path.join(base, name)
+    if not os.path.isfile(path):
+        return [], f"text-tasks file named by the manifest is missing: {path}"
+    tasks = []
+    with open(path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            text = (row.get("Text") or "").strip()
+            if not text:
+                continue
+            tasks.append({
+                "text": text,
+                "videoFile": (row.get("File") or "").strip(),
+                "shotNumber": (row.get("Shot") or "").strip(),
+                "sceneName": (row.get("Scene") or "").strip(),
+            })
+    return tasks, None
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +263,69 @@ def cue_rows(manifest: dict, cues: list, starts_by_file: dict, durations_by_file
     return rows
 
 
+def text_task_rows(manifest: dict, tasks: list, cue_marker_rows: list,
+                   starts_by_file: dict, durations_by_file: dict) -> list[dict]:
+    """Point-marker rows for the in-frame-text worklist, timeline-relative.
+
+    PLACED AFTER THE CUES, and that is the whole subtlety. Resolve keeps one
+    marker per frame; shot 1's Blue marker owns frame 0 and the dialogue cues
+    cascade forward from frame 1 for as long as their estimates run. So the
+    frames a text task may use are computed from the cue rows ALREADY BUILT for
+    the same shot — start after the last one ends — rather than from a fixed
+    offset that would fight them on any shot carrying dialogue.
+
+    A task whose shot has no clip on the timeline gets frame None and is
+    reported. A task whose free frame would fall past the end of its own clip
+    also gets None WITH ITS REASON: a marker sitting on the next shot would tell
+    the editor to title the wrong picture, which is worse than no marker.
+    """
+    videos_by_file = {_basename(v["file"]): v for v in (manifest.get("videos") or [])}
+    # the first frame each file is free from, after its cues have been laid
+    free_from: dict = {}
+    for c in cue_marker_rows:
+        vf = c.get("file")
+        if not vf or c.get("frame") is None:
+            continue
+        end = int(c["frame"]) + max(1, int(c.get("duration") or 1))
+        free_from[vf] = max(free_from.get(vf, 0), end)
+
+    rows = []
+    for t in tasks:
+        vf = _basename(t.get("videoFile") or "")
+        v = videos_by_file.get(vf)
+        start = starts_by_file.get(vf) if vf else None
+        shot_len = durations_by_file.get(vf) if vf else None
+        name = f"Text: {t['text']}"
+        note = "; ".join(x for x in (
+            t["text"] and f'"{t["text"]}"',
+            t.get("shotNumber") and f"shot {t['shotNumber']}",
+            "lay this as a title over the clip — the generation deliberately did not render it",
+        ) if x)
+
+        if start is None or vf not in starts_by_file:
+            rows.append({"shot": (display_name(manifest, v) if v else (vf or None)),
+                         "file": vf or None, "frame": None, "name": name, "note": note,
+                         "reason": "no frame (shot has no clip on V1)"})
+            continue
+
+        offset = max(free_from.get(vf, 0) - start, TEXT_TASK_FRAME_OFFSET)
+        frame = start + offset
+        # never let a task land past its own clip
+        if shot_len is not None and offset >= shot_len:
+            rows.append({"shot": display_name(manifest, v) if v else vf, "file": vf,
+                         "frame": None, "name": name, "note": note,
+                         "reason": "no free frame inside this shot (its cues fill it)"})
+            continue
+        free_from[vf] = start + offset + 1
+        rows.append({"shot": display_name(manifest, v) if v else vf, "file": vf,
+                     "frame": frame, "name": name, "note": note})
+    return rows
+
+
 def plan_timeline(manifest: dict, base: str, timeline_name: str, cues: list,
                   fps: float, fps_source: str, resolve_connected: bool,
                   bin_lookup, duration_lookup, bin_unknown: str = BIN_UNKNOWN_OFFLINE,
-                  target_project: dict | None = None) -> dict:
+                  target_project: dict | None = None, text_tasks: list | None = None) -> dict:
     """What build_timeline would lay down, decided from the manifest + disk +
     (optionally) the media pool. Never touches Resolve.
 
@@ -306,6 +401,12 @@ def plan_timeline(manifest: dict, base: str, timeline_name: str, cues: list,
 
     vo = vo_rows(manifest, starts_by_file, planned, a_on_disk, a_in_bin)
     cue_list = cue_rows(manifest, cues, starts_by_file, durations_by_file, fps)
+    # AFTER the cues, and from their laid rows — see text_task_rows on why a
+    # fixed offset would fight them on any shot that carries dialogue.
+    # `text_tasks` defaults to None so every existing caller keeps working.
+    text_task_list = text_task_rows(
+        manifest, text_tasks or [], cue_list, starts_by_file, durations_by_file,
+    )
 
     would_build = not missing and len(planned) == len(videos)
     return {
@@ -319,6 +420,7 @@ def plan_timeline(manifest: dict, base: str, timeline_name: str, cues: list,
         "markers": markers,
         "vo": vo,
         "cueMarkers": cue_list,
+        "textTaskMarkers": text_task_list,
         "missing": missing,
         "wouldBuild": would_build,
     }
@@ -337,6 +439,9 @@ def summarize(plan: dict) -> dict:
         "voLoose": 0,
         "voLooseLabels": [],
         "cueMarkers": len(plan["cueMarkers"]),
+        # .get: a plan built by an older caller has no such key, and a KeyError
+        # here would take down a build over an advisory worklist.
+        "textTaskMarkers": len(plan.get("textTaskMarkers") or []),
     }
 
 
@@ -354,7 +459,12 @@ def _is_cue_marker(m: dict) -> bool:
     return (m.get("customData") or "") == CUE_TAG
 
 
-def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: bool = True) -> dict:
+def _is_text_task_marker(m: dict) -> bool:
+    return (m.get("customData") or "") == TEXT_TASK_TAG
+
+
+def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: bool = True,
+                    text_tasks: list | None = None) -> dict:
     """The acceptance gate. observed:
         {"binVideos": set|None, "binAudio": set|None,
          "timeline": {"name", "v1": [{"name","start","duration"}],
@@ -388,7 +498,7 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
     tl = observed.get("timeline")
     if not tl:
         report["timeline"] = None
-        for name in ("V1 clip count", "V1 clip order", "no stray V1 clips", "shot markers", "shot marker positions", "cue markers"):
+        for name in ("V1 clip count", "V1 clip order", "no stray V1 clips", "shot markers", "shot marker positions", "cue markers", "text-task markers"):
             check(name, None, None, False, detail="no timeline")
         for a in audio:
             check(f"VO {_basename(a['file'])}", None, None, False, detail="no timeline")
@@ -452,6 +562,13 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
     cue_found = sum(1 for m in markers.values() if _is_cue_marker(m))
     cue_expected = len(cues) if cues_expected else 0
     check("cue markers", cue_expected, cue_found, cue_found == cue_expected)
+
+    # In-frame text (2026-08-17). Checked only when the package HAS a worklist:
+    # a package exported before the studio wrote one must still PASS, so an
+    # empty list adds no row rather than a row asserting zero.
+    if text_tasks:
+        text_found = sum(1 for m in markers.values() if _is_text_task_marker(m))
+        check("text-task markers", len(text_tasks), text_found, text_found == len(text_tasks))
 
     overall = "PASS" if all(c["pass"] for c in checks) else "FAIL"
     return {"checks": checks, "overall": overall, "report": report}

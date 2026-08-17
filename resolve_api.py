@@ -44,6 +44,16 @@ CUE_MARKER_COLORS = (
 # the same contract the shot/cue markers already work under.
 STOCK_TAG = "oside:stock"
 STOCK_MARKER_COLOR = "Cocoa"
+# IN-FRAME TEXT — the lettering a shot asked for and the generation deliberately
+# did NOT render (2026-08-17, OSIDE v0.160.0). Video models re-spell text between
+# takes, so a sign that changes across two shots of one scene is a continuity
+# break no re-roll reliably fixes; the studio's answer is to describe the surface,
+# leave the words out, and lay the real text as a title over the clip HERE. These
+# markers are that worklist, on the timeline where the editor works, one per run
+# of text. Same contract as the others: the customData TAG is the signal, not the
+# colour (the palette is spoken for).
+TEXT_TASK_TAG = "oside:text"
+TEXT_TASK_MARKER_COLOR = "Cream"
 
 
 class ResolveError(RuntimeError):
@@ -251,6 +261,40 @@ def add_stock_marker(timeline, text: str) -> dict:
         if timeline.AddMarker(bump, STOCK_MARKER_COLOR, "Stock intent", text, 1, STOCK_TAG):
             return {"placed": True, "frame": bump, "note": text}
     return {"placed": False, "reason": "AddMarker refused frames 0-7 (all occupied)", "note": text}
+
+
+def add_text_task_markers(timeline, rows: list[dict]) -> dict:
+    """The in-frame-text worklist — one POINT marker per run of lettering, on
+    the shot that asked for it.
+
+    rows: [{"frame": int|None, "name": str, "note": str}]
+      frame is TIMELINE-RELATIVE, the same reference the shot and cue markers
+      use. A point marker, not a range: a title has no duration until the editor
+      gives it one, and inventing a length here would be a claim about the cut.
+
+    Nudge-and-report, the same shape as the cue and stock markers, because the
+    frames near a shot's head are the contested ones — shot 1's Blue marker sits
+    on frame 0 and the dialogue cues cascade from frame 1. A marker that cannot
+    find a free slot is REPORTED, never silently dropped.
+    """
+    # ponytail: 12-frame nudge window — wider than the cues' 4 because text
+    # tasks are placed AFTER them and therefore start further into a busy shot.
+    placed, skipped = 0, []
+    for r in rows:
+        frame = r.get("frame")
+        if frame is None:
+            skipped.append({"name": r["name"], "reason": r.get("reason") or "no frame (shot has no clip on V1)"})
+            continue
+        ok = False
+        for bump in range(0, 12):
+            if timeline.AddMarker(int(frame) + bump, TEXT_TASK_MARKER_COLOR, r["name"], r.get("note", ""), 1, TEXT_TASK_TAG):
+                ok = True
+                break
+        if ok:
+            placed += 1
+        else:
+            skipped.append({"name": r["name"], "frame": frame, "reason": "AddMarker refused (frames occupied)"})
+    return {"placed": placed, "skipped": skipped}
 
 
 def timeline_by_name(project, name: str | None):

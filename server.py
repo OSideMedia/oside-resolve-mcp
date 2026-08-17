@@ -245,6 +245,10 @@ def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool,
     fps comes from the kind's template rather than whatever project happens
     to be open."""
     cues, cue_warning = handoff.load_cues(manifest, base) if cues_on else ([], None)
+    # The in-frame-text worklist rides the SAME switch as the cues: both are
+    # marker worklists laid on the same timeline, and a director who turned the
+    # markers off meant all of them.
+    text_tasks, text_warning = handoff.load_text_tasks(manifest, base) if cues_on else ([], None)
     ctx: dict = {}
     target: dict | None = None
     bin_unknown = handoff.BIN_UNKNOWN_OFFLINE
@@ -316,15 +320,18 @@ def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool,
 
     plan = handoff.plan_timeline(
         manifest, base, timeline_name, cues, fps, fps_source, connected, bin_lookup, duration_lookup,
-        bin_unknown=bin_unknown, target_project=target,
+        bin_unknown=bin_unknown, target_project=target, text_tasks=text_tasks,
     )
     plan["cuesEnabled"] = cues_on
     plan["cuesFile"] = manifest.get("cues") if cues_on else None
     if cue_warning:
         plan["cueWarning"] = cue_warning
+    plan["textTasksFile"] = manifest.get("textTasks") if cues_on else None
+    if text_warning:
+        plan["textTaskWarning"] = text_warning
     if "project" not in ctx:
         plan["resolveError"] = ctx.get("error")
-    return plan, cues, ctx
+    return plan, cues, ctx, text_tasks
 
 
 @mcp.tool(annotations=CREATES)
@@ -352,7 +359,7 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
     disk presence and fps comes from the kind's template."""
     try:
         manifest, base = _load_manifest(manifest_path)
-        plan, cue_list, ctx = _plan(manifest, base, timeline_name, cues, project)
+        plan, cue_list, ctx, text_tasks = _plan(manifest, base, timeline_name, cues, project)
         if dry_run:
             return _ok(dryRun=True, **handoff.summarize(plan), wouldBuild=plan["wouldBuild"],
                        missing=plan["missing"], plan=plan)
@@ -415,6 +422,14 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
         plan["cueMarkers"] = handoff.cue_rows(manifest, cue_list, landed, lengths, plan["fps"])
         cue_report = rapi.add_range_markers(timeline, plan["cueMarkers"]) if plan["cueMarkers"] else {"placed": 0, "skipped": []}
 
+        # in-frame text, AFTER the cues so the frames they occupy are already
+        # taken and the nudge in add_text_task_markers has honest information
+        plan["textTaskMarkers"] = handoff.text_task_rows(
+            manifest, text_tasks, plan["cueMarkers"], landed, lengths,
+        )
+        text_report = (rapi.add_text_task_markers(timeline, plan["textTaskMarkers"])
+                       if plan["textTaskMarkers"] else {"placed": 0, "skipped": []})
+
         summary = handoff.summarize(plan)
         summary.update(
             voClips=len(placements),
@@ -426,6 +441,8 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             voTrackIndex=vo_report["track"],
             cueMarkers=cue_report["placed"],
             cueMarkersSkipped=cue_report["skipped"],
+            textTaskMarkers=text_report["placed"],
+            textTaskMarkersSkipped=text_report["skipped"],
         )
         return _ok(dryRun=False, **summary, wouldBuild=True,
                    missing=[m for m in plan["missing"] if m["where"] == "disk"], plan=plan)
@@ -451,6 +468,7 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
         _pm, project = _open_project(resolve)
         media_pool = project.GetMediaPool()
         cue_list, _warn = handoff.load_cues(manifest, base) if cues else ([], None)
+        task_list, _twarn = handoff.load_text_tasks(manifest, base) if cues else ([], None)
 
         timeline = rapi.timeline_by_name(project, timeline_name)
         observed = {
@@ -458,7 +476,8 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
             "binAudio": _bin_names(media_pool, manifest.get("audio") or [], "VO"),
             "timeline": rapi.observe_timeline(timeline) if timeline else None,
         }
-        result = handoff.evaluate_verify(manifest, cue_list, observed, cues_expected=cues)
+        result = handoff.evaluate_verify(manifest, cue_list, observed, cues_expected=cues,
+                                         text_tasks=task_list)
         return _ok(overall=result["overall"], clean=result["overall"] == "PASS",
                    checks=result["checks"], report=result["report"])
     except Exception as e:  # noqa: BLE001
