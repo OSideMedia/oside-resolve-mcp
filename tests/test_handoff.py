@@ -618,7 +618,7 @@ def test_tool_annotations_prompt_and_capabilities():
     assert body.index("dry_run=True") < body.index("create_project(kind, name)")
     caps = server.capabilities()
     assert caps["manifest"] == "oside-davinci/v1"
-    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look"]
+    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "text_tasks"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -924,6 +924,143 @@ def test_stock_marker_nudges_past_the_shot_marker_and_reports_its_frame():
     blocked = FakeTimeline(markers={f: dict(shot0) for f in range(0, 8)})
     out = rapi.add_stock_marker(blocked, "note")
     assert out["placed"] is False and "occupied" in out["reason"]
+
+
+
+# ---------------------------------------------------------------------------
+# IN-FRAME TEXT (2026-08-17) — the worklist the studio's export writes when a
+# shot asked for lettering the generation deliberately did not render.
+# ---------------------------------------------------------------------------
+
+def test_text_tasks_load_and_skip_blank_rows():
+    manifest, base = _fixture()
+    tasks, warn = handoff.load_text_tasks(manifest, base)
+    assert warn is None
+    # the fixture has three rows, one with an empty Text cell
+    assert [t["text"] for t in tasks] == ["OPEN ALL NIGHT", "CLOSED"]
+
+
+def test_text_tasks_absent_key_is_not_an_error():
+    tasks, warn = handoff.load_text_tasks({}, ".")
+    assert tasks == [] and warn is None
+
+
+def test_text_tasks_named_but_missing_warns_and_never_blocks():
+    manifest, base = _fixture()
+    tasks, warn = handoff.load_text_tasks({**manifest, "textTasks": "nope.csv"}, base)
+    assert tasks == [] and "missing" in warn
+
+
+def test_text_task_markers_never_collide_with_the_cues_on_the_same_shot():
+    """The point of placing them AFTER the cues. Given a shot whose cues run to
+    frame 40, its text task must start at or past 40 — never on top of a line."""
+    manifest, _ = _fixture()
+    cue_rows = [
+        {"file": "a.mp4", "frame": 1, "duration": 24},
+        {"file": "a.mp4", "frame": 25, "duration": 15},
+    ]
+    rows = handoff.text_task_rows(
+        manifest,
+        [{"text": "CLOSED", "videoFile": "a.mp4", "shotNumber": "2", "sceneName": "X"}],
+        cue_rows, {"a.mp4": 0}, {"a.mp4": 200},
+    )
+    assert rows[0]["frame"] >= 40, rows[0]["frame"]
+
+
+def test_two_text_tasks_on_one_shot_take_different_frames():
+    manifest, _ = _fixture()
+    rows = handoff.text_task_rows(
+        manifest,
+        [{"text": "ONE", "videoFile": "a.mp4", "shotNumber": "1", "sceneName": "X"},
+         {"text": "TWO", "videoFile": "a.mp4", "shotNumber": "1", "sceneName": "X"}],
+        [], {"a.mp4": 0}, {"a.mp4": 200},
+    )
+    assert rows[0]["frame"] != rows[1]["frame"]
+
+
+def test_text_task_on_a_silent_shot_still_clears_frame_zero():
+    """scene01_shot1A has no dialogue, so nothing reserves frames for it — the
+    task must still miss the Blue shot marker on the shot's first frame."""
+    res = server.build_timeline(FIXTURE, dry_run=True)
+    plan = res["plan"]
+    starts = {m["file"]: m["frame"] for m in plan["markers"]}
+    t = next(t for t in plan["textTaskMarkers"] if t["file"] == "scene01_shot1A.mp4")
+    assert t["frame"] > starts["scene01_shot1A.mp4"]
+
+
+def test_text_task_marker_carries_the_exact_wording_for_the_editor():
+    res = server.build_timeline(FIXTURE, dry_run=True)
+    t = next(t for t in res["plan"]["textTaskMarkers"] if t["file"] == "scene01_shot1A.mp4")
+    assert "OPEN ALL NIGHT" in t["name"] and "OPEN ALL NIGHT" in t["note"]
+    # and says WHY it is a task rather than a rendered sign
+    assert "did not render it" in t["note"]
+
+
+def test_text_tasks_ride_the_cues_switch():
+    res = server.build_timeline(FIXTURE, dry_run=True, cues=False)
+    assert res["plan"]["textTaskMarkers"] == []
+    assert res["textTaskMarkers"] == 0
+
+
+def test_text_task_without_a_clip_is_reported_not_placed():
+    manifest, base = _fixture()
+    rows = handoff.text_task_rows(
+        manifest,
+        [{"text": "GHOST", "videoFile": "videos/not_on_timeline.mp4", "shotNumber": "9", "sceneName": "X"}],
+        [], {}, {},
+    )
+    assert rows[0]["frame"] is None and "no clip" in rows[0]["reason"]
+
+
+def test_text_task_that_cannot_fit_inside_its_shot_is_reported_not_misplaced():
+    """A marker nudged past its own clip would tell the editor to title the
+    NEXT shot — worse than no marker, so it is reported instead."""
+    manifest, _ = _fixture()
+    cue = [{"file": "a.mp4", "frame": 0, "duration": 500}]
+    rows = handoff.text_task_rows(
+        manifest,
+        [{"text": "LATE", "videoFile": "a.mp4", "shotNumber": "1", "sceneName": "X"}],
+        cue, {"a.mp4": 0}, {"a.mp4": 100},
+    )
+    assert rows[0]["frame"] is None and "no free frame" in rows[0]["reason"]
+
+
+def test_verify_counts_text_task_markers_by_tag():
+    manifest, base = _fixture()
+    tasks, _ = handoff.load_text_tasks(manifest, base)
+    v1, a1, markers = _good_timeline()
+    # every task laid, correctly tagged
+    for i, t in enumerate(tasks):
+        markers[300 + i] = {"name": f"Text: {t['text']}", "customData": rapi.TEXT_TASK_TAG, "color": "Cream"}
+    observed = _observed(v1, a1, markers)
+    cues, _ = handoff.load_cues(manifest, base)
+    res = handoff.evaluate_verify(manifest, cues, observed, text_tasks=tasks)
+    row = next(c for c in res["checks"] if c["check"] == "text-task markers")
+    assert row["pass"] and row["expected"] == len(tasks) == row["found"]
+
+
+def test_verify_fails_when_a_text_task_marker_is_missing():
+    manifest, base = _fixture()
+    tasks, _ = handoff.load_text_tasks(manifest, base)
+    v1, a1, markers = _good_timeline()
+    markers[300] = {"name": "Text: OPEN ALL NIGHT", "customData": rapi.TEXT_TASK_TAG, "color": "Cream"}
+    observed = _observed(v1, a1, markers)
+    cues, _ = handoff.load_cues(manifest, base)
+    res = handoff.evaluate_verify(manifest, cues, observed, text_tasks=tasks)
+    row = next(c for c in res["checks"] if c["check"] == "text-task markers")
+    assert not row["pass"] and res["overall"] == "FAIL"
+
+
+def test_a_package_with_no_worklist_adds_no_check_and_still_passes():
+    """A package exported before the studio wrote text-tasks.csv must not gain
+    a failing row asserting zero."""
+    manifest, base = _fixture()
+    v1, a1, markers = _good_timeline()
+    observed = _observed(v1, a1, markers)
+    cues, _ = handoff.load_cues(manifest, base)
+    res = handoff.evaluate_verify(manifest, cues, observed, text_tasks=[])
+    assert not any(c["check"] == "text-task markers" for c in res["checks"])
+
 
 
 if __name__ == "__main__":

@@ -20,6 +20,14 @@ project:
    line** under its shot: name = speaker, note = the line, length = the line's
    estimate (the shot's length when a cue has none), one colour per speaker
    (deterministic per project, never Blue). `cues=False` skips them.
+   When the manifest also names a `text-tasks.csv`, one **point marker per run
+   of in-frame lettering** lands on the shot that asked for it: name and note
+   carry the exact wording, and the note says the generation deliberately did
+   not render it — video models re-spell text between takes, so a sign belongs
+   over the clip, not inside it. Placed AFTER that shot's cues (Resolve keeps
+   one marker per frame), and a task with no free frame inside its own clip is
+   REPORTED rather than nudged onto the next shot. Rides the same `cues`
+   switch.
    **`dry_run=True` touches nothing** and returns the full plan — ordered clip
    list with on-disk / in-bin presence, VO placement per take (`underShot` /
    `atHead`, target shot, start frame, `track: "VO"`), shot + cue markers, a
@@ -64,12 +72,15 @@ project:
    names the `track` it sits on, e.g. `"A2 VO"`; unpinned takes pass on
    presence, since two head takes cannot share frame 0); one shot marker per
    shot, each on its shot's
-   first frame; cue markers == scripted lines (0 when `cues=False`). The
+   first frame; cue markers == scripted lines (0 when `cues=False`);
+   text-task markers == rows in the worklist, a check that appears ONLY when
+   the package carries one, so a package exported before the studio wrote them
+   still passes. The
    pre-v2 `clean` + `report` fields stay (`clean` now means overall PASS).
 
 Plus `resolve_status` (with a `capabilities` block — `{"manifest":
 "oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2",
-"vo_track"], "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
+"vo_track","look","text_tasks"], "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
 before it relies on a feature), `launch_resolve`, `list_templates`, and
 `export_template(kind)` (snapshot a live template project to `templates/`).
 One MCP prompt, `handoff`, carries the recipe below. Every tool declares MCP

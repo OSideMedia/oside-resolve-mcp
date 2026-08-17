@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0 — 2026-08-17
+
+**In-frame text arrives as a worklist on the timeline.**
+
+- New manifest key `textTasks` names a `text-tasks.csv` (Scene, Shot, Text,
+  Where it lands, File, Outcome) written by OSIDE v0.160.0. Each row becomes
+  ONE point marker on the shot that asked for the lettering, carrying the exact
+  wording and the reason it is a task rather than a rendered sign: video models
+  re-spell text between takes, so a sign that changes across two shots of one
+  scene is a continuity break no re-roll fixes. The studio's answer is to
+  describe the surface, leave the words out of the generation, and lay the real
+  text over the clip here.
+- **Placed after that shot's cues**, computed from the cue rows already built
+  rather than a fixed offset. Resolve keeps one marker per frame; shot 1's Blue
+  marker owns frame 0 and the dialogue cues cascade from frame 1, so a fixed
+  offset would fight them on any shot carrying dialogue. Three tests go red
+  against the naive version.
+- **A task that cannot fit inside its own clip is REPORTED, not nudged onto the
+  next shot** — a marker on the wrong picture would tell the editor to title the
+  wrong shot, which is worse than no marker.
+- `verify_import` counts them by tag (`oside:text`), and the check appears ONLY
+  when the package carries a worklist — a package exported before OSIDE wrote
+  them still passes rather than gaining a row asserting zero.
+- Rides the existing `cues` switch: both are marker worklists on one timeline,
+  and a director who turned markers off meant all of them.
+- `capabilities.features` gains `text_tasks`, so OSIDE can check before relying
+  on it. An older server ignores the manifest key exactly as it always did.
+
 ## 0.3.1 — 2026-08-16
 
 **Film stock travels as INTENT, never as a grade.**
