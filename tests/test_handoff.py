@@ -870,6 +870,62 @@ def test_capabilities_advertise_look():
     assert "look" in server.capabilities()["features"]
 
 
+# ---- film stock: INTENT ONLY (0.3.1) --------------------------------------
+# A stock is a creative grade, and apply_look sells a starting balance. These
+# hold the line: the note reads only from a well-formed additive key, and it
+# never turns into anything a node would consume.
+
+def _look_with_stock(**intent):
+    return {"look": {"schema": "oside-look/1", "name": "L", "stockIntent": intent}}
+
+
+def test_stock_note_reads_a_well_formed_intent():
+    note = handoff.stock_intent_note(
+        _look_with_stock(id="velvia-50", label="Fuji Velvia 50", balance="daylight",
+                         note="OSIDE measured saturation + contrast. Intent only: nothing has been applied for it.")
+    )
+    assert note.startswith("Stock intent: Fuji Velvia 50 (daylight)")
+    assert "measured saturation + contrast" in note
+    # the scope is stated ONCE — the head must not repeat the studio's clause
+    assert note.count("nothing has been applied") == 1
+    assert "colourist's call, nothing applied" not in note
+
+
+def test_stock_note_absent_is_none_not_a_broken_marker():
+    # an older studio build simply has no stockIntent — additive key
+    assert handoff.stock_intent_note({"look": {"schema": "oside-look/1"}}) is None
+    assert handoff.stock_intent_note({}) is None
+    assert handoff.stock_intent_note({"look": "not-a-dict"}) is None
+    # half-filled / hand-edited: unusable reads as "no stock"
+    assert handoff.stock_intent_note(_look_with_stock(label="")) is None
+    assert handoff.stock_intent_note(_look_with_stock(id="x")) is None
+
+
+def test_stock_note_survives_a_partial_intent():
+    # a note-less manifest (older or hand-edited) still says what it means
+    note = handoff.stock_intent_note(_look_with_stock(label="Kodak Portra 400"))
+    assert note == "Stock intent: Kodak Portra 400 — colourist's call, nothing applied."
+
+
+def test_stock_marker_nudges_past_the_shot_marker_and_reports_its_frame():
+    # frame 0 holds shot 1's Blue marker in every built timeline, so the stock
+    # note must move over rather than vanish
+    shot0 = {"color": rapi.SHOT_MARKER_COLOR, "name": "Shot 1", "note": "", "duration": 1, "customData": rapi.SHOT_TAG}
+    tl = FakeTimeline(markers={0: shot0})
+    out = rapi.add_stock_marker(tl, "Stock intent: X — colourist's call, nothing applied.")
+    assert out["placed"] is True and out["frame"] == 1
+    placed = tl.GetMarkers()[1]
+    assert placed["customData"] == rapi.STOCK_TAG          # the TAG is the discriminator
+    assert placed["color"] != rapi.SHOT_MARKER_COLOR       # …colour is only a hint
+    assert "nothing applied" in placed["note"]
+    assert tl.GetMarkers()[0]["customData"] == rapi.SHOT_TAG   # shot marker untouched
+
+    # a head-dense timeline is REPORTED, never silently dropped
+    blocked = FakeTimeline(markers={f: dict(shot0) for f in range(0, 8)})
+    out = rapi.add_stock_marker(blocked, "note")
+    assert out["placed"] is False and "occupied" in out["reason"]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

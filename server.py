@@ -484,10 +484,12 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
         cdl_doc, why = handoff.load_look_cdl(manifest, base)
         if cdl_doc is None:
             return _ok(applied=0, refused=True, reason=why, rows=[], missing=[], extra=[])
+        stock_note = handoff.stock_intent_note(manifest)
         if dry_run:
             names = [{"name": _basename_of(v["file"])} for v in manifest.get("videos") or []]
             plan = handoff.plan_look(manifest, cdl_doc, names)
-            return _ok(dryRun=True, look=manifest["look"].get("name"), rows=plan["rows"], missing=plan["missing"], extra=plan["extra"])
+            return _ok(dryRun=True, look=manifest["look"].get("name"), rows=plan["rows"], missing=plan["missing"], extra=plan["extra"],
+                       stockIntent=stock_note)
         resolve = rapi.connect()
         _pm, project = _open_project(resolve)
         timeline = rapi.timeline_by_name(project, timeline_name)
@@ -503,9 +505,13 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
             ok = bool(it.SetCDL(r["set"]))
             rows.append({"clip": r["clip"], "shot": r["shot"], "applied": ok, "identity": r["identity"], "cdl": r["cdl"], "measured": r["measured"]})
         applied = sum(1 for r in rows if r["applied"])
+        # the stock is INTENT: one marker, nothing graded for it.
+        stock_marker = rapi.add_stock_marker(timeline, stock_note) if stock_note else None
         return _ok(look=manifest["look"].get("name"), applied=applied, of=len(rows), rows=rows,
                    missing=plan["missing"], extra=plan["extra"],
-                   note="node 1 CDL = starting balance (key/temperature/saturation). Not a read-back: Resolve has no CDL getter.")
+                   stockMarker=stock_marker,
+                   note="node 1 CDL = starting balance (key/temperature/saturation). Not a read-back: Resolve has no CDL getter. "
+                        "A film stock, when the manifest names one, travels as a marker only — never a node or a LUT.")
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
