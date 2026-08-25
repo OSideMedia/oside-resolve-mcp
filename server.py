@@ -683,8 +683,14 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
     block or the CDL file is missing/unreadable. `dry_run=True` returns the
     plan without touching Resolve. Returns per-clip rows {clip, shot, applied,
     identity, cdl}, `missing` (manifest clips it could not grade), `extra` (V1
-    items the manifest does not know — untouched). Resolve exposes no CDL
-    getter, so `applied` is what SetCDL returned, not a read-back."""
+    items the manifest does not know — untouched).
+
+    Resolve exposes no `GetCDL`, so without `verify` the `applied` flag is only
+    what SetCDL said about itself. **`verify=True` READS THE GRADE BACK** out of
+    a `Timeline.Export` EDL+CDL: each row gains `verified` (and `readBackDiffs`
+    when it does not match), the result gains a `readback` block, and `complete`
+    then requires the read-back to agree. The EDL carries no clip names — every
+    event's reel is `AX` — so events match V1 items BY POSITION."""
     try:
         manifest, base = _load_manifest(manifest_path)
         cdl_doc, why = handoff.load_look_cdl(manifest, base)

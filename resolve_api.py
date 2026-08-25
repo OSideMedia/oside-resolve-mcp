@@ -426,7 +426,15 @@ def export_timeline_cdl(resolve, timeline) -> str | None:
     path = os.path.join(tmp, "readback.edl")
     try:
         ok = timeline.Export(path, resolve.EXPORT_EDL, resolve.EXPORT_CDL)
-        if not ok or not os.path.isfile(path):
+        # SIZE, not just existence. MEASURED 2026-08-25 on 21.0.4.5: exporting a
+        # populated timeline as EXPORT_ALE_CDL returns True and writes a
+        # ZERO-BYTE file. `Timeline.Export` therefore lies in a second way — the
+        # documented trap is that a string enum is silently rejected with no file
+        # written, but a live enum can also answer True over an empty one. An
+        # existence check passes a 0-byte file, and the read-back then reports
+        # "no CDL for this clip" for EVERY clip, which blames the grade for a
+        # failure of the export.
+        if not ok or not os.path.isfile(path) or os.path.getsize(path) == 0:
             return None
         with open(path, encoding="utf-8", errors="replace") as f:
             return f.read()
