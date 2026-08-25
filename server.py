@@ -685,6 +685,12 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
     identity, cdl}, `missing` (manifest clips it could not grade), `extra` (V1
     items the manifest does not know — untouched).
 
+    The CDL lands in a colour version named `OSIDE base`, created per clip and
+    left ACTIVE — so the film opens showing the balance as before, while the
+    colourist keeps a clean `Version 1` underneath and an unambiguous name for
+    which grade is the tool's. A re-run overwrites `OSIDE base` (ours, by name),
+    not their work — provided they grade in their own version.
+
     Resolve exposes no `GetCDL`, so without `verify` the `applied` flag is only
     what SetCDL said about itself. **`verify=True` READS THE GRADE BACK** out of
     a `Timeline.Export` EDL+CDL: each row gains `verified` (and `readBackDiffs`
@@ -714,9 +720,21 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
         rows = []
         for r in plan["rows"]:
             it = by_name[r["clip"]]
+            # THE LOOK GETS ITS OWN COLOUR VERSION. SetCDL writes node 1 of
+            # whatever version is ACTIVE, so writing the bare active version put
+            # our starting balance in the same slot a colourist grades in — the
+            # one place this server overwrote a human's work. `look_version`
+            # creates `OSIDE base` and leaves it active, so the film still opens
+            # showing the balance while a clean Version 1 survives underneath.
+            # It never raises: a Resolve that will not give us a version falls
+            # back to today's behaviour and says so on the row.
+            ver = rapi.look_version(it)
             ok = bool(it.SetCDL(r["set"]))
             row = {"clip": r["clip"], "shot": r["shot"], "applied": ok,
+                   "version": ver.get("version"), "versionCreated": ver.get("created"),
                    "identity": r["identity"], "cdl": r["cdl"], "measured": r["measured"]}
+            if ver.get("why"):
+                row["versionNote"] = ver["why"]
             if not ok:
                 # SetCDL returns False with NO reason. The diagnosable cause is
                 # the node count: NodeIndex is 1-based and must not exceed
@@ -766,7 +784,15 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
                 readback = {"ok": True, "events": len(found), "checked": checked,
                             "verified": matched,
                             "allMatch": checked > 0 and matched == checked,
-                            "how": "Timeline.Export(EXPORT_EDL, EXPORT_CDL), matched by V1 position"}
+                            "version": rapi.LOOK_VERSION_NAME,
+                            # The export reads each item's ACTIVE version
+                            # (measured 2026-08-25). `look_version` left ours
+                            # active a few lines above, which is the only reason
+                            # this read-back is about OUR grade — verifying with
+                            # the colourist's version active would have confirmed
+                            # THEIR values and reported success.
+                            "how": "Timeline.Export(EXPORT_EDL, EXPORT_CDL) with "
+                                   f"{rapi.LOOK_VERSION_NAME!r} active, matched by V1 position"}
 
         # the stock is INTENT: one marker, nothing graded for it.
         stock_marker = rapi.add_stock_marker(timeline, stock_note) if stock_note else None

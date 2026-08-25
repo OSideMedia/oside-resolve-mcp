@@ -1,6 +1,6 @@
 [project]
 name = "oside-resolve-mcp"
-version = "0.5.1"
+version = "0.5.2"
 description = "OSIDE studio → DaVinci Resolve bridge: build a Resolve project from an oside-davinci/v1 export package (template copy, bin imports, shot-order timeline with markers)."
 requires-python = ">=3.10"
 dependencies = ["mcp>=1.2.0"]
