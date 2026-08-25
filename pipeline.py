@@ -82,7 +82,7 @@ def main() -> int:
         if not manifest.get("look"):
             report["steps"]["look"] = {"ok": True, "skipped": "manifest carries no look block"}
             return True
-        result = server.apply_look(args.manifest, args.timeline)
+        result = server.apply_look(args.manifest, args.timeline, verify=True)
         report["steps"]["look"] = result
         if result.get("refused"):
             return True

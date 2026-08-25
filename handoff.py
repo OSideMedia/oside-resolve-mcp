@@ -17,6 +17,7 @@
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -36,7 +37,10 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             "post_save",
             # 0.5.0 — a CDL outside the starting-balance envelope is refused per
             # clip instead of applied as if it were a balance.
-            "cdl_envelope"]
+            "cdl_envelope",
+            # 0.5.0 — apply_look(verify=True) READS THE GRADE BACK out of an
+            # EXPORT_EDL+EXPORT_CDL export instead of trusting SetCDL's return.
+            "cdl_readback"]
 
 # The template a kind maps to fixes the timeline rate. templates/templates.json
 # carries each template's `fps` (server reads it); this is the last-resort
@@ -833,6 +837,61 @@ def cdl_problem(cdl) -> str | None:
     if not (CDL_SAT_RANGE[0] <= sat <= CDL_SAT_RANGE[1]):
         return f"saturation {sat} outside the starting-balance envelope {CDL_SAT_RANGE}"
     return None
+
+
+CDL_READBACK_TOL = 1e-3
+
+
+def parse_cdl_edl(text: str) -> list[dict]:
+    """The ASC CDL values out of an EDL exported with EXPORT_EDL+EXPORT_CDL, in
+    EVENT ORDER (which is timeline order, i.e. V1 order).
+
+    Resolve exposes no `GetCDL`, so this export is the only way to READ BACK
+    what a `SetCDL` actually did. Proven on the 2026-08-24 walk: the file came
+    back carrying the exact values just applied. The reel column is `AX` for
+    every event — there are no clip names in it — so events match clips BY
+    POSITION and nothing else.
+
+        001  AX       V     C        00:00:00:00 ...
+        *ASC_SOP (1.000000 1.000000 1.000000)(-0.025000 ...)(1.000000 ...)
+        *ASC_SAT 0.940000
+    """
+    triple = r"\(\s*([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)"
+    sop_re = re.compile(r"\*\s*ASC_SOP\s*" + triple + r"\s*" + triple + r"\s*" + triple)
+    sat_re = re.compile(r"\*\s*ASC_SAT\s+([-\d.eE+]+)")
+    out: list[dict] = []
+    for line in text.splitlines():
+        m = sop_re.search(line)
+        if m:
+            v = [float(x) for x in m.groups()]
+            out.append({"slope": v[0:3], "offset": v[3:6], "power": v[6:9], "saturation": None})
+            continue
+        m = sat_re.search(line)
+        if m and out:
+            out[-1]["saturation"] = float(m.group(1))
+    return out
+
+
+def compare_cdl(expected: dict, found: dict | None, tol: float = CDL_READBACK_TOL) -> dict:
+    """Did the CDL we set come back? {match: bool, diffs: [...]} — a real
+    read-back verdict, as opposed to SetCDL's own answer about itself."""
+    if not found:
+        return {"match": False, "diffs": ["no CDL for this clip in the exported EDL"]}
+    diffs = []
+    for key in ("slope", "offset", "power"):
+        want, got = expected.get(key), found.get(key)
+        if not isinstance(got, (list, tuple)) or len(got) != 3:
+            diffs.append(f"{key}: unreadable in the EDL")
+            continue
+        for i, (a, b) in enumerate(zip(want, got)):
+            if abs(float(a) - float(b)) > tol:
+                diffs.append(f"{key}[{i}]: set {float(a):.4f}, read back {float(b):.4f}")
+    want_sat, got_sat = expected.get("saturation"), found.get("saturation")
+    if got_sat is None:
+        diffs.append("saturation: absent from the EDL")
+    elif abs(float(want_sat) - float(got_sat)) > tol:
+        diffs.append(f"saturation: set {float(want_sat):.3f}, read back {float(got_sat):.3f}")
+    return {"match": not diffs, "diffs": diffs}
 
 
 def plan_look(manifest: dict, cdl_doc: dict, v1_items: list[dict]) -> dict:

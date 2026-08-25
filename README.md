@@ -55,12 +55,16 @@ project:
    values). Refuses — applies nothing — without a look block or the CDL file,
    and says why. Returns per-clip rows `{clip, shot, applied, identity, cdl,
    measured}`, `missing`, `extra` (V1 items the manifest does not know stay
-   untouched). Resolve exposes no `GetCDL`, so `applied` is SetCDL's answer,
-   not a read-back — applied values can only be read back out of band (a
-   `Timeline.Export` EDL+CDL, or measured pixels). A false `applied` now carries
-   a diagnosis against the item's node count. Returns `complete`, and echoes
-   Depth Converter's own `derivation` line (the gains are a fitted HEURISTIC,
-   and the file says so). `dry_run=True` returns the plan without touching Resolve.
+   untouched). Resolve exposes no `GetCDL`, so `applied` is only SetCDL's answer
+   about itself — **`verify=True` (0.5.0) READS THE GRADE BACK**: it exports the
+   timeline as an EDL carrying ASC CDL and compares what returns against what it
+   set, per clip (`verified`, plus `readBackDiffs` when it does not match) with a
+   `readback` summary. `complete` then requires the read-back to match, so a look
+   that did not take can no longer report success. The EDL has no clip names —
+   every event's reel is `AX` — so events match V1 items BY POSITION. A false
+   `applied` carries a diagnosis against the item's node count. Echoes Depth
+   Converter's own `derivation` line (the gains are a fitted HEURISTIC, and the
+   file says so). `dry_run=True` returns the plan without touching Resolve.
    **Film stock (0.3.1):** when the look block carries `stockIntent`, one
    marker goes on the head of the timeline — `Stock intent: <label>
    (<balance>) — colourist's call, nothing applied`. No node, no LUT, no
@@ -163,7 +167,9 @@ Claude: resolve_status()                          ← preconditions + capabiliti
         import_package("/Volumes/.../manifest.json")
         build_timeline("/Volumes/.../manifest.json")   ← V1 + VO track + markers
         (depthc look-compare --manifest /Volumes/.../manifest.json --emit-cdl)   ← Depth Converter, when the manifest has a look
-        apply_look("/Volumes/.../manifest.json")       ← node-1 CDL per clip: starting balance, key/temp/sat only
+        apply_look("/Volumes/.../manifest.json", verify=True)   ← node-1 CDL per clip: starting balance,
+                                                         key/temp/sat only — and READ BACK out of an
+                                                         EDL+CDL export, not just SetCDL's own answer
         save_project()                                 ← THE VERIFICATION BOUNDARY: an errored append's
                                                          placements survive every in-session read and are
                                                          discarded by the save. Verify on the far side of it.

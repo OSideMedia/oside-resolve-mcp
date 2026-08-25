@@ -653,7 +653,8 @@ def test_tool_annotations_prompt_and_capabilities():
     caps = server.capabilities()
     assert caps["manifest"] == "oside-davinci/v1"
     assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
-                                "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope"]
+                                "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope",
+                                "cdl_readback"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -1327,6 +1328,58 @@ def test_clip_frames_floor_to_match_resolve():
     assert handoff.seconds_to_frames(5.041667, 60.0) == 303
     assert handoff.seconds_to_clip_frames(None, 24) is None
     assert handoff.seconds_to_clip_frames(0.001, 24) == 1   # never zero-length
+
+
+_EDL = """TITLE: readback
+FCM: NON-DROP FRAME
+
+001  AX       V     C        00:00:00:00 00:00:05:00 00:00:00:00 00:00:05:00
+*ASC_SOP (1.000000 1.000000 1.000000)(-0.025000 -0.020000 -0.015000)(1.000000 1.000000 1.000000)
+*ASC_SAT 0.940000
+
+002  AX       V     C        00:00:00:00 00:00:05:00 00:00:05:00 00:00:10:00
+*ASC_SOP (1.000000 1.000000 1.000000)(0.025000 0.030000 0.035000)(1.000000 1.000000 1.000000)
+*ASC_SAT 1.050000
+"""
+
+
+def test_cdl_edl_parses_in_event_order():
+    """The EDL is the ONLY read-back Resolve offers for a grade — there is no
+    GetCDL. Its reel column is `AX` on every event, so events match clips by
+    POSITION, and the parser must preserve order."""
+    rows = handoff.parse_cdl_edl(_EDL)
+    assert len(rows) == 2, rows
+    assert rows[0]["offset"] == [-0.025, -0.02, -0.015]
+    assert rows[0]["saturation"] == 0.94
+    assert rows[1]["offset"] == [0.025, 0.03, 0.035]
+    assert rows[1]["saturation"] == 1.05
+    assert rows[0]["slope"] == [1.0, 1.0, 1.0] and rows[0]["power"] == [1.0, 1.0, 1.0]
+    assert handoff.parse_cdl_edl("") == []
+
+
+def test_cdl_readback_catches_a_grade_that_did_not_take():
+    """A verdict that cannot go red is not a verdict. Same CDL -> match; a
+    changed channel, a changed saturation, or an absent event -> caught."""
+    got = handoff.parse_cdl_edl(_EDL)
+    same = {"slope": [1, 1, 1], "offset": [-0.025, -0.02, -0.015],
+            "power": [1, 1, 1], "saturation": 0.94}
+    assert handoff.compare_cdl(same, got[0])["match"] is True
+
+    # one offset channel silently not applied
+    drifted = handoff.compare_cdl({**same, "offset": [-0.025, -0.02, 0.20]}, got[0])
+    assert drifted["match"] is False and "offset[2]" in drifted["diffs"][0], drifted
+
+    # saturation applied at the wrong value
+    sat = handoff.compare_cdl({**same, "saturation": 0.60}, got[0])
+    assert sat["match"] is False and "saturation" in sat["diffs"][0], sat
+
+    # the clip has no event in the EDL at all — SetCDL claimed success over nothing
+    absent = handoff.compare_cdl(same, None)
+    assert absent["match"] is False and "no CDL for this clip" in absent["diffs"][0]
+
+    # tolerance is real but tight: 6-decimal EDL vs our 4-decimal write
+    near = handoff.compare_cdl({**same, "offset": [-0.0250004, -0.02, -0.015]}, got[0])
+    assert near["match"] is True
 
 
 if __name__ == "__main__":
