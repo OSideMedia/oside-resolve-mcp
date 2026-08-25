@@ -55,8 +55,12 @@ project:
    values). Refuses — applies nothing — without a look block or the CDL file,
    and says why. Returns per-clip rows `{clip, shot, applied, identity, cdl,
    measured}`, `missing`, `extra` (V1 items the manifest does not know stay
-   untouched). Resolve has no CDL getter, so `applied` is SetCDL's answer,
-   not a read-back. `dry_run=True` returns the plan without touching Resolve.
+   untouched). Resolve exposes no `GetCDL`, so `applied` is SetCDL's answer,
+   not a read-back — applied values can only be read back out of band (a
+   `Timeline.Export` EDL+CDL, or measured pixels). A false `applied` now carries
+   a diagnosis against the item's node count. Returns `complete`, and echoes
+   Depth Converter's own `derivation` line (the gains are a fitted HEURISTIC,
+   and the file says so). `dry_run=True` returns the plan without touching Resolve.
    **Film stock (0.3.1):** when the look block carries `stockIntent`, one
    marker goes on the head of the timeline — `Stock intent: <label>
    (<balance>) — colourist's call, nothing applied`. No node, no LUT, no
@@ -77,6 +81,13 @@ project:
    the package carries one, so a package exported before the studio wrote them
    still passes. The
    pre-v2 `clean` + `report` fields stay (`clean` now means overall PASS).
+   **v3 (0.5.0):** each shot marker must NAME its own shot (the old row compared
+   sorted frame lists, so rotating every marker onto a different clip passed);
+   cue and text markers are scored against what the build INTENDED to place, so
+   a deliberately reported skip is no longer a FAIL; narration must be OFF A1;
+   a stock marker is required when the manifest names a `stockIntent`; and a
+   worklist the manifest names but which is not on disk is reported rather than
+   silently passing.
 
 Plus `resolve_status` (with a `capabilities` block — `{"manifest":
 "oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2",
@@ -153,6 +164,9 @@ Claude: resolve_status()                          ← preconditions + capabiliti
         build_timeline("/Volumes/.../manifest.json")   ← V1 + VO track + markers
         (depthc look-compare --manifest /Volumes/.../manifest.json --emit-cdl)   ← Depth Converter, when the manifest has a look
         apply_look("/Volumes/.../manifest.json")       ← node-1 CDL per clip: starting balance, key/temp/sat only
+        save_project()                                 ← THE VERIFICATION BOUNDARY: an errored append's
+                                                         placements survive every in-session read and are
+                                                         discarded by the save. Verify on the far side of it.
         verify_import("/Volumes/.../manifest.json")    ← overall PASS|FAIL, VO rows name their track
 ```
 
@@ -162,6 +176,10 @@ Claude: resolve_status()                          ← preconditions + capabiliti
   project or timeline name is a hard refusal.
 - Template projects are read (exported), never modified.
 - Renders are user-triggered in Resolve, not tool-triggered.
+- `save_project` refuses the default `Untitled Project`: the call cannot succeed
+  there and headless it blocks forever rather than returning.
+- Manifest entries may not be absolute, may not resolve outside the package, and
+  may not share a clip name (Resolve matches clips by basename alone).
 - stdio transport only; nothing listens on the network.
 
 ## Known errors
@@ -188,4 +206,10 @@ appear in the tool's `error` field.
 | `Target project 'X' is not the open project (…).` | a **real** `build_timeline(…, project=X)` while some other project is open — the build is refused rather than laid into the wrong project | open X (or `create_project` it), or drop `project` to build into the open one |
 | `Clips not in the media pool (run import_package first): …` | the timeline build reads clips from the VIDEOS bin and they are not there | run `import_package`; a `build_timeline(dry_run=True)` shows exactly which are missing |
 | `Package file missing on disk: …` | a file the manifest names is gone (drive not mounted, package moved) | mount the drive / restore the package; export again from the studio |
+| `Resolve laid N clip(s) on V1 but M were sent — timeline 'X' is incomplete` | Resolve dropped a clip during the append (an unreadable or offline source is the usual cause). The build stops rather than stamping shot markers onto the wrong pictures and reporting success | check every file opens in Resolve, then rebuild with a new `timeline_name` |
+| `Could not make 'X' the current timeline — refusing to build into whichever timeline is open instead` | Resolve refused the timeline switch. The build refuses rather than appending into whatever was current — a template project ships with timelines of its own | close any modal, retry with a new `timeline_name` |
+| `Resolve imported fewer files than the package names (...)` | `ImportMedia` returned fewer items than paths given | check the media opens in Resolve (codec, drive mounted), then re-run `import_package` |
+| `Two package files share the clip name 'X'` | two manifest entries have the same basename — Resolve matches clips by name alone, so one would silently stand in for the other | re-export from the studio (its exporter numbers colliding names) |
+| `Manifest entry 'X' is an absolute path` / `resolves outside the package directory` | a hand-built or malformed manifest points outside its own package | make every `file` relative to the manifest |
+| `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |

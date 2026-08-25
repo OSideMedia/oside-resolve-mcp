@@ -72,6 +72,46 @@ def _template_fps(manifest: dict) -> float:
         return handoff.kind_fps(manifest)
 
 
+def _check_entries(manifest: dict, base: str) -> None:
+    """Two invariants this server RELIES ON but never used to check.
+
+    1. Every entry path stays inside the package. `os.path.join(base, e["file"])`
+       silently returns an ABSOLUTE path when `file` is absolute, and `../..`
+       walks straight out — so a hand-built or malformed manifest could point
+       imports at anything on disk.
+    2. No two entries share a basename. Resolve matches clips by name alone, so
+       colliding basenames mean the wrong media is laid twice and the right
+       media never — and `apply_look` then grades whichever instance won the
+       dict. OSIDE's exporter already guarantees uniqueness (lib/export/
+       basenames.ts, `claimUniqueFile`), which is exactly why this went unseen:
+       we depend on an invariant only the PRODUCER enforces. A second producer,
+       or a hand-edited package, breaks it silently [audit 2026-08-24].
+    """
+    root = os.path.realpath(base)
+    seen: dict = {}
+    for key in ("videos", "audio"):
+        for e in manifest.get(key) or []:
+            rel = e.get("file") or ""
+            if os.path.isabs(rel):
+                raise rapi.ResolveError(
+                    f"Manifest entry {rel!r} is an absolute path — package files must be "
+                    "relative to the manifest."
+                )
+            full = os.path.realpath(os.path.join(base, rel))
+            if full != root and not full.startswith(root + os.sep):
+                raise rapi.ResolveError(
+                    f"Manifest entry {rel!r} resolves outside the package directory."
+                )
+            name = os.path.basename(rel).lower()
+            if name in seen:
+                raise rapi.ResolveError(
+                    f"Two package files share the clip name {os.path.basename(rel)!r} "
+                    f"({seen[name]} and {rel}) — Resolve matches clips by name alone, so "
+                    "one would silently stand in for the other. Re-export with distinct names."
+                )
+            seen[name] = rel
+
+
 def _load_manifest(manifest_path: str) -> tuple[dict, str]:
     if not os.path.isfile(manifest_path):
         raise rapi.ResolveError(f"Manifest not found: {manifest_path}")
@@ -79,7 +119,9 @@ def _load_manifest(manifest_path: str) -> tuple[dict, str]:
         manifest = json.load(f)
     if manifest.get("format") != "oside-davinci/v1":
         raise rapi.ResolveError(f"Not an oside-davinci/v1 manifest: {manifest_path}")
-    return manifest, os.path.dirname(os.path.abspath(manifest_path))
+    base = os.path.dirname(os.path.abspath(manifest_path))
+    _check_entries(manifest, base)
+    return manifest, base
 
 
 def _abs_files(base: str, entries: list[dict]) -> list[str]:
@@ -127,8 +169,31 @@ def resolve_status() -> dict:
         resolve = rapi.connect()
         pm = rapi.project_manager(resolve)
         current = pm.GetCurrentProject()
+        # PRODUCT NAME, not just the version: it reads "DaVinci Resolve" on the
+        # free edition and "DaVinci Resolve Studio" on Studio. This server needs
+        # Studio (the free edition has no external scripting), and our error
+        # message used to offer three causes at once — closed / scripting off /
+        # free edition — where one call distinguishes them.
+        product = None
+        try:
+            product = resolve.GetProductName()
+        except (AttributeError, TypeError):
+            pass
+        # GetCurrentDatabase is the only HONEST liveness check: after an unclean
+        # shutdown Resolve still answers GetProductName, GetVersionString and
+        # GetCurrentProject normally while LoadProject/CreateProject fail
+        # indefinitely — i.e. every cheap probe passes in the wedged state.
+        database = None
+        try:
+            database = pm.GetCurrentDatabase()
+        except (AttributeError, TypeError):
+            database = None
         return _ok(
             version=resolve.GetVersionString(),
+            product=product,
+            studio=(product is None or "studio" in str(product).lower()),
+            database=database,
+            live=bool(database) if database is not None else None,
             currentProject=current.GetName() if current else None,
             projects=rapi.project_names(pm),
             capabilities=caps,
@@ -198,7 +263,24 @@ def create_project(kind: str, name: str) -> dict:
         pm = rapi.project_manager(resolve)
         project = rapi.create_from_template(pm, drp, name)
         fps = project.GetSetting("timelineFrameRate")
-        return _ok(project=name, template=spec["resolveProject"], timelineFrameRate=fps)
+        # RECONCILE the rate the project actually got against the one
+        # templates.json declares. The rate is authored in three places —
+        # handoff.KIND_FPS, templates.json, and the .drp itself — and only the
+        # .drp is true. Nothing compared them, and export_template overwrites the
+        # snapshot without touching templates.json, so a template re-cut at a
+        # different rate would leave every seconds-to-frames conversion in the
+        # dry run silently wrong [audit 2026-08-24]. Checked today: they agree.
+        declared = _template_fps({"kind": kind})
+        mismatch = None
+        try:
+            if fps is not None and abs(float(fps) - float(declared)) > 0.01:
+                mismatch = (f"project opened at {fps} fps but templates.json declares "
+                            f"{declared} for {kind!r} — re-run export_template, or fix the "
+                            "declared fps; the dry run plans at the declared rate")
+        except (TypeError, ValueError):
+            pass
+        return _ok(project=name, template=spec["resolveProject"], timelineFrameRate=fps,
+                   declaredFrameRate=declared, frameRateWarning=mismatch)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -226,6 +308,17 @@ def import_package(manifest_path: str) -> dict:
             imported[key] = len(items)
 
         expected = {"videos": len(manifest.get("videos") or []), "audio": len(manifest.get("audio") or [])}
+        # The two numbers used to sit side by side under an unconditional ok:true,
+        # so a wholly failed ImportMedia reported success with imported.videos: 0
+        # and pipeline.py's step() — which reads only `ok` — walked straight past
+        # it [audit 2026-08-24]. Compare them.
+        if imported != expected:
+            short = ", ".join(f"{k}: {imported[k]} of {expected[k]}"
+                              for k in expected if imported[k] != expected[k])
+            raise rapi.ResolveError(
+                f"Resolve imported fewer files than the package names ({short}). "
+                "Check the media opens in Resolve, then re-run import_package."
+            )
         return _ok(project=project.GetName(), imported=imported, expected=expected)
     except Exception as e:  # noqa: BLE001
         return _err(e)
@@ -257,9 +350,9 @@ def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool,
         def duration_lookup(v, abs_path):
             secs = handoff.probe_duration_seconds(abs_path)
             if secs is not None:
-                return handoff.seconds_to_frames(secs, fps), "ffprobe"
+                return handoff.seconds_to_clip_frames(secs, fps), "ffprobe"
             if v.get("tcStart") is not None and v.get("tcEnd") is not None:
-                return handoff.seconds_to_frames(float(v["tcEnd"]) - float(v["tcStart"]), fps), "beat"
+                return handoff.seconds_to_clip_frames(float(v["tcEnd"]) - float(v["tcStart"]), fps), "beat"
             return None, "unknown"
         return duration_lookup
 
@@ -306,11 +399,18 @@ def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool,
 
             def duration_lookup(_v, abs_path):
                 item = by_name["videos"].get(os.path.basename(abs_path))
-                frames = rapi.clip_duration_frames(item) if item is not None else None
+                # `fps` is the TIMELINE rate — pass it so a source at a different
+                # rate is conformed. Every OSIDE render is 24 fps and the
+                # explainer template is 60, so without this the connected plan
+                # was short by 182 frames per clip on every explainer board, and
+                # every cue frame derived from those starts was wrong with it
+                # [audit 2026-08-24]. The offline path below was always correct,
+                # which made the CONNECTED dry run the less accurate of the two.
+                frames = rapi.clip_duration_frames(item, fps) if item is not None else None
                 if frames is not None:
                     return frames, "resolve"
                 secs = handoff.probe_duration_seconds(abs_path)
-                return handoff.seconds_to_frames(secs, fps), ("ffprobe" if secs is not None else "unknown")
+                return handoff.seconds_to_clip_frames(secs, fps), ("ffprobe" if secs is not None else "unknown")
 
     except rapi.ResolveError as e:
         fps, fps_source = _template_fps(manifest), "template"
@@ -329,6 +429,10 @@ def _plan(manifest: dict, base: str, timeline_name: str, cues_on: bool,
     plan["textTasksFile"] = manifest.get("textTasks") if cues_on else None
     if text_warning:
         plan["textTaskWarning"] = text_warning
+    # Collected so the GATE can surface them too. A manifest that names a
+    # worklist which is not on disk must not block a build — but reporting PASS
+    # without mentioning it turns a half-copied package into a clean handoff.
+    plan["sidecarWarnings"] = [w for w in (cue_warning, text_warning) if w]
     if "project" not in ctx:
         plan["resolveError"] = ctx.get("error")
     return plan, cues, ctx, text_tasks
@@ -407,7 +511,17 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
         for r in plan["vo"]:
             item = by_name["audio"].get(os.path.basename(r["file"]))
             if item is None:
+                # MARK IT, don't skip it silently. This used to `continue`, and
+                # the loop below then stamped `track: "VO"` on every row anyway —
+                # so a narration file that never imported produced a row claiming
+                # it sat under its shot on the VO track. The aggregate count was
+                # honest; the per-row detail was not, and the row is what an agent
+                # quotes back [audit 2026-08-24].
+                r["placed"] = False
+                r["track"] = None
+                r["reason"] = "not in the VO bin — never appended"
                 continue
+            r["placed"] = True
             record = None if r["mode"] == "atHead" else tl_start + int(r["startFrame"])
             placements.append({"item": item, "recordFrame": record, "label": r.get("label")})
         if placements:
@@ -416,6 +530,8 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             vo_track = rapi.ensure_vo_track(timeline)
             vo_report = rapi.append_audio(media_pool, timeline, placements, vo_track)
             for r in plan["vo"]:
+                if r.get("placed") is False:
+                    continue        # never appended — leave its honest reason alone
                 r["track"] = vo_report["trackName"]
                 r["trackIndex"] = vo_report["track"]
 
@@ -430,7 +546,21 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
         text_report = (rapi.add_text_task_markers(timeline, plan["textTaskMarkers"])
                        if plan["textTaskMarkers"] else {"placed": 0, "skipped": []})
 
+        # RECONCILE BEFORE REPORTING. `summarize` counts the PLAN; the timeline
+        # was observed above. rapi.build_timeline now refuses a clip-count
+        # mismatch outright, so this is the belt to that braces — and it keeps
+        # the reported numbers sourced from the timeline rather than from what
+        # we meant to do [audit 2026-08-24].
         summary = handoff.summarize(plan)
+        landed_count = len(observed["v1"])
+        if landed_count != len(items):
+            raise rapi.ResolveError(
+                f"Resolve laid {landed_count} clip(s) on V1 but {len(items)} were sent — "
+                f"timeline {timeline_name!r} is incomplete."
+            )
+        summary["clips"] = landed_count
+        summary["markers"] = sum(1 for m in (observed.get("markers") or {}).values()
+                                 if (m.get("customData") or "") == rapi.SHOT_TAG)
         summary.update(
             voClips=len(placements),
             voUnderShot=vo_report["underShot"],
@@ -446,6 +576,42 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
         )
         return _ok(dryRun=False, **summary, wouldBuild=True,
                    missing=[m for m in plan["missing"] if m["where"] == "disk"], plan=plan)
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+@mcp.tool(annotations=IDEMPOTENT_WRITE)
+def save_project() -> dict:
+    """Save the open project, and report what V1 holds AFTER the save.
+
+    The save is the verification boundary. Placements from an append whose
+    response errored are not durable — they appear in the timeline, every
+    in-session read agrees they are there, and the save discards them. A witness
+    read from the same unsaved state as the thing it is checking cannot
+    contradict that; only a post-save read can. Run this between build_timeline
+    and verify_import.
+
+    Refuses on the default 'Untitled Project': SaveProject cannot succeed there
+    (no location, no SaveProjectAs) and headless it blocks forever rather than
+    returning."""
+    try:
+        resolve = rapi.connect()
+        pm, project = _open_project(resolve)
+        name = project.GetName()
+        if name == "Untitled Project":
+            raise rapi.ResolveError(
+                "Refusing to save 'Untitled Project' — it has no location, the call cannot "
+                "succeed, and headless it blocks indefinitely. Create a named project first."
+            )
+        if not pm.SaveProject():
+            raise rapi.ResolveError(f"SaveProject returned false for {name!r}.")
+        # what survived the save, per timeline — the whole point of the call
+        after = {}
+        for i in range(project.GetTimelineCount()):
+            tl = project.GetTimelineByIndex(i + 1)
+            if tl is not None:
+                after[tl.GetName()] = len(tl.GetItemListInTrack("video", 1) or [])
+        return _ok(project=name, saved=True, v1CountsAfterSave=after)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -467,17 +633,37 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
         resolve = rapi.connect()
         _pm, project = _open_project(resolve)
         media_pool = project.GetMediaPool()
-        cue_list, _warn = handoff.load_cues(manifest, base) if cues else ([], None)
-        task_list, _twarn = handoff.load_text_tasks(manifest, base) if cues else ([], None)
+        cue_list, cue_warn = handoff.load_cues(manifest, base) if cues else ([], None)
+        task_list, task_warn = handoff.load_text_tasks(manifest, base) if cues else ([], None)
 
         timeline = rapi.timeline_by_name(project, timeline_name)
+        tl_observed = rapi.observe_timeline(timeline) if timeline else None
         observed = {
             "binVideos": _bin_names(media_pool, manifest.get("videos") or [], "VIDEOS"),
             "binAudio": _bin_names(media_pool, manifest.get("audio") or [], "VO"),
-            "timeline": rapi.observe_timeline(timeline) if timeline else None,
+            "timeline": tl_observed,
         }
-        result = handoff.evaluate_verify(manifest, cue_list, observed, cues_expected=cues,
-                                         text_tasks=task_list)
+        # RE-DERIVE THE PLAN FROM THE TIMELINE ITSELF, so `expected` means "what
+        # the build intended to place" rather than "how many lines the CSV holds".
+        # Scoring against the raw worklist made the gate FAIL builds that had
+        # correctly refused to put a marker on the wrong shot [audit 2026-08-24].
+        planned_cues = planned_tasks = None
+        if tl_observed:
+            landed = {it["name"]: it["start"] for it in tl_observed["v1"]}
+            lengths = {it["name"]: it["duration"] for it in tl_observed["v1"]}
+            try:
+                fps = float(project.GetSetting("timelineFrameRate"))
+            except (TypeError, ValueError):
+                fps = _template_fps(manifest)
+            planned_cues = handoff.cue_rows(manifest, cue_list, landed, lengths, fps)
+            planned_tasks = handoff.text_task_rows(manifest, task_list, planned_cues,
+                                                  landed, lengths)
+        result = handoff.evaluate_verify(
+            manifest, cue_list, observed, cues_expected=cues, text_tasks=task_list,
+            planned_cues=planned_cues, planned_text_tasks=planned_tasks,
+            stock_intent=handoff.stock_intent_note(manifest),
+            sidecar_warnings=[w for w in (cue_warn, task_warn) if w],
+        )
         return _ok(overall=result["overall"], clean=result["overall"] == "PASS",
                    checks=result["checks"], report=result["report"])
     except Exception as e:  # noqa: BLE001
@@ -522,14 +708,41 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
         for r in plan["rows"]:
             it = by_name[r["clip"]]
             ok = bool(it.SetCDL(r["set"]))
-            rows.append({"clip": r["clip"], "shot": r["shot"], "applied": ok, "identity": r["identity"], "cdl": r["cdl"], "measured": r["measured"]})
+            row = {"clip": r["clip"], "shot": r["shot"], "applied": ok,
+                   "identity": r["identity"], "cdl": r["cdl"], "measured": r["measured"]}
+            if not ok:
+                # SetCDL returns False with NO reason. The diagnosable cause is
+                # the node count: NodeIndex is 1-based and must not exceed
+                # GetNodeGraph().GetNumNodes() (TimelineItem.GetNumNodes is
+                # deprecated). Attach it rather than reporting a bare false.
+                nodes = None
+                try:
+                    graph = it.GetNodeGraph()
+                    nodes = int(graph.GetNumNodes()) if graph is not None else None
+                except (AttributeError, TypeError, ValueError):
+                    nodes = None
+                row["nodes"] = nodes
+                row["why"] = ("node 1 does not exist on this item" if nodes == 0
+                              else "SetCDL rejected the values" if nodes
+                              else "SetCDL returned false and the node count could not be read")
+            rows.append(row)
         applied = sum(1 for r in rows if r["applied"])
         # the stock is INTENT: one marker, nothing graded for it.
         stock_marker = rapi.add_stock_marker(timeline, stock_note) if stock_note else None
+        # A run where NOTHING applied used to return ok:true. The look is the
+        # whole point of the call; a total failure is a failure [audit 2026-08-24].
+        complete = (applied == len(rows)) and not plan["missing"]
         return _ok(look=manifest["look"].get("name"), applied=applied, of=len(rows), rows=rows,
                    missing=plan["missing"], extra=plan["extra"],
+                   complete=complete,
                    stockMarker=stock_marker,
-                   note="node 1 CDL = starting balance (key/temperature/saturation). Not a read-back: Resolve has no CDL getter. "
+                   # The CDL file carries its own honesty — Depth Converter stamps
+                   # a `derivation` line saying the gains are a fitted HEURISTIC.
+                   # Repeat it rather than substituting our own summary: the file
+                   # was honest about what it is and this tool was not.
+                   derivation=cdl_doc.get("derivation"),
+                   note="node 1 CDL = starting balance (key/temperature/saturation). Not a read-back: Resolve exposes no GetCDL "
+                        "(applied values can only be read back out of band, e.g. a Timeline.Export EDL+CDL). "
                         "A film stock, when the manifest names one, travels as a marker only — never a node or a LUT.")
     except Exception as e:  # noqa: BLE001
         return _err(e)
@@ -561,8 +774,15 @@ def handoff_prompt(manifest_path: str = "<package>/manifest.json") -> str:
         "balance on node 1 of every V1 clip, from the look-cdl.json Depth Converter measured beside the "
         "manifest (`depthc look-compare --manifest --emit-cdl`). Key, temperature, saturation only — never "
         "a palette fix, never a creative grade. If it `refused`, say why and move on; it never blocks the gate.\n"
+        "3c. save_project() — SAVE BEFORE YOU VERIFY. The save is the verification boundary: "
+        "placements from an errored append are visible to every in-session read and are discarded "
+        "by the save, so a gate run before it cannot contradict them. It reports V1 counts AFTER "
+        "the save; compare them with what build_timeline said it laid.\n"
         f"4. verify_import({manifest_path!r}) — the gate. Report `overall` first (PASS or FAIL) and quote "
-        "the failing rows of `checks` verbatim; a FAIL is a FAIL, name the delta.\n\n"
+        "the failing rows of `checks` verbatim; a FAIL is a FAIL, name the delta. The gate binds each "
+        "marker to the shot it names, scores cue/text markers against what the build INTENDED to place "
+        "(a reported skip is not a failure), requires the stock marker when the manifest names a stock, "
+        "and requires narration to be off A1.\n\n"
         "Never render, never delete, never overwrite; name any partial project left behind."
     )
 

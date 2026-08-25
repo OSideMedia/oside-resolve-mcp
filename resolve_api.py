@@ -60,6 +60,55 @@ class ResolveError(RuntimeError):
     pass
 
 
+def marker_frames(timeline) -> set:
+    """Every frame currently carrying a marker, as ints."""
+    try:
+        return {int(float(k)) for k in (timeline.GetMarkers() or {})}
+    except (AttributeError, TypeError, ValueError):
+        return set()
+
+
+def first_free_frame(occupied: set, start, window: int, limit=None):
+    """The first frame at or after `start` that no marker holds, searched in a
+    SET READ ONCE — never by trying writes until one sticks. None when the
+    window (or the clip boundary `limit`) runs out first."""
+    for bump in range(window):
+        at = int(start) + bump
+        if limit is not None and at >= int(limit):
+            return None
+        if at not in occupied:
+            return at
+    return None
+
+
+def add_marker_once(timeline, occupied: set, frame, color, name, note, duration, tag) -> bool:
+    """ONE AddMarker attempt at a frame already known to be free, then record it
+    as taken in `occupied` so the caller never re-reads to find its next slot.
+
+    Collisions are resolved UP FRONT from a single marker read
+    (`first_free_frame`) instead of by trying writes until one sticks. Resolve
+    will not resolve a collision for you, so the search belongs in our own
+    bookkeeping; and a loop over writes is the shape that turns one surprising
+    write into a pile of markers, which is exactly what a stray repeated call
+    produced during the 2026-08-24 walk.
+
+    Honest scope note: AddMarker's return value was measured on Resolve 21.0.4.5
+    and is RELIABLE — it answers False on an occupied frame and True on a free
+    one, including for markers placed past the end of the timeline. An earlier
+    version of this docstring claimed a measured false-negative; that was my own
+    test harness calling apply_look eight times (a dict comprehension evaluating
+    its call once per key), not a Resolve defect. Recorded here because a
+    fabricated vendor quirk in a comment outlives the session that invented it.
+    """
+    at = int(frame)
+    try:
+        timeline.AddMarker(at, color, name, note, duration, tag)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    occupied.add(at)
+    return True
+
+
 def connect():
     """Return the Resolve app object, or raise ResolveError with a fix hint.
     OSIDE_RESOLVE_OFFLINE=1 in the environment makes this raise without
@@ -193,51 +242,90 @@ def build_timeline(project, media_pool, name: str, video_items: list, markers: l
     timeline = media_pool.CreateEmptyTimeline(name)
     if timeline is None:
         raise ResolveError(f"CreateEmptyTimeline failed for {name!r}.")
-    project.SetCurrentTimeline(name)
+    # SetCurrentTimeline takes a TIMELINE OBJECT, not a name — Blackmagic's own
+    # reference is explicit (Developer/Scripting/README.txt: "SetCurrentTimeline
+    # (timeline) --> Bool"). This used to pass `name`, and the call is a no-op on
+    # a string: the build then appended into WHATEVER TIMELINE WAS CURRENT, which
+    # on a fresh template copy is one of the four timelines the .drp ships with —
+    # i.e. it could silently edit a template timeline, the one thing the
+    # create-only guardrail exists to forbid. It went unseen because the test
+    # fake was written to accept a string [audit 2026-08-24].
+    # We already hold the object CreateEmptyTimeline returned; use it, and only
+    # fall back to reading current if Resolve refuses the switch.
+    if not project.SetCurrentTimeline(timeline):
+        current = project.GetCurrentTimeline()
+        if current is None or current.GetName() != name:
+            raise ResolveError(
+                f"Could not make {name!r} the current timeline — refusing to build "
+                "into whichever timeline is open instead."
+            )
+        timeline = current
     if video_items:
         if not media_pool.AppendToTimeline(video_items):
             raise ResolveError("AppendToTimeline failed for the video clips.")
     # markers ride the timeline start of each appended clip. Tagged through
     # customData so verify_import can tell a shot marker from a cue marker by
     # something firmer than its colour.
-    timeline = project.GetCurrentTimeline()
     start = timeline.GetStartFrame()
     track_items = timeline.GetItemListInTrack("video", 1) or []
+    # Reconcile before marking: zip() truncates silently, so a Resolve that laid
+    # fewer clips than it was handed (an unreadable/offline source) would get
+    # markers stamped onto the WRONG pictures and a report claiming success.
+    if len(track_items) != len(markers):
+        raise ResolveError(
+            f"Resolve laid {len(track_items)} clip(s) on V1 but {len(markers)} were sent — "
+            f"timeline {name!r} is incomplete; nothing further was written to it."
+        )
+    occupied = marker_frames(timeline)
     for item, marker in zip(track_items, markers):
         frame = int(item.GetStart()) - int(start)
-        timeline.AddMarker(frame, SHOT_MARKER_COLOR, marker["name"], marker.get("note", ""), 1, SHOT_TAG)
+        if frame in occupied:
+            raise ResolveError(
+                f"Frame {frame} already carries a marker — refusing to build "
+                f"{name!r} over an existing marker set."
+            )
+        add_marker_once(timeline, occupied, frame, SHOT_MARKER_COLOR, marker["name"],
+                        marker.get("note", ""), 1, SHOT_TAG)
     return timeline
 
 
 def add_range_markers(timeline, rows: list[dict]) -> dict:
     """Range markers for dialogue cues — one per scripted line, under its shot.
 
-    rows: [{"frame": int, "duration": int, "color": str, "name": str, "note": str}]
+    rows: [{"frame": int, "duration": int, "color": str, "name": str, "note": str,
+            "limit": int | None}]
       frame is TIMELINE-RELATIVE (0 = the timeline's first frame), the same
-      reference the shot markers use.
+      reference the shot markers use. `limit` is the first frame PAST this cue's
+      own shot — the nudge never crosses it.
 
     Resolve keys markers by frame — one marker per frame, and AddMarker simply
     answers False when the slot is taken. A cue whose computed frame is already
-    occupied (a long line running past its clip into the next shot's Blue
-    marker, or a colliding cue) is nudged forward a few frames before it is
+    occupied (a colliding cue) is nudged forward a few frames before it is
     given up on; a skipped cue is REPORTED, never silently dropped.
+
+    THE NUDGE STOPS AT THE CLIP BOUNDARY. Without `limit` this loop would walk a
+    cue onto the NEXT shot and report it `placed` — defeating the boundary guard
+    the planner applies, because the guard lives in handoff.py and the transform
+    lives here [audit 2026-08-24]. A marker on the wrong picture tells the editor
+    the wrong line belongs to this shot, which is worse than no marker.
     """
-    # ponytail: 4-frame nudge window; a proper free-slot search if cue-dense boards need it
+    # ponytail: 4-frame search window; widen only if cue-dense boards need it
+    occupied = marker_frames(timeline)
     placed, skipped = 0, []
     for r in rows:
         frame = r.get("frame")
         if frame is None:
-            skipped.append({"name": r["name"], "reason": "no frame (shot has no clip on V1)"})
+            skipped.append({"name": r["name"],
+                            "reason": r.get("reason") or "no frame (shot has no clip on V1)"})
             continue
-        ok = False
-        for bump in range(0, 4):
-            if timeline.AddMarker(int(frame) + bump, r["color"], r["name"], r.get("note", ""), max(1, int(r.get("duration") or 1)), CUE_TAG):
-                ok = True
-                break
-        if ok:
-            placed += 1
-        else:
-            skipped.append({"name": r["name"], "frame": frame, "reason": "AddMarker refused (frame occupied)"})
+        at = first_free_frame(occupied, frame, 4, r.get("limit"))
+        if at is None:
+            skipped.append({"name": r["name"], "frame": frame,
+                            "reason": "no free frame inside this shot"})
+            continue
+        add_marker_once(timeline, occupied, at, r["color"], r["name"], r.get("note", ""),
+                        max(1, int(r.get("duration") or 1)), CUE_TAG)
+        placed += 1
     return {"placed": placed, "skipped": skipped}
 
 
@@ -255,45 +343,68 @@ def add_stock_marker(timeline, text: str) -> dict:
     REPORTS the frame it landed on. A marker it could not place is reported as
     skipped — never silently dropped.
     """
-    # ponytail: 8-frame nudge window, same shape as the cue nudge; a free-slot
-    # search only if a head-dense timeline ever needs it.
-    for bump in range(0, 8):
-        if timeline.AddMarker(bump, STOCK_MARKER_COLOR, "Stock intent", text, 1, STOCK_TAG):
-            return {"placed": True, "frame": bump, "note": text}
-    return {"placed": False, "reason": "AddMarker refused frames 0-7 (all occupied)", "note": text}
+    # IDEMPOTENT. apply_look is documented as re-runnable ("absolute values, a
+    # re-run resets node 1 to the same CDL") and the CDL half is — but the stock
+    # marker was not: every run added ANOTHER one, so re-applying a look to a
+    # timeline three times left three "Stock intent" markers a few frames apart.
+    # Found on the 2026-08-24 walk, when a harness bug called apply_look eight
+    # times and six markers piled up at the head of the timeline. The harness bug
+    # was mine; the accumulation it exposed is real, and a colourist re-running
+    # the look would have hit it [audit 2026-08-24].
+    existing = None
+    for k, m in (timeline.GetMarkers() or {}).items():
+        if (m.get("customData") or "") == STOCK_TAG:
+            existing = int(float(k))
+            break
+    if existing is not None:
+        return {"placed": True, "frame": existing, "note": text, "alreadyPresent": True}
+    # ponytail: 8-frame search window, same shape as the cue search
+    occupied = marker_frames(timeline)
+    at = first_free_frame(occupied, 0, 8)
+    if at is None:
+        return {"placed": False, "reason": "no free frame in 0-7 (all occupied)", "note": text}
+    add_marker_once(timeline, occupied, at, STOCK_MARKER_COLOR, "Stock intent", text, 1, STOCK_TAG)
+    return {"placed": True, "frame": at, "note": text}
 
 
 def add_text_task_markers(timeline, rows: list[dict]) -> dict:
     """The in-frame-text worklist — one POINT marker per run of lettering, on
     the shot that asked for it.
 
-    rows: [{"frame": int|None, "name": str, "note": str}]
+    rows: [{"frame": int|None, "name": str, "note": str, "limit": int | None}]
       frame is TIMELINE-RELATIVE, the same reference the shot and cue markers
-      use. A point marker, not a range: a title has no duration until the editor
-      gives it one, and inventing a length here would be a claim about the cut.
+      use. `limit` is the first frame PAST this task's own clip. A point marker,
+      not a range: a title has no duration until the editor gives it one, and
+      inventing a length here would be a claim about the cut.
 
     Nudge-and-report, the same shape as the cue and stock markers, because the
     frames near a shot's head are the contested ones — shot 1's Blue marker sits
     on frame 0 and the dialogue cues cascade from frame 1. A marker that cannot
     find a free slot is REPORTED, never silently dropped.
+
+    THE NUDGE STOPS AT THE CLIP BOUNDARY. text_task_rows refuses to plan a task
+    past its own clip; without `limit` this loop walked straight past that
+    decision and landed the marker on the next shot anyway, reporting `placed`
+    [audit 2026-08-24].
     """
-    # ponytail: 12-frame nudge window — wider than the cues' 4 because text
+    # ponytail: 12-frame search window — wider than the cues' 4 because text
     # tasks are placed AFTER them and therefore start further into a busy shot.
+    occupied = marker_frames(timeline)
     placed, skipped = 0, []
     for r in rows:
         frame = r.get("frame")
         if frame is None:
-            skipped.append({"name": r["name"], "reason": r.get("reason") or "no frame (shot has no clip on V1)"})
+            skipped.append({"name": r["name"],
+                            "reason": r.get("reason") or "no frame (shot has no clip on V1)"})
             continue
-        ok = False
-        for bump in range(0, 12):
-            if timeline.AddMarker(int(frame) + bump, TEXT_TASK_MARKER_COLOR, r["name"], r.get("note", ""), 1, TEXT_TASK_TAG):
-                ok = True
-                break
-        if ok:
-            placed += 1
-        else:
-            skipped.append({"name": r["name"], "frame": frame, "reason": "AddMarker refused (frames occupied)"})
+        at = first_free_frame(occupied, frame, 12, r.get("limit"))
+        if at is None:
+            skipped.append({"name": r["name"], "frame": frame,
+                            "reason": "no free frame inside this shot"})
+            continue
+        add_marker_once(timeline, occupied, at, TEXT_TASK_MARKER_COLOR, r["name"],
+                        r.get("note", ""), 1, TEXT_TASK_TAG)
+        placed += 1
     return {"placed": placed, "skipped": skipped}
 
 
@@ -392,23 +503,43 @@ def timecode_to_frames(tc: str, fps) -> int | None:
     return ((h * 60 + m) * 60 + s_) * base + f
 
 
-def clip_duration_frames(item) -> int | None:
+def clip_duration_frames(item, timeline_fps: float | None = None) -> int | None:
     """A media-pool item's length in frames, or None when Resolve won't say.
 
     Video items answer `Frames`; AUDIO items answer '' there and only carry
     `Duration` as timecode at the item's `FPS` [live walk 2026-08-16] — read
-    that, and fall back to ffprobe on the file when even that is blank."""
+    that, and fall back to ffprobe on the file when even that is blank.
+
+    `Frames` is the count in the CLIP'S OWN rate. Pass `timeline_fps` to get the
+    number of TIMELINE frames the clip will occupy — they are not the same
+    number whenever the source rate differs from the timeline's. Every OSIDE
+    render lands at exactly 24 fps (measured across the live-fire library
+    2026-08-24) while the explainer template runs at 60, so a 5.04 s clip
+    reporting 121 source frames actually occupies 303 frames on an explainer
+    timeline. Without the conversion the connected dry run was wrong by 182
+    frames per clip on every explainer board, and every cue frame computed from
+    those starts was wrong with it. Cinematic escapes only by luck: 24 on 23.976
+    conforms frame-for-frame."""
+    def _conform(frames: int, src_fps) -> int:
+        try:
+            src = float(src_fps or 0)
+        except (TypeError, ValueError):
+            return frames
+        if not timeline_fps or not src or abs(src - float(timeline_fps)) < 0.05:
+            return frames
+        return max(1, int(round(frames / src * float(timeline_fps))))
+
     try:
         frames = item.GetClipProperty("Frames")
         if frames not in (None, ""):
-            return int(frames)
+            return _conform(int(frames), item.GetClipProperty("FPS"))
     except (AttributeError, TypeError, ValueError):
         pass
     try:
         fps = item.GetClipProperty("FPS")
         n = timecode_to_frames(item.GetClipProperty("Duration"), fps)
         if n:
-            return n
+            return _conform(n, fps)
     except (AttributeError, TypeError, ValueError):
         pass
     try:
@@ -423,25 +554,12 @@ def clip_duration_frames(item) -> int | None:
     return None
 
 
-def video_start_frames(timeline, video_items: list) -> dict:
-    """Where each appended clip actually LANDED on V1: {clip name -> recordFrame}.
-
-    The caller already has the media-pool items in append order and Resolve
-    lays them in that same order, so zipping the track items back against them
-    is the same correspondence the marker loop above relies on.
-
-    Exists so shot-attached audio can sit UNDER its clip instead of stacking at
-    00:00. Keyed by the media-pool item's own name (which is the filename), so
-    the caller can look up by manifest basename.
-    """
-    track_items = timeline.GetItemListInTrack("video", 1) or []
-    frames = {}
-    for pool_item, track_item in zip(video_items, track_items):
-        try:
-            frames[pool_item.GetName()] = int(track_item.GetStart())
-        except (AttributeError, TypeError, ValueError):
-            continue
-    return frames
+# `video_start_frames` lived here until 2026-08-24. It was dead (grep found only
+# its own definition) AND it returned ABSOLUTE frames where every sibling in this
+# module returns timeline-relative ones — so the next caller to reach for it by
+# name would have laid every marker and VO take an hour into the timeline (a
+# default project starts at frame 86400). server.build_timeline does the job now,
+# from observe_timeline. Deleted rather than left as a trap.
 
 
 def ensure_vo_track(timeline) -> int:
@@ -536,8 +654,20 @@ def append_audio(media_pool, timeline, placements: list, track_index: int) -> di
             clip_info.update({"startFrame": 0, "endFrame": end})
         before = read()
         media_pool.AppendToTimeline([clip_info])  # return value NOT trusted
-        if _find_new_item(before, read(), name, record - start) is not None:
+        after = read()
+        if _find_new_item(before, after, name, record - start) is not None:
             report["atHead" if at_head else "underShot"] += 1
+            continue
+        # Did it arrive somewhere ELSE? Matching on the exact frame alone meant a
+        # placement Resolve honoured at a shifted frame read as "nothing was
+        # placed", and the tail retry below then appended a SECOND copy of the
+        # take before raising an error saying nothing had been placed at all
+        # [audit 2026-08-24]. Look by name first; a take that arrived is `loose`,
+        # not a reason to append it twice.
+        shifted = _find_new_item(before, after, name, None)
+        if shifted is not None:
+            report["loose"] += 1
+            report["looseLabels"].append(p.get("label") or name)
             continue
         # The exact frame was refused (an occupied slot on the VO track — two
         # head takes, or overlapping pins). The clip still has to ARRIVE: lay

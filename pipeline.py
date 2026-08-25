@@ -70,11 +70,55 @@ def main() -> int:
         print(json.dumps(report))
         return 0 if report["ok"] else 1
 
+    def look_step() -> bool:
+        """The look, ADVISORY. `apply_look` refuses cleanly when the manifest has
+        no look block or Depth Converter has not measured a look-cdl.json beside
+        it — a refusal is a legitimate outcome and must not fail the build (the
+        handoff prompt says exactly this). What is NOT acceptable is what this
+        pipeline did before: skip the step entirely and say nothing, so the
+        grade silently failed to travel on the one-click path while the
+        agent-driven path applied it [audit 2026-08-24]. A look that was
+        attempted and came back incomplete IS a failure."""
+        if not manifest.get("look"):
+            report["steps"]["look"] = {"ok": True, "skipped": "manifest carries no look block"}
+            return True
+        result = server.apply_look(args.manifest, args.timeline)
+        report["steps"]["look"] = result
+        if result.get("refused"):
+            return True
+        if not result.get("ok") or not result.get("complete"):
+            report["error"] = (f"look: applied {result.get('applied')} of {result.get('of')}"
+                               f" — {result.get('error') or 'not every clip took the CDL'}")
+            return False
+        return True
+
+    def save_step() -> bool:
+        """THE SAVE IS THE VERIFICATION BOUNDARY, not the end of the job.
+
+        Placements from an append whose response errored are not durable: they
+        appear in the timeline, every in-session read agrees they are there, and
+        the save discards them — measured elsewhere on a real turnover at
+        573 items before the save and 500 after. Our whole re-read doctrine is a
+        pre-save witness derived from the same unsaved state as the thing it
+        checks, so it cannot contradict this class of defect; only a post-save
+        read can. Verify AFTER this step.
+
+        Guarded on a named project: on the default 'Untitled Project' SaveProject
+        returns False in the GUI and BLOCKS FOREVER headless. This pipeline
+        always creates a named project, so the guard is belt-and-braces."""
+        result = server.save_project()
+        report["steps"]["save"] = result
+        if not result.get("ok"):
+            report["error"] = f"save: {result.get('error', 'failed')}"
+        return bool(result.get("ok"))
+
     done = (
         step("launch", server.launch_resolve())
         and step("create", server.create_project(kind, name))
         and step("import", server.import_package(args.manifest))
         and step("timeline", server.build_timeline(args.manifest, args.timeline, cues=cues))
+        and look_step()
+        and save_step()
         and step("verify", server.verify_import(args.manifest, args.timeline, cues=cues))
     )
     verify = report["steps"].get("verify", {})
