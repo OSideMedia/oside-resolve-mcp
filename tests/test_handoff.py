@@ -38,8 +38,21 @@ def _fixture():
 # ---------------------------------------------------------------------------
 
 class FakeItem:
+    """A timeline item, with COLOUR VERSIONS modelled per the vendor contract and
+    the 2026-08-25 live measurements on 21.0.4.5:
+
+      * a clip starts with one version, 'Version 1';
+      * `AddVersion(name, 0)` CREATES AND SWITCHES — GetCurrentVersion reports
+        the new one immediately;
+      * `SetCDL` writes into whichever version is ACTIVE.
+
+    Before this the fake had no SetCDL and no versions at all, so apply_look's
+    impure half had never been exercised by anything.
+    """
     def __init__(self, name, start, duration):
         self._n, self._s, self._d = name, start, duration
+        self._versions = {"Version 1": None}
+        self._current = "Version 1"
 
     def GetName(self):
         return self._n
@@ -49,6 +62,33 @@ class FakeItem:
 
     def GetDuration(self):
         return self._d
+
+    # ---- colour versions ----
+    def GetVersionNameList(self, version_type=0):
+        return list(self._versions)
+
+    def GetCurrentVersion(self):
+        return {"versionName": self._current, "versionType": 0}
+
+    def AddVersion(self, name, version_type=0):
+        if name in self._versions:
+            return False
+        self._versions[name] = None
+        self._current = name          # measured: AddVersion switches
+        return True
+
+    def LoadVersionByName(self, name, version_type=0):
+        if name not in self._versions:
+            return False
+        self._current = name
+        return True
+
+    def SetCDL(self, payload):
+        self._versions[self._current] = dict(payload)   # lands in the ACTIVE version
+        return True
+
+    def cdl_in(self, version):
+        return self._versions.get(version)
 
 
 class FakeTimeline:
@@ -1428,6 +1468,61 @@ def test_an_existing_vo_track_is_reused_whatever_its_format():
     tl.SetTrackName("audio", 2, rapi.VO_TRACK_NAME)
     tl._subtypes[("audio", 2)] = "stereo"
     assert rapi.ensure_vo_track(tl) == 2      # reused, no refusal
+
+
+def test_the_look_lands_in_its_own_colour_version_not_the_colourists():
+    """SetCDL writes node 1 of whatever version is ACTIVE, so the tool used to
+    write into the same slot a colourist grades in — the one place this server
+    overwrote a human's work. Measured 2026-08-25: AddVersion creates AND
+    switches, so the CDL lands in ours with no extra call."""
+    it = FakeItem("shot01.mp4", 0, 120)
+    # the colourist's own work, in the version the clip ships with
+    it.SetCDL({"NodeIndex": "1", "Saturation": "0.777"})
+    assert it.cdl_in("Version 1")["Saturation"] == "0.777"
+
+    ver = rapi.look_version(it)
+    assert ver["version"] == rapi.LOOK_VERSION_NAME == "OSIDE base"
+    assert ver["created"] is True and ver["active"] is True
+    assert ver["was"] == "Version 1"
+
+    it.SetCDL({"NodeIndex": "1", "Saturation": "0.940"})
+    # ours landed in ours...
+    assert it.cdl_in("OSIDE base")["Saturation"] == "0.940"
+    # ...and THEIRS SURVIVED, which is the whole point
+    assert it.cdl_in("Version 1")["Saturation"] == "0.777"
+    # and ours is left ACTIVE, so the film still opens showing the balance
+    assert it.GetCurrentVersion()["versionName"] == "OSIDE base"
+
+
+def test_a_second_run_reuses_the_version_and_overwrites_only_ours():
+    """A re-run overwriting OSIDE base is INTENDED — the version carries our
+    name. What must not happen is a second version, or a write to theirs."""
+    it = FakeItem("shot01.mp4", 0, 120)
+    it.SetCDL({"Saturation": "0.777"})                     # colourist, Version 1
+    rapi.look_version(it); it.SetCDL({"Saturation": "0.940"})
+    again = rapi.look_version(it)
+    assert again["created"] is False and again["active"] is True
+    it.SetCDL({"Saturation": "1.010"})
+    assert it.GetVersionNameList(0) == ["Version 1", "OSIDE base"], "no version proliferation"
+    assert it.cdl_in("OSIDE base")["Saturation"] == "1.010"
+    assert it.cdl_in("Version 1")["Saturation"] == "0.777"
+
+
+def test_a_resolve_without_versions_falls_back_and_says_so():
+    """Colour bookkeeping must never fail a build. A Resolve that will not give
+    us a version writes the active one — today's behaviour — and reports why."""
+    class NoVersions(FakeItem):
+        def GetVersionNameList(self, version_type=0):
+            raise AttributeError("not on this build")
+    v = rapi.look_version(NoVersions("s.mp4", 0, 10))
+    assert v["version"] is None and v["active"] is False
+    assert "does not expose colour versions" in v["why"]
+
+    class WontCreate(FakeItem):
+        def AddVersion(self, name, version_type=0):
+            return False
+    v2 = rapi.look_version(WontCreate("s.mp4", 0, 10))
+    assert v2["version"] is None and "could not create" in v2["why"]
 
 
 if __name__ == "__main__":

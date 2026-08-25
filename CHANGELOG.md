@@ -197,6 +197,59 @@ now reproduces the condition and shows the fix holding: **A1 carried
 `capabilities.features` gains `verify_v3`, `post_save`, `cdl_envelope` and
 `cdl_readback`.
 
+## 0.5.2 — 2026-08-25
+
+**The look gets its own colour version, so a re-run cannot overwrite a colourist.**
+
+`SetCDL` writes node 1 of whatever colour VERSION is active, so `apply_look` wrote
+into the same slot a colourist grades in — the one place this server overwrote a
+human's work, against the create-only guardrail everything else obeys.
+
+The CDL now lands in a version named `OSIDE base`, created per clip and left
+ACTIVE. The film still opens showing the balance exactly as before; the colourist
+gains a clean `Version 1` underneath and an unambiguous name for which grade is
+the tool's.
+
+**Scope, stated honestly:** this does NOT stop a re-run overwriting the version it
+owns — that is intended, the version carries our name. It stops a re-run
+overwriting THEIRS, provided they grade in their own version, which is standard
+practice and which the named version now makes obvious.
+
+**And a correction to how this was first framed:** the trigger is NOT the
+director's rebuild. `create_project` refuses an existing project name and runs
+first, so pressing *Build in Resolve* again either fails at step one or makes a
+new project — the create-only guardrail already blocked that path. The real
+exposure is a direct `apply_look` call on a timeline a colourist has since
+graded, which is the agent path, not the button.
+
+### Measured before any of it was written (21.0.4.5, 2026-08-25)
+
+One answer decided the design, so it was probed rather than guessed:
+
+- `AddVersion(name, 0)` works and is **not Studio-gated**.
+- It **creates AND switches** — `GetCurrentVersion` reports the new one at once,
+  so a `SetCDL` straight after lands in ours with no extra call.
+- `SetCDL` writes to the **active** version (`Version 1` kept its own values).
+- `Timeline.Export` EDL+CDL **reads back the active version**.
+
+That last one is why `verify=True` had to move with the write. Building this
+blind and leaving the export where it was would have had the read-back confirm
+the COLOURIST'S grade and report success — a check that always passes, which is
+worse than no check.
+
+### Walked live
+
+A clip graded to `saturation 0.777` first, then `apply_look(verify=True)`:
+applied 3/3, `complete`, read-back verified 3/3 against `OSIDE base`. Afterwards
+every clip carried both versions with ours active, and reading each back through
+the EDL gave `Version 1 = [0.777, 0.777, 0.777]` and
+`OSIDE base = [0.94, 1.05, 0.99]`. Both survived.
+
+Never fails a build: a Resolve that will not give us a version falls back to
+today's behaviour and says so on the row. The fake now models colour versions and
+`SetCDL` at all — before this, `apply_look`'s impure half had never been
+exercised by anything. Tests 59 → 62, all three new ones proven red.
+
 ## 0.5.1 — 2026-08-25
 
 Follow-ups from evaluating eight more Resolve MCP repos (barckley75, hiteshK03,

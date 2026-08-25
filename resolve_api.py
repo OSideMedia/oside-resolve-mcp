@@ -39,6 +39,13 @@ VO_TRACK_NAME = "VO"
 # defaults to mono silently, so the value below is the difference between an
 # intent and an accident.
 VO_TRACK_SUBTYPE = "mono"
+# THE LOOK LIVES IN ITS OWN COLOUR VERSION [decided 2026-08-25]. SetCDL writes
+# node 1 of whatever version is ACTIVE, so writing the bare active version put
+# our starting balance in the same slot a colourist grades in. The version is
+# left ACTIVE after apply_look, so the film still opens showing the balance
+# exactly as it did before — the colourist simply now has a clean Version 1
+# underneath, and a name that says which grade is the tool's.
+LOOK_VERSION_NAME = "OSIDE base"
 CUE_TAG = "oside:cue"
 CUE_MARKER_COLORS = (
     "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia", "Rose",
@@ -447,6 +454,75 @@ def export_timeline_cdl(resolve, timeline) -> str | None:
         return None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def look_version(item, name: str = LOOK_VERSION_NAME) -> dict:
+    """Make `name` the item's active colour VERSION, creating it when absent.
+
+    WHY A VERSION AT ALL. `SetCDL` writes node 1 of whatever version is active,
+    so before this the tool wrote into the same slot a colourist grades in — the
+    one place in this repo that overwrote a human's work, against the create-only
+    guardrail everything else obeys. A named version gives the colourist a
+    labelled, recoverable reference and an unambiguous answer to "which grade is
+    the tool's".
+
+    Scope, honestly: this does NOT stop a re-run from overwriting the version it
+    owns — that is intended, the version carries our name. It stops a re-run from
+    overwriting THEIRS, provided they grade in their own version, which is
+    standard practice and which the named version now makes obvious.
+
+    MEASURED 2026-08-25 on 21.0.4.5, and every step of the sequence matters:
+      - `AddVersion(name, 0)` works and is NOT Studio-gated;
+      - it CREATES AND SWITCHES — `GetCurrentVersion` reports the new one at once,
+        so a SetCDL straight after lands in ours with no extra call;
+      - `SetCDL` writes to the ACTIVE version (Version 1 kept its own values);
+      - `Timeline.Export` EDL+CDL reads back the ACTIVE version — so the
+        read-back only tells the truth about OUR grade while ours is active.
+        Verifying without this would have quietly confirmed the colourist's
+        grade instead and reported success.
+
+    Never raises: a Resolve that will not give us a version is a reason to fall
+    back to today's behaviour (write the active version) and SAY SO, not to fail
+    a build over colour bookkeeping.
+    """
+    was = None
+    try:
+        cur = item.GetCurrentVersion() or {}
+        was = cur.get("versionName") if isinstance(cur, dict) else None
+    except (AttributeError, TypeError):
+        was = None
+    try:
+        existing = list(item.GetVersionNameList(0) or [])
+    except (AttributeError, TypeError):
+        return {"version": None, "active": False, "was": was,
+                "why": "this Resolve does not expose colour versions — wrote the active version"}
+    if name in existing:
+        try:
+            ok = bool(item.LoadVersionByName(name, 0))
+        except (AttributeError, TypeError):
+            ok = False
+        return {"version": name if ok else None, "active": ok, "was": was, "created": False,
+                "why": None if ok else f"could not switch to {name!r} — wrote the active version"}
+    try:
+        made = bool(item.AddVersion(name, 0))
+    except (AttributeError, TypeError):
+        made = False
+    if not made:
+        return {"version": None, "active": False, "was": was, "created": False,
+                "why": f"could not create {name!r} — wrote the active version"}
+    # AddVersion switches on its own (measured); confirm rather than assume
+    try:
+        cur = item.GetCurrentVersion() or {}
+        active = (cur.get("versionName") if isinstance(cur, dict) else None) == name
+    except (AttributeError, TypeError):
+        active = False
+    if not active:
+        try:
+            active = bool(item.LoadVersionByName(name, 0))
+        except (AttributeError, TypeError):
+            active = False
+    return {"version": name if active else None, "active": active, "was": was, "created": True,
+            "why": None if active else f"created {name!r} but could not make it active"}
 
 
 def timeline_by_name(project, name: str | None):
