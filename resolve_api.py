@@ -29,10 +29,29 @@ RESOLVE_APP = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
 # without leaning on colour.
 SHOT_MARKER_COLOR = "Blue"
 SHOT_TAG = "oside:shot"
-# Narration lives on ITS OWN audio track. Clips with embedded audio (Seedance
-# 2.x default) fill A1 when the video is appended, and Resolve's
-# AppendToTimeline answers a truthy list for an audio clip aimed at an
-# occupied A1 frame while placing NOTHING [live walk 2026-08-16].
+# A1 CARRIES THE SHOT'S OWN AUDIO, BY DESIGN — and narration therefore lives on
+# ITS OWN track. Both halves of that sentence are decisions, not accidents.
+#
+# The shot audio is COMMISSIONED. Seedance generates audio and video in one pass,
+# and OSIDE directs it: `lib/prompter/audio.ts` is an audio-direction layer that
+# emits a `Audio: / Dialogue: / Voices:` block with per-second lip-sync timing,
+# gated in production by `check-voice-lock`. So the audio arriving on A1 is the
+# performance the director specified and paid for — dialogue, SFX, ambience —
+# not junk riding along with the picture.
+#
+# We append the shot clips as a bare item list, which is what lays that audio on
+# A1. `AppendToTimeline` also accepts `mediaType: 1` (video only), which would
+# leave A1 empty — measured 2026-08-25. We deliberately do NOT use it here.
+# Stripping A1 would discard generated dialogue and its lip-sync on every
+# handoff. (The `--keep-audio` inversion in OSIDE's b-roll intake is the OPPOSITE
+# case and does not transfer: b-roll is stock footage with BGM nobody asked for,
+# where "the edit owns sound" is right. These are the film's own shots.)
+#
+# Narration is separate work and gets its own track. That separation is what the
+# VO lane is for — not a workaround for A1 being "taken". Resolve's
+# AppendToTimeline answers a truthy list for an audio clip aimed at an occupied
+# A1 frame while placing NOTHING [live walk 2026-08-16], which is why placement
+# is judged by re-reading the track.
 VO_TRACK_NAME = "VO"
 # Narration is MONO by decision [Peter, 2026-08-25]; stereo is reserved for sound
 # effects and music, which this bridge does not lay today. AddTrack("audio")

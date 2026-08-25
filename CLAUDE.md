@@ -109,13 +109,26 @@ of them. If one looks wrong, say so and leave it.**
   (~1150 lines). Probe it before guessing, and prefer it to any third-party
   docstring.
 
+## Decided, with the reason — do not reopen without arguing against it
+
+- **A1 carries the shot's own audio, and that is intentional** [decided
+  2026-08-25]. `mediaType: 1` on the V1 append would leave A1 empty (measured),
+  and we deliberately do not use it. Seedance generates audio and video in one
+  pass, and OSIDE *directs* it: `lib/prompter/audio.ts` emits an
+  `Audio: / Dialogue: / Voices:` block with per-second lip-sync timing, gated by
+  `check-voice-lock`. The audio on A1 is the performance the director specified
+  and paid for. Stripping it would discard generated dialogue and its lip-sync
+  on every handoff.
+
+  **The trap that nearly caused this to be "fixed":** OSIDE's b-roll intake
+  strips audio by default — "b-roll must be silent, the edit owns sound" — and
+  that rule looks like it should generalise. It does not. B-roll is stock
+  footage carrying BGM nobody asked for; these are the film's own shots. Same
+  mechanism, opposite intent. Narration rides its own track because it is
+  *separate work*, not because A1 is "taken".
+
 ## Open product calls
 
-- **Embedded audio on A1.** Measured 2026-08-25: `mediaType: 1` on the V1 append
-  keeps A1 empty; the bare list we ship lays the shot clips' embedded audio
-  there. The whole `vo_track` feature works *around* that fill — so it is opt-out,
-  not a fact of nature. Whether OSIDE renders' embedded audio should reach the
-  editor at all is undecided.
 - **Clip-level markers.** `TimelineItem.AddMarker` is clip-relative and travels
   with the clip through trims; ours sit at absolute timeline frames and go stale
   the moment an editor ripples. Decided 2026-08-24 to keep timeline markers;

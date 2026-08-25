@@ -14,8 +14,11 @@ project:
    cues=True, project=None)` — clips in shot order on V1, one Blue point
    marker per shot carrying its number + description (+ VO line for
    explainers), each pinned VO take under its own shot **on its own audio
-   track named `VO`** (added to the timeline — never A1, which the shot clips'
-   embedded audio fills; unpinned VO at the head of that track), and — when the
+   track named `VO`** (added to the timeline — never A1, which carries the shot
+   clips' OWN audio: Seedance generates audio and video in one pass and OSIDE
+   directs it, so A1 holds the dialogue, SFX and ambience the director specified.
+   Narration is separate work and gets its own lane; unpinned VO at the head of
+   that track), and — when the
    manifest names a `dialogue-cues.csv` — one **range marker per scripted
    line** under its shot: name = speaker, note = the line, length = the line's
    estimate (the shot's length when a cue has none), one colour per speaker
