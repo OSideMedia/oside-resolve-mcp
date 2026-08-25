@@ -58,6 +58,9 @@ class FakeTimeline:
         for i in range(2, audio_tracks + 1):
             self._tracks[("audio", i)] = []
         self._names = {}
+        # the real template's A1 is STEREO (measured 2026-08-25); only tracks we
+        # add ourselves are mono, and only because we now ask for it
+        self._subtypes = {("audio", 1): "stereo"}
         self._markers = dict(markers or {})
 
     def GetName(self):
@@ -69,10 +72,21 @@ class FakeTimeline:
     def GetTrackCount(self, kind):
         return sum(1 for k, _ in self._tracks if k == kind)
 
-    def AddTrack(self, kind, *_):
+    def AddTrack(self, kind, subtype=None):
+        """Models the vendor contract: `AddTrack(trackType, subTrackType)`, and
+        subTrackType DEFAULTS TO 'mono' for audio when omitted (vendor README
+        line 376). Measured 2026-08-25 on 21.0.4.5 — a bare AddTrack('audio')
+        really does come back 'mono' while the template's A1 is 'stereo'."""
         idx = self.GetTrackCount(kind) + 1
         self._tracks[(kind, idx)] = []
+        if kind == "audio":
+            self._subtypes[(kind, idx)] = (subtype or "mono")
         return True
+
+    def GetTrackSubType(self, kind, idx):
+        if kind != "audio":
+            return ""
+        return self._subtypes.get((kind, idx), "stereo")
 
     def SetTrackName(self, kind, idx, name):
         if (kind, idx) not in self._tracks:
@@ -1380,6 +1394,40 @@ def test_cdl_readback_catches_a_grade_that_did_not_take():
     # tolerance is real but tight: 6-decimal EDL vs our 4-decimal write
     near = handoff.compare_cdl({**same, "offset": [-0.0250004, -0.02, -0.015]}, got[0])
     assert near["match"] is True
+
+
+def test_vo_track_is_mono_by_decision_not_by_default():
+    """Narration is MONO by decision [Peter, 2026-08-25]; stereo is reserved for
+    SFX and music. AddTrack('audio') defaults to mono SILENTLY, so until 0.5.x
+    every VO track OSIDE built was mono by an undocumented default nobody chose.
+    We now ask for it and read it back — and a Resolve that hands us something
+    else must not receive narration."""
+    tl = FakeTimeline(name="T", start=0)
+    assert tl.GetTrackSubType("audio", 1) == "stereo", "the template's A1 is stereo"
+    idx = rapi.ensure_vo_track(tl)
+    assert idx == 2
+    assert tl.GetTrackSubType("audio", idx) == rapi.VO_TRACK_SUBTYPE == "mono"
+    assert tl.GetTrackName("audio", idx) == rapi.VO_TRACK_NAME
+
+    # a Resolve that gives us the WRONG format is refused, not used
+    class WrongFormat(FakeTimeline):
+        def GetTrackSubType(self, kind, idx):
+            return "5.1" if idx > 1 else "stereo"
+    try:
+        rapi.ensure_vo_track(WrongFormat(name="T", start=0))
+        raise AssertionError("expected a refusal when the track came back 5.1")
+    except rapi.ResolveError as e:
+        assert "mono" in str(e) and "5.1" in str(e), str(e)
+
+
+def test_an_existing_vo_track_is_reused_whatever_its_format():
+    """The subtype check guards what we CREATE. A timeline that already carries
+    a VO track — a rebuild, or one the editor made — is reused as-is; refusing
+    it would block a build over a track we did not lay."""
+    tl = FakeTimeline(name="T", start=0, audio_tracks=2)
+    tl.SetTrackName("audio", 2, rapi.VO_TRACK_NAME)
+    tl._subtypes[("audio", 2)] = "stereo"
+    assert rapi.ensure_vo_track(tl) == 2      # reused, no refusal
 
 
 if __name__ == "__main__":
