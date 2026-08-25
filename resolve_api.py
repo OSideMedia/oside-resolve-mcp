@@ -34,6 +34,11 @@ SHOT_TAG = "oside:shot"
 # AppendToTimeline answers a truthy list for an audio clip aimed at an
 # occupied A1 frame while placing NOTHING [live walk 2026-08-16].
 VO_TRACK_NAME = "VO"
+# Narration is MONO by decision [Peter, 2026-08-25]; stereo is reserved for sound
+# effects and music, which this bridge does not lay today. AddTrack("audio")
+# defaults to mono silently, so the value below is the difference between an
+# intent and an accident.
+VO_TRACK_SUBTYPE = "mono"
 CUE_TAG = "oside:cue"
 CUE_MARKER_COLORS = (
     "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia", "Rose",
@@ -598,24 +603,58 @@ def clip_duration_frames(item, timeline_fps: float | None = None) -> int | None:
 # from observe_timeline. Deleted rather than left as a trap.
 
 
+def track_sub_type(timeline, track_type: str, index: int) -> str:
+    """An audio track's channel format ('mono', 'stereo', '5.1', …). Blank for
+    non-audio tracks and on builds that do not answer."""
+    try:
+        return str(timeline.GetTrackSubType(track_type, index) or "")
+    except (AttributeError, TypeError):
+        return ""
+
+
 def ensure_vo_track(timeline) -> int:
     """The index of the timeline's VO audio track — an existing track named
-    VO_TRACK_NAME, else a NEW audio track (named VO when the API can name it).
-    Never A1: the video clips' embedded audio owns A1."""
+    VO_TRACK_NAME, else a NEW MONO audio track (named VO when the API can name
+    it). Never A1: the video clips' embedded audio owns A1.
+
+    NARRATION IS MONO, BY DECISION [Peter, 2026-08-25]. Stereo is reserved for
+    sound effects and music, which this bridge does not lay today — when those
+    lanes arrive they get their own tracks and their own subtype.
+
+    `AddTrack("audio")` defaults to mono silently, so until now every VO track
+    OSIDE built was mono by an undocumented default nobody chose — measured
+    2026-08-25 on 21.0.4.5: our track came back `subType='mono'` while the
+    template's A1 is `'stereo'`. The default happened to match the intent, which
+    is exactly the kind of accident that survives until the default changes. The
+    subtype is now REQUESTED and then READ BACK, the same doctrine the rest of
+    this module runs on.
+    """
     count = audio_track_count(timeline)
     for idx in range(1, count + 1):
         if track_name(timeline, "audio", idx).strip().lower() == VO_TRACK_NAME.lower():
             return idx
     added = False
     try:
-        added = bool(timeline.AddTrack("audio"))
+        added = bool(timeline.AddTrack("audio", VO_TRACK_SUBTYPE))
     except (AttributeError, TypeError):
-        added = False
+        # older builds may not accept the subtype argument; a mono default is
+        # still what we want, so fall back rather than fail the build
+        try:
+            added = bool(timeline.AddTrack("audio"))
+        except (AttributeError, TypeError):
+            added = False
     if not added:
         raise ResolveError("AddTrack('audio') failed — could not create the VO track.")
     idx = audio_track_count(timeline)
     if idx <= count:
         raise ResolveError("AddTrack('audio') answered True but the track count did not grow.")
+    got = track_sub_type(timeline, "audio", idx)
+    if got and got.lower() != VO_TRACK_SUBTYPE:
+        raise ResolveError(
+            f"The VO track came back {got!r}, not {VO_TRACK_SUBTYPE!r} — narration is mono by "
+            "decision (stereo is for SFX and music). Refusing to lay narration onto a track "
+            "whose channel format was not the one asked for."
+        )
     try:
         timeline.SetTrackName("audio", idx, VO_TRACK_NAME)
     except (AttributeError, TypeError):

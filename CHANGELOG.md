@@ -197,6 +197,49 @@ now reproduces the condition and shows the fix holding: **A1 carried
 `capabilities.features` gains `verify_v3`, `post_save`, `cdl_envelope` and
 `cdl_readback`.
 
+## 0.5.1 — 2026-08-25
+
+Follow-ups from evaluating eight more Resolve MCP repos (barckley75, hiteshK03,
+apvlv, allwavemedia, hoyt-harness, lordhoell, Tooflex, wassermanproductions).
+Most of that field is general remote control with no measured API knowledge —
+seven of the eight contain no evidence language at all, and **not one verifies a
+write by re-reading state**. The value was in three facts and one refutation.
+
+- **Narration is MONO by decision, and now says so.** `AddTrack("audio")`
+  defaults to mono *silently*, so every VO track OSIDE ever built was mono by an
+  undocumented default nobody chose — measured 2026-08-25: our track came back
+  `subType='mono'` while the template's A1 is `'stereo'`. The subtype is now
+  requested explicitly and READ BACK, and a track that comes back in another
+  format is refused rather than filled with narration. Stereo is reserved for
+  sound effects and music, which this bridge does not lay today. An existing VO
+  track is still reused whatever its format — the check guards what we create.
+- **`Timeline.Export` can answer True over a ZERO-BYTE file.** Measured:
+  `EXPORT_ALE_CDL` on a populated timeline returned True and wrote nothing. The
+  documented trap is that a STRING enum is silently rejected with no file
+  written; this is a second, different lie. The read-back checked existence, and
+  a 0-byte file exists — it now checks size. (Same probe settles a standing
+  question: ALE_CDL carries no clip names, so it cannot retire the EDL's
+  match-by-position.)
+- **`apply_look`'s docstring was stale** — it still ended "Resolve exposes no CDL
+  getter, so `applied` is what SetCDL returned, not a read-back", the opposite of
+  what 0.5.0 shipped one commit earlier.
+- **A `CLAUDE.md` with an ANTI-PATTERNS block.** Eleven invariants that each look
+  wrong to a fresh reader and whose obvious-looking "fix" is the bug, every one
+  bought with a council audit or a live walk. They were buried in CHANGELOG prose
+  that nothing loads.
+- **A trigger skill** (`~/.claude/skills/oside-resolve-handoff`). The `handoff`
+  MCP prompt stays the source of truth — it lives inside the server and cannot
+  drift from the tools — but a prompt only reaches an agent that already knows to
+  ask for it, and by then the first tool call is usually made.
+
+**Refuted, and worth recording so it is not re-raised:** a claim repeated in
+another repo's prose AND its test fake says `ImportMedia` returns only *newly*
+imported items, which would make our 0.5.0 import check fail on any re-run.
+Measured on 21.0.4.5: importing the same package twice returned the full count
+both times and did not duplicate the bins. `import_package` IS idempotent. The
+claim holds only WITHIN one call — the same path listed twice returned one item —
+which our duplicate-basename door check makes unreachable.
+
 ## 0.4.0 — 2026-08-17
 
 **In-frame text arrives as a worklist on the timeline.**
