@@ -1,5 +1,179 @@
 # Changelog
 
+## 0.5.0 — 2026-08-24
+
+**The plan is not the witness.** A three-seat council audit (Codex, Opus,
+Gemini) plus a cherry-pick pass over `samuelgursky/davinci-resolve-mcp` found
+one defect shape running through the whole bridge: the server reported on its
+INTENTIONS rather than on what happened, and the test fake was written to match
+the code rather than the API, so none of it could go red. Every fix below ships
+with a test that fails against 0.4.0.
+
+### The blocker
+
+- **`SetCurrentTimeline` was called with a string; the API takes a Timeline
+  object** (Blackmagic's own reference: `SetCurrentTimeline(timeline) --> Bool`).
+  On a string the call is a no-op, and the build then appended into WHATEVER
+  TIMELINE WAS CURRENT — and both template snapshots ship with four timelines of
+  their own, so this could silently edit a template, the one thing the
+  create-only guardrail exists to forbid. Live walks passed only because Resolve
+  21.0.4.5 happens to make a newly created timeline current, which is documented
+  nowhere. We now pass the object we already hold and refuse the build if the
+  switch does not take. **The test fake accepted a string too** — it has been
+  corrected to the vendor contract, which is what makes this assertion capable
+  of failing at all.
+
+### The gate was wrong in both directions
+
+- **It never bound a marker to the shot it names.** `shot marker positions`
+  compared two sorted frame lists, so rotating every shot marker onto a
+  different clip returned `overall: PASS`. New row: `shot markers name their own
+  shot`. Untagged pre-0.2 Blue markers stay exempt, as the README promises.
+- **It failed builds that behaved correctly.** `expected` was the raw worklist
+  row count, so a cue or text task the planner deliberately refused (no room
+  inside its own shot) scored as a failure and `pipeline.py` exited 1 over a
+  correct project. `expected` is now what the build INTENDED to place, with
+  `skippedByDesign` alongside it.
+- **Three shipped features had no gate row at all**: the film-stock marker, the
+  look, and the VO track itself. Narration back on A1 — the exact 2026-08-16
+  defect `vo_track` was built to prevent — used to PASS. The canonical
+  `_good_timeline()` fixture put VO on A1 and asserted PASS, which is why nobody
+  noticed; it now models a correct build.
+- **A named-but-missing worklist is surfaced.** `load_cues` returning
+  `([], reason)` must not block a build; reporting PASS without mentioning it
+  turned a half-copied package into a clean handoff.
+
+### Markers on the wrong picture
+
+- **Dialogue cues cascade with a clip-boundary guard**, the one
+  `text_task_rows` has enforced since 0.4.0 and whose reasoning this changelog
+  already recorded: *a marker on the wrong picture is worse than no marker*. Two
+  ordinary lines under a five-second generated shot used to put cue 2 on the
+  next shot and cue 3 past the end of the timeline, with `reason: None`.
+- **The placement nudges no longer cross the boundary.** The guard lived in
+  `handoff.py` and the transform in `resolve_api.py`: the 4- and 12-frame nudge
+  windows knew nothing about the clip and walked correctly-planned markers onto
+  the next shot anyway, reporting them `placed`. Rows now carry a `limit`.
+- **A cue with no `Est s` reserves a nominal second**, not the whole shot —
+  claiming the shot cascaded every following cue off the end of it and swallowed
+  every text task on it.
+
+### Honest returns
+
+- `build_timeline` reconciles against the timeline it observes: a clip-count
+  mismatch is refused rather than reported as success with marker counts taken
+  from the plan, and `AddMarker`'s return is now checked (it was the only marker
+  write in the repo that discarded it).
+- `import_package` compares `imported` against `expected` instead of printing
+  both under an unconditional `ok: true`.
+- `apply_look` reports `complete`, and diagnoses a false `SetCDL` against
+  `GetNodeGraph().GetNumNodes()` instead of returning a bare `applied: false`.
+- VO rows for takes that never imported say so, instead of being stamped
+  `track: "VO"` alongside the ones that were actually laid.
+- `append_audio` accepts a placement Resolve honoured at a shifted frame rather
+  than appending a second copy and then reporting that nothing was placed.
+
+### Cross-repo and hardening
+
+- **Mixed-rate sources are conformed.** Every OSIDE render is 24 fps and the
+  explainer template is 60, so the CONNECTED dry run read 121 source frames
+  where the clip occupies 303 — every explainer plan was short by 182 frames per
+  clip, and every cue frame derived from those starts was wrong with it. The
+  offline path was always correct, which made the connected plan the less
+  accurate of the two.
+- **The CDL envelope is enforced**, not just promised in prose: slope/power
+  0.5–2.0, |offset| ≤ 0.25, saturation 0.5–1.5, each vector exactly three finite
+  numbers. A clip outside it is refused BY NAME instead of applied as if it were
+  a starting balance, and a malformed entry no longer raises `KeyError` and
+  takes the whole run down. `apply_look` now also echoes Depth Converter's own
+  `derivation` line — the file said "HEURISTIC v1.1, gains fitted once" and this
+  tool was quietly dropping that caveat.
+- **Manifest entries are checked at the door**: no absolute paths, nothing
+  resolving outside the package, no two files sharing a clip name. Resolve
+  matches clips by basename alone, and we depended on an invariant only OSIDE's
+  exporter enforced.
+- `create_project` reconciles the project's real frame rate against the one
+  `templates.json` declares (they agree today; nothing was checking).
+
+### From the cherry-pick pass
+
+- **`save_project` — the save is the verification boundary.** Placements from an
+  errored append are visible to every in-session read and are discarded by the
+  save (measured elsewhere at 573 items before, 500 after). Our re-read doctrine
+  is a pre-save witness derived from the same unsaved state as the thing it
+  checks, so it cannot see this class at all. `pipeline.py` now saves between
+  build and verify. Guarded on a named project: on `Untitled Project`
+  `SaveProject` returns False in the GUI and blocks forever headless.
+- **`pipeline.py` applies the look.** The one-click Build-in-Resolve path never
+  called `apply_look`, so the grade travelled when an agent drove the handoff
+  and silently did not when the director pressed the button. A refusal (no look
+  block, no measured CDL) is still not a failure; a partial application is.
+- `resolve_status` reports `GetProductName()` (free vs Studio) and
+  `GetCurrentDatabase()` — the only honest liveness check, since a wedged
+  Resolve answers every cheaper probe normally while `LoadProject` fails forever.
+- **Doc correction:** "Resolve has no CDL getter" is true of `GetCDL` and was
+  being read as "no read-back is possible". `Timeline.Export` with
+  `EXPORT_EDL`+`EXPORT_CDL` (or `EXPORT_ALE_CDL`) carries applied CDLs out of
+  Resolve. Reworded; no code change until that path is walked live.
+
+### Removed
+
+- `video_start_frames` — dead (grep found only its definition) and it returned
+  ABSOLUTE frames where every sibling returns timeline-relative ones, so the
+  next caller to reach for it would have laid everything an hour into the
+  timeline.
+
+### Measured on the live walk (Resolve 21.0.4.5, 2026-08-24)
+
+Four walks against a real Resolve with a real 24 fps package. Facts, not
+inferences — each one settles something the fake could not.
+
+- **`SetCurrentTimeline("name")` returns False. With the Timeline object it
+  returns True.** The blocker was real, not theoretical. It never fired only
+  because `CreateEmptyTimeline` DOES make the new timeline current on its own
+  (also measured) — and the template ships with `YT` and `YT Shorts`, with `YT`
+  current, so that undocumented behaviour was the only thing standing between a
+  build and a template timeline.
+- **The fps conform is confirmed.** On the 60 fps explainer template a
+  5.041667 s / 24 fps source lands at frames 0, 302, 604 with duration 302 —
+  Resolve conforms by DURATION. The pre-0.5.0 arithmetic would have planned
+  121, off by 181 frames per clip.
+- **Clip frames FLOOR.** 120 on 23.976 and 302 on 60, where rounding gave
+  121/303. `seconds_to_clip_frames` now floors, so the dry run predicts exactly
+  what gets built on both templates (verified against both walks). Cue
+  durations still round.
+- **The CDL read-back WORKS.** `Timeline.Export(path, EXPORT_EDL, EXPORT_CDL)`
+  returned our exact applied values — `*ASC_SOP (1.0 1.0 1.0)(-0.025 -0.02
+  -0.015)(1.0 1.0 1.0)` / `*ASC_SAT 0.940000`. So there IS a read-back path for
+  the look; the README's caveat is now scoped to `GetCDL` alone rather than
+  implying no read-back exists. Wiring it into `apply_look` is a follow-up.
+- **`GetStartFrame()` is 0 on both templates**, so the absolute-vs-relative
+  marker question is moot for our packages — the subtraction is a no-op in
+  practice, and the fake's 86400 start is the more conservative case.
+- **The save discarded nothing** on these append shapes (3 clips in, 3 after
+  the save, on every walk). `save_project` stays: it is cheap, and the class it
+  guards against is one no in-session read can see.
+- **`AddMarker`'s return value is reliable** — False on an occupied frame, True
+  on a free one, including past the end of the timeline. An earlier draft of
+  this release recorded a "measured false-negative"; that was a bug in my own
+  walk harness (a dict comprehension over `.get()` called `apply_look` eight
+  times), not a Resolve defect, and the false claim has been removed from the
+  source rather than left to mislead the next reader.
+
+### Found by the walk
+
+- **`apply_look` was not idempotent.** The CDL half was — absolute values, a
+  re-run resets node 1 — but the film-stock marker was added AGAIN on every
+  run, so re-applying a look three times left three `Stock intent` markers a few
+  frames apart. It now returns the existing marker's frame with
+  `alreadyPresent: true` and adds nothing. The new `film-stock marker` gate row
+  is what caught it, on its first live run.
+- **Marker collisions are resolved from ONE read** (`first_free_frame` over a
+  set) instead of by trying writes until one sticks. Retrying writes is the
+  shape that turns a repeated call into a pile of markers.
+
+`capabilities.features` gains `verify_v3`, `post_save` and `cdl_envelope`.
+
 ## 0.4.0 — 2026-08-17
 
 **In-frame text arrives as a worklist on the timeline.**

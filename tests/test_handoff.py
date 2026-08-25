@@ -225,8 +225,18 @@ class FakeProject:
     def GetTimelineByIndex(self, i):
         return self._timelines[i - 1]
 
-    def SetCurrentTimeline(self, name):
-        self._current = next(t for t in self._timelines if t.GetName() == name)
+    def SetCurrentTimeline(self, timeline):
+        """Takes a TIMELINE OBJECT, exactly as Blackmagic's reference specifies
+        ("SetCurrentTimeline(timeline) --> Bool", Developer/Scripting/README.txt).
+
+        This fake used to accept a STRING, because the code under test passed
+        one. That is how the wrong call survived every green run: the fixture
+        implemented the defect rather than the API, so the assertion could never
+        go red [audit 2026-08-24]. A string is now refused the way a real Resolve
+        would refuse it — it answers False rather than switching."""
+        if isinstance(timeline, str) or timeline not in self._timelines:
+            return False
+        self._current = timeline
         return True
 
     def GetCurrentTimeline(self):
@@ -472,47 +482,69 @@ def test_cue_colours_stable_and_not_blue():
     assert rapi.SHOT_MARKER_COLOR not in a.values()
 
 
-def _observed(v1, a1, markers, bins=True):
+def _observed(v1, a1, markers, bins=True, vo=None):
+    """An observation. `vo`, when given, is a second audio track named VO — the
+    layout a correct build produces. Without it the observation carries A1
+    alone, which is what a pre-0.2.1 (or hand-made) timeline looks like."""
     manifest, _ = _fixture()
+    tracks = [{"index": 1, "name": "A1", "items": a1}]
+    if vo is not None:
+        tracks.append({"index": 2, "name": rapi.VO_TRACK_NAME, "items": vo})
     return {
         "binVideos": {os.path.basename(v["file"]) for v in manifest["videos"]} if bins else set(),
         "binAudio": {os.path.basename(a["file"]) for a in manifest["audio"]} if bins else set(),
-        "timeline": {"name": "EDIT 01", "v1": v1, "a1": a1, "markers": markers},
+        "timeline": {"name": "EDIT 01", "v1": v1, "a1": a1, "markers": markers,
+                     "audioTracks": tracks},
     }
 
 
 def _good_timeline():
+    """A timeline a CORRECT build produces.
+
+    The narration used to sit on `a1` here, and `test_verify_pass` asserted PASS
+    over it — so the canonical "good" fixture encoded the pre-0.2.1 layout, the
+    very defect the `vo_track` feature was built to prevent (A1 is full of the
+    shot clips' embedded audio, Resolve accepts the append and places nothing).
+    The gate could not tell the two apart, and this fixture is why nobody
+    noticed. VO now rides its own named track [audit 2026-08-24]; A1 carries the
+    shot clips' embedded audio, as it does in Resolve.
+
+    Shot markers carry their names, because the gate now binds a marker to the
+    shot it names rather than comparing bare frame lists.
+    """
     v1 = [
         {"name": "scene01_shot1A.mp4", "start": 0, "duration": 120},
         {"name": "scene01_shot2.mp4", "start": 120, "duration": 96},
         {"name": "scene02_shot1.mp4", "start": 216, "duration": 200},
     ]
-    a1 = [
+    a1 = []  # embedded audio from the shot clips — narration never lands here
+    vo = [
         {"name": "vo01_narrator.mp3", "start": 0},
         {"name": "vo03_scene02-shot9_ben.mp3", "start": 0},
         {"name": "vo02_scene01-shot2_ada.mp3", "start": 120},
     ]
     markers = {
-        0: {"color": "Blue", "customData": rapi.SHOT_TAG},
-        120: {"color": "Blue", "customData": rapi.SHOT_TAG},
-        216: {"color": "Blue", "customData": rapi.SHOT_TAG},
+        0: {"color": "Blue", "name": "shot 1A", "customData": rapi.SHOT_TAG},
+        120: {"color": "Blue", "name": "shot 2", "customData": rapi.SHOT_TAG},
+        216: {"color": "Blue", "name": "shot 1", "customData": rapi.SHOT_TAG},
         121: {"color": "Cyan", "customData": rapi.CUE_TAG, "duration": 24},
         145: {"color": "Green", "customData": rapi.CUE_TAG, "duration": 24},
         217: {"color": "Green", "customData": rapi.CUE_TAG, "duration": 48},
     }
-    return v1, a1, markers
+    return v1, a1, markers, vo
 
 
 def test_verify_pass():
     manifest, base = _fixture()
     cues, _ = handoff.load_cues(manifest, base)
-    v1, a1, markers = _good_timeline()
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers))
+    v1, a1, markers, vo = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
     assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
     assert all(c["pass"] for c in out["checks"])
     names = [c["check"] for c in out["checks"]]
     for want in ("videos in bin", "audio in bin", "V1 clip count", "V1 clip order",
-                 "no stray V1 clips", "shot markers", "shot marker positions", "cue markers"):
+                 "no stray V1 clips", "shot markers", "shot marker positions", "cue markers",
+                 "shot markers name their own shot"):
         assert want in names, want
     # backward-compatible report shape
     assert out["report"]["videos"] == {"expected": 3, "found": 3, "missing": []}
@@ -522,15 +554,17 @@ def test_verify_pass():
 def test_verify_fails_on_order_stray_vo_delta_marker_and_cues():
     manifest, base = _fixture()
     cues, _ = handoff.load_cues(manifest, base)
-    v1, a1, markers = _good_timeline()
+    v1, a1, markers, vo = _good_timeline()
     # swap two clips, add a stray, shift Ada's VO by 3 frames, lose a shot marker, drop a cue
     v1 = [v1[1], v1[0], v1[2], {"name": "stray.mp4", "start": 416, "duration": 10}]
     v1[0]["start"], v1[1]["start"] = 0, 96
-    a1 = [dict(a1[0]), dict(a1[1]), {"name": "vo02_scene01-shot2_ada.mp3", "start": 3}]
+    # narration still rides the VO track — this test is about ORDER, STRAYS and a
+    # shifted take, not about which track VO landed on (that has its own row now)
+    vo = [dict(vo[0]), dict(vo[1]), {"name": "vo02_scene01-shot2_ada.mp3", "start": 3}]
     markers = dict(markers)
     del markers[216]
     del markers[217]
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers))
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
     assert out["overall"] == "FAIL"
     by = {c["check"]: c for c in out["checks"]}
     assert by["V1 clip order"]["pass"] is False and by["V1 clip order"]["firstDivergence"] == 0
@@ -542,8 +576,8 @@ def test_verify_fails_on_order_stray_vo_delta_marker_and_cues():
     assert by["shot marker positions"]["pass"] is False
     assert by["cue markers"]["expected"] == 3 and by["cue markers"]["found"] == 2 and not by["cue markers"]["pass"]
     # a 1-frame VO miss is still a miss — tolerance is zero
-    a1[2]["start"] = 1
-    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers))
+    vo[2]["start"] = 1
+    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
     assert {c["check"]: c for c in out2["checks"]}[ada["check"]]["delta"] == 1
     assert out2["overall"] == "FAIL"
 
@@ -561,9 +595,9 @@ def test_verify_no_timeline_and_missing_bins_fail():
 def test_verify_untagged_blue_markers_count_as_shots():
     """Timelines built by the pre-tag server carry bare Blue markers."""
     manifest, base = _fixture()
-    v1, a1, _ = _good_timeline()
+    v1, a1, _, vo = _good_timeline()
     markers = {0: {"color": "Blue"}, 120: {"color": "Blue"}, 216: {"color": "Blue"}}
-    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers), cues_expected=False)
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers, vo=vo), cues_expected=False)
     assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
 
 
@@ -618,7 +652,8 @@ def test_tool_annotations_prompt_and_capabilities():
     assert body.index("dry_run=True") < body.index("create_project(kind, name)")
     caps = server.capabilities()
     assert caps["manifest"] == "oside-davinci/v1"
-    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "text_tasks"]
+    assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
+                                "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -677,8 +712,12 @@ def test_vo_lands_on_own_track_when_embedded_audio_fills_a1():
         assert [t["name"] for t in obs["audioTracks"]] == ["Audio 1", "VO"]
         assert obs["a1"] == obs["audioTracks"][0]["items"]
         ver = server.verify_import(FIXTURE, "EDIT 01")
-        rows = [c for c in ver["checks"] if c["check"].startswith("VO ")]
+        rows = [c for c in ver["checks"] if c["check"].startswith("VO ") and "@" in c["check"]]
         assert len(rows) == 3 and all(c["pass"] and c["track"] == "A2 VO" for c in rows), rows
+        # and each take now also carries the row that ASSERTS it is off A1 —
+        # the gate used to report the track without ever requiring it
+        off_a1 = [c for c in ver["checks"] if c["check"].endswith("not on A1")]
+        assert len(off_a1) == 3 and all(c["pass"] and c["found"] == "A2 VO" for c in off_a1), off_a1
         assert ver["overall"] == "PASS", [c for c in ver["checks"] if not c["pass"]]
         # the dry-run plan says where narration goes: track VO, every row
         dry = server.build_timeline(FIXTURE, "EDIT 02", dry_run=True)
@@ -726,7 +765,7 @@ def test_clip_duration_frames_reads_audio_timecode():
 
 def test_verify_finds_vo_on_any_audio_track_and_names_it():
     manifest, base = _fixture()
-    v1, _a1, markers = _good_timeline()
+    v1, _a1, markers, vo = _good_timeline()
     markers = {f: m for f, m in markers.items() if m["customData"] == rapi.SHOT_TAG}
     tracks = [
         {"index": 1, "name": "Audio 1", "items": [{"name": n, "start": s} for n, s in
@@ -1028,7 +1067,7 @@ def test_text_task_that_cannot_fit_inside_its_shot_is_reported_not_misplaced():
 def test_verify_counts_text_task_markers_by_tag():
     manifest, base = _fixture()
     tasks, _ = handoff.load_text_tasks(manifest, base)
-    v1, a1, markers = _good_timeline()
+    v1, a1, markers, vo = _good_timeline()
     # every task laid, correctly tagged
     for i, t in enumerate(tasks):
         markers[300 + i] = {"name": f"Text: {t['text']}", "customData": rapi.TEXT_TASK_TAG, "color": "Cream"}
@@ -1042,7 +1081,7 @@ def test_verify_counts_text_task_markers_by_tag():
 def test_verify_fails_when_a_text_task_marker_is_missing():
     manifest, base = _fixture()
     tasks, _ = handoff.load_text_tasks(manifest, base)
-    v1, a1, markers = _good_timeline()
+    v1, a1, markers, vo = _good_timeline()
     markers[300] = {"name": "Text: OPEN ALL NIGHT", "customData": rapi.TEXT_TASK_TAG, "color": "Cream"}
     observed = _observed(v1, a1, markers)
     cues, _ = handoff.load_cues(manifest, base)
@@ -1055,12 +1094,239 @@ def test_a_package_with_no_worklist_adds_no_check_and_still_passes():
     """A package exported before the studio wrote text-tasks.csv must not gain
     a failing row asserting zero."""
     manifest, base = _fixture()
-    v1, a1, markers = _good_timeline()
+    v1, a1, markers, vo = _good_timeline()
     observed = _observed(v1, a1, markers)
     cues, _ = handoff.load_cues(manifest, base)
     res = handoff.evaluate_verify(manifest, cues, observed, text_tasks=[])
     assert not any(c["check"] == "text-task markers" for c in res["checks"])
 
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-08-24 — each of these goes RED against the pre-fix code.
+# ---------------------------------------------------------------------------
+
+def test_cue_that_outruns_its_shot_is_reported_not_laid_on_the_next_one():
+    """The sibling of test_text_task_that_cannot_fit_inside_its_shot_... which
+    existed for lettering and never for dialogue. Two ordinary lines under a
+    short shot used to put cue 2 on the NEXT shot and cue 3 past the end of the
+    timeline, with reason None on every row."""
+    manifest = {"kind": "cinematic", "audio": [], "videos": [
+        {"file": "videos/s1.mp4", "sceneIndex": 1, "shotNumber": "1"},
+        {"file": "videos/s2.mp4", "sceneIndex": 1, "shotNumber": "2"}]}
+    cues = [{"speaker": "ADA", "line": "one", "videoFile": "videos/s1.mp4", "estSeconds": 4.0},
+            {"speaker": "BEN", "line": "two", "videoFile": "videos/s1.mp4", "estSeconds": 4.0},
+            {"speaker": "ADA", "line": "three", "videoFile": "videos/s1.mp4", "estSeconds": 2.0}]
+    rows = handoff.cue_rows(manifest, cues, {"s1.mp4": 0, "s2.mp4": 48},
+                            {"s1.mp4": 48, "s2.mp4": 48}, 24.0)
+    assert rows[0]["frame"] == 1 and rows[0]["limit"] == 48
+    # the two that cannot fit are REPORTED, never placed on the next shot
+    assert [r["frame"] for r in rows[1:]] == [None, None], rows
+    assert all("no room left in this shot" in r["reason"] for r in rows[1:]), rows
+    # and nothing ever lands at or past the next shot's first frame
+    assert all(r["frame"] is None or r["frame"] < 48 for r in rows), rows
+
+
+def test_the_nudge_never_crosses_the_clip_boundary():
+    """The planner's guard is not enough on its own: the placement nudge knew
+    nothing about the clip and walked a correctly-planned marker onto the next
+    shot anyway, reporting it `placed`."""
+    # shot A ends at frame 96; the task is planned at 94 and 94/95 are taken
+    tl = FakeTimeline(name="T", start=0, markers={94: {"color": "Blue"}, 95: {"color": "Blue"}})
+    out = rapi.add_text_task_markers(tl, [{"frame": 94, "name": "Text: SALE", "note": "", "limit": 96}])
+    assert out["placed"] == 0, out
+    assert out["skipped"] and "no free frame inside this shot" in out["skipped"][0]["reason"]
+    assert 96 not in tl.GetMarkers(), "a marker crossed into the next shot"
+    # the same guard on the cue nudge
+    tl2 = FakeTimeline(name="T", start=0, markers={10: {"color": "Blue"}, 11: {"color": "Blue"}})
+    out2 = rapi.add_range_markers(tl2, [{"frame": 10, "duration": 4, "color": "Cyan",
+                                         "name": "ADA", "note": "x", "limit": 12}])
+    assert out2["placed"] == 0 and 12 not in tl2.GetMarkers(), out2
+
+
+def test_gate_fails_when_a_shot_marker_names_the_wrong_picture():
+    """Rotating every shot marker onto a different clip used to return PASS:
+    the gate compared sorted frame multisets and never read the marker's name."""
+    manifest, base = _fixture()
+    v1, a1, markers, vo = _good_timeline()
+    rotated = dict(markers)
+    rotated[0] = {**markers[0], "name": "shot 1"}       # belongs on 216
+    rotated[216] = {**markers[216], "name": "shot 1A"}  # belongs on 0
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, rotated, vo=vo),
+                                  cues_expected=False)
+    assert out["overall"] == "FAIL"
+    row = {c["check"]: c for c in out["checks"]}["shot markers name their own shot"]
+    assert not row["pass"] and len(row["mismatched"]) == 2, row
+    # the two OLD rows still pass — which is exactly why this one had to exist
+    by = {c["check"]: c for c in out["checks"]}
+    assert by["shot markers"]["pass"] and by["shot marker positions"]["pass"]
+
+
+def test_gate_does_not_fail_a_build_that_skipped_a_task_by_design():
+    """`expected` must mean what the build INTENDED to place. Scoring against
+    the raw worklist made a deliberate, correct skip read as a failure."""
+    manifest, base = _fixture()
+    v1, a1, markers, vo = _good_timeline()
+    tasks = [{"text": "SALE", "videoFile": "videos/scene01_shot2.mp4", "shotNumber": "2", "sceneName": "X"},
+             {"text": "OPEN", "videoFile": "videos/scene01_shot2.mp4", "shotNumber": "2", "sceneName": "X"}]
+    # a plan in which only the first task could be placed
+    planned = [{"frame": 130, "name": "Text: SALE", "note": "", "file": "scene01_shot2.mp4"},
+               {"frame": None, "name": "Text: OPEN", "note": "", "file": "scene01_shot2.mp4",
+                "reason": "no free frame inside this shot (its cues fill it)"}]
+    m = dict(markers)
+    m[130] = {"color": "Cream", "name": "Text: SALE", "note": "", "duration": 1,
+              "customData": rapi.TEXT_TASK_TAG}
+    cues, _ = handoff.load_cues(manifest, base)
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, m, vo=vo),
+                                  text_tasks=tasks, planned_text_tasks=planned)
+    row = {c["check"]: c for c in out["checks"]}["text-task markers"]
+    assert row["expected"] == 1 and row["found"] == 1 and row["pass"], row
+    assert row["skippedByDesign"] == 1
+    assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
+
+
+def test_gate_fails_narration_left_on_a1():
+    """The 2026-08-16 defect's own shape. The gate reported which track a take
+    sat on and never required it to be off A1."""
+    manifest, base = _fixture()
+    v1, _a1, markers, vo = _good_timeline()
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, vo, markers), cues_expected=False)
+    assert out["overall"] == "FAIL"
+    rows = [c for c in out["checks"] if c["check"].endswith("not on A1")]
+    assert rows and not any(c["pass"] for c in rows), rows
+
+
+def test_gate_requires_the_stock_marker_when_the_manifest_names_a_stock():
+    manifest, base = _fixture()
+    v1, a1, markers, vo = _good_timeline()
+    cues, _ = handoff.load_cues(manifest, base)
+    obs = _observed(v1, a1, markers, vo=vo)
+    out = handoff.evaluate_verify(manifest, cues, obs,
+                                  stock_intent="Stock intent: Kodak 2383 — x")
+    by = {c["check"]: c for c in out["checks"]}
+    assert by["film-stock marker"]["found"] == 0 and not by["film-stock marker"]["pass"]
+    # present -> passes
+    m = dict(markers)
+    m[3] = {"color": "Cocoa", "name": "Stock intent", "note": "x", "duration": 1,
+            "customData": rapi.STOCK_TAG}
+    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, m, vo=vo),
+                                   stock_intent="Stock intent: Kodak 2383 — x")
+    assert out2["overall"] == "PASS", [c for c in out2["checks"] if not c["pass"]]
+
+
+def test_gate_surfaces_a_named_but_missing_worklist():
+    manifest, base = _fixture()
+    v1, a1, markers, vo = _good_timeline()
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers, vo=vo),
+                                  cues_expected=False,
+                                  sidecar_warnings=["cues file named by the manifest is missing: /x/y.csv"])
+    assert out["overall"] == "FAIL"
+    assert any(c["check"] == "worklist file present" for c in out["checks"])
+
+
+def test_a_cdl_outside_the_starting_balance_envelope_is_refused_by_name():
+    """'never a creative grade' was carried in prose only. One clip's bad
+    numbers must not be applied, and must not take the whole run down."""
+    manifest, _ = _fixture()
+    good = {"slope": [1, 1, 1], "offset": [0.01, 0.0, -0.01], "power": [1, 1, 1], "saturation": 0.95}
+    doc = {"schema": handoff.LOOK_CDL_SCHEMA, "clips": [
+        {"file": "videos/scene01_shot1A.mp4", "cdl": good},
+        {"file": "videos/scene01_shot2.mp4", "cdl": {**good, "saturation": 0.1}},
+        {"file": "videos/scene02_shot1.mp4", "cdl": {"slope": [1, 1], "offset": [0, 0, 0],
+                                                     "power": [1, 1, 1], "saturation": 1.0}},
+    ]}
+    v1 = [{"name": "scene01_shot1A.mp4"}, {"name": "scene01_shot2.mp4"}, {"name": "scene02_shot1.mp4"}]
+    plan = handoff.plan_look(manifest, doc, v1)
+    assert [r["clip"] for r in plan["rows"]] == ["scene01_shot1A.mp4"]
+    why = {m["clip"]: m["why"] for m in plan["missing"]}
+    assert "saturation" in why["scene01_shot2.mp4"], why
+    assert "slope" in why["scene02_shot1.mp4"], why
+
+
+def test_a_malformed_cdl_entry_does_not_take_the_whole_run_down():
+    """cdl_payload does cdl['slope'] unguarded — a missing key used to raise
+    KeyError inside apply_look's blanket except and kill every clip."""
+    assert handoff.cdl_problem({"offset": [0, 0, 0], "power": [1, 1, 1], "saturation": 1.0})
+    assert handoff.cdl_problem(None)
+    assert handoff.cdl_problem({"slope": [1, 1, 1], "offset": [0, 0, 0],
+                                "power": [1, 1, 1], "saturation": "nope"})
+    assert handoff.cdl_problem({"slope": [1, 1, 1], "offset": [0.9, 0, 0],
+                                "power": [1, 1, 1], "saturation": 1.0})
+    assert handoff.cdl_problem({"slope": [1, 1, 1], "offset": [0, 0, 0],
+                                "power": [1, 1, 1], "saturation": 1.0}) is None
+
+
+def test_a_source_at_another_rate_is_conformed_to_the_timeline():
+    """Every OSIDE render is 24fps; the explainer template is 60. Reading the
+    source frame count as timeline frames made the CONNECTED dry run short by
+    182 frames per clip on every explainer board."""
+    clip = FakeClip("shot.mp4", 121, fps=24.0)           # 5.04s at 24fps
+    assert rapi.clip_duration_frames(clip) == 121         # no timeline rate -> unchanged
+    assert rapi.clip_duration_frames(clip, 60.0) == 302   # 5.04s at 60fps (was read as 121)
+    assert rapi.clip_duration_frames(clip, 23.976) == 121  # conforms frame-for-frame
+
+
+def test_a_manifest_cannot_reach_outside_its_package_or_reuse_a_clip_name():
+    base = os.path.join(HERE, "fixtures", "pkg")
+    for bad, expect in (
+        ({"videos": [{"file": "/etc/passwd"}], "audio": []}, "absolute path"),
+        ({"videos": [{"file": "../../../etc/passwd"}], "audio": []}, "outside the package"),
+        ({"videos": [{"file": "videos/a.mp4"}, {"file": "other/a.mp4"}], "audio": []}, "share the clip name"),
+    ):
+        try:
+            server._check_entries(bad, base)
+            raise AssertionError(f"expected a refusal for {bad}")
+        except rapi.ResolveError as e:
+            assert expect in str(e), (expect, str(e))
+    # the real fixture is fine
+    manifest, b = _fixture()
+    server._check_entries(manifest, b)
+
+
+def test_stock_marker_is_idempotent():
+    """apply_look is documented re-runnable and the CDL half was — but the stock
+    marker used to be added AGAIN on every run, so re-applying a look three times
+    left three 'Stock intent' markers. Surfaced by the 2026-08-24 walk."""
+    tl = FakeTimeline(name="T", start=0, markers={0: {"color": "Blue", "customData": rapi.SHOT_TAG}})
+    first = rapi.add_stock_marker(tl, "Stock intent: Kodak 2383 — x")
+    assert first["placed"] and first["frame"] == 1, first
+    n_after_first = len(tl.GetMarkers())
+    for _ in range(5):
+        again = rapi.add_stock_marker(tl, "Stock intent: Kodak 2383 — x")
+        assert again["placed"] and again.get("alreadyPresent") is True, again
+        assert again["frame"] == 1
+    assert len(tl.GetMarkers()) == n_after_first, "a re-run added another stock marker"
+    assert sum(1 for m in tl.GetMarkers().values()
+               if (m.get("customData") or "") == rapi.STOCK_TAG) == 1
+
+
+def test_markers_resolve_collisions_from_one_read_not_by_retrying_writes():
+    """The search for a free frame happens in a set read ONCE. A loop over
+    WRITES is the shape that turns a repeated call into a pile of markers."""
+    occupied = {0, 2, 3}
+    assert rapi.first_free_frame(occupied, 0, 8) == 1
+    assert rapi.first_free_frame(occupied, 2, 8) == 4
+    # the clip boundary still wins over the window
+    assert rapi.first_free_frame({0, 1}, 0, 8, limit=2) is None
+    # and a placement records itself so the next search skips it, with no re-read
+    tl = FakeTimeline(name="T", start=0)
+    occ = rapi.marker_frames(tl)
+    at = rapi.first_free_frame(occ, 5, 4)
+    rapi.add_marker_once(tl, occ, at, "Cocoa", "n", "note", 1, rapi.STOCK_TAG)
+    assert at in occ and rapi.first_free_frame(occ, 5, 4) == 6
+
+
+def test_clip_frames_floor_to_match_resolve():
+    """MEASURED on the 2026-08-24 walk: a 5.041667s 24fps source lands as 120
+    frames on a 23.976 timeline and 302 on a 60fps one. Rounding gave 121/303,
+    so the dry run drifted a frame per clip against the timeline it predicts."""
+    assert handoff.seconds_to_clip_frames(5.041667, 23.976) == 120
+    assert handoff.seconds_to_clip_frames(5.041667, 60.0) == 302
+    # cue durations still ROUND — shaving a frame off every spoken line is the
+    # wrong direction for a reading aid
+    assert handoff.seconds_to_frames(5.041667, 60.0) == 303
+    assert handoff.seconds_to_clip_frames(None, 24) is None
+    assert handoff.seconds_to_clip_frames(0.001, 24) == 1   # never zero-length
 
 
 if __name__ == "__main__":

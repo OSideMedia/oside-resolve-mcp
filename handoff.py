@@ -21,11 +21,22 @@ import shutil
 import subprocess
 
 from resolve_api import (
-    CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, TEXT_TASK_TAG, VO_TRACK_NAME,
+    CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, STOCK_TAG, TEXT_TASK_TAG,
+    VO_TRACK_NAME,
 )
 
 MANIFEST_FORMAT = "oside-davinci/v1"
-FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "text_tasks"]
+FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "text_tasks",
+            # 0.5.0 — the gate now BINDS each marker to the shot it names, scores
+            # cue/text rows against what the build intended to place rather than
+            # the raw worklist, and covers the stock marker and the VO track.
+            "verify_v3",
+            # 0.5.0 — the pipeline saves before it verifies, so the acceptance
+            # read happens on the far side of the save boundary.
+            "post_save",
+            # 0.5.0 — a CDL outside the starting-balance envelope is refused per
+            # clip instead of applied as if it were a balance.
+            "cdl_envelope"]
 
 # The template a kind maps to fixes the timeline rate. templates/templates.json
 # carries each template's `fps` (server reads it); this is the last-resort
@@ -72,6 +83,27 @@ def seconds_to_frames(seconds, fps: float) -> int | None:
         return None
     try:
         return max(1, int(round(float(seconds) * float(fps))))
+    except (TypeError, ValueError):
+        return None
+
+
+def seconds_to_clip_frames(seconds, fps: float) -> int | None:
+    """Seconds -> the number of TIMELINE frames a clip of that length occupies.
+
+    FLOOR, not round — measured against Resolve 21.0.4.5 on the 2026-08-24 walk:
+    a 5.041667 s source lands as 120 frames on a 23.976 timeline (round gives
+    121) and as 302 on a 60 fps timeline (round gives 303). Flooring matched
+    reality in both, so the dry run's clip starts now agree with the built
+    timeline instead of drifting a frame per clip.
+
+    `seconds_to_frames` keeps rounding and is still what CUE durations use: a
+    marker's range is a reading aid, and shaving a frame off every spoken line
+    is the wrong direction for that.
+    """
+    if seconds is None:
+        return None
+    try:
+        return max(1, int(float(seconds) * float(fps)))
     except (TypeError, ValueError):
         return None
 
@@ -246,20 +278,38 @@ def cue_rows(manifest: dict, cues: list, starts_by_file: dict, durations_by_file
         duration = seconds_to_frames(c.get("estSeconds"), fps)
         duration_source = "estimate"
         if duration is None:
-            duration, duration_source = shot_len, "shot"
+            # A cue with no `Est s` used to claim the WHOLE SHOT, which then
+            # cascaded every following cue off the end of it and swallowed every
+            # text task on that shot. A nominal second is the honest reservation
+            # for a line whose length nobody measured [audit 2026-08-24].
+            duration, duration_source = seconds_to_frames(1.0, fps), "nominal"
+        shot = display_name(manifest, v) if v else (vf or None)
+        row = {
+            "shot": shot, "file": vf or None, "duration": duration,
+            "durationSource": duration_source, "color": colors[c["speaker"]],
+            "name": c["speaker"], "note": c["line"],
+        }
+        if start is None or vf not in starts_by_file:
+            rows.append({**row, "frame": None, "limit": None,
+                         "reason": "no frame (shot has no clip on V1)"})
+            continue
         offset = cursor_by_file.get(vf, CUE_FRAME_OFFSET)
-        frame = (start + offset) if (start is not None and vf in starts_by_file) else None
+        # NEVER LET A CUE LAND PAST ITS OWN CLIP. text_task_rows has enforced
+        # this since 0.4.0 and the changelog gives the reason — "a marker sitting
+        # on the next shot would tell the editor to title the wrong picture,
+        # which is worse than no marker". The identical sentence is true of a
+        # line of dialogue, and the guard was simply never retrofitted here: two
+        # ordinary lines under a five-second generated shot put cue 2 on the next
+        # shot and cue 3 past the end of the timeline, silently [audit
+        # 2026-08-24]. `limit` carries the boundary through to the placement
+        # nudge, which would otherwise walk across it anyway.
+        if shot_len is not None and offset >= shot_len:
+            rows.append({**row, "frame": None, "limit": None,
+                         "reason": "no room left in this shot for its dialogue"})
+            continue
         cursor_by_file[vf] = offset + (duration or 1)
-        rows.append({
-            "shot": display_name(manifest, v) if v else (vf or None),
-            "file": vf or None,
-            "frame": frame,
-            "duration": duration,
-            "durationSource": duration_source,
-            "color": colors[c["speaker"]],
-            "name": c["speaker"],
-            "note": c["line"],
-        })
+        rows.append({**row, "frame": start + offset,
+                     "limit": (start + shot_len) if shot_len is not None else None})
     return rows
 
 
@@ -304,7 +354,8 @@ def text_task_rows(manifest: dict, tasks: list, cue_marker_rows: list,
 
         if start is None or vf not in starts_by_file:
             rows.append({"shot": (display_name(manifest, v) if v else (vf or None)),
-                         "file": vf or None, "frame": None, "name": name, "note": note,
+                         "file": vf or None, "frame": None, "limit": None,
+                         "name": name, "note": note,
                          "reason": "no frame (shot has no clip on V1)"})
             continue
 
@@ -313,12 +364,17 @@ def text_task_rows(manifest: dict, tasks: list, cue_marker_rows: list,
         # never let a task land past its own clip
         if shot_len is not None and offset >= shot_len:
             rows.append({"shot": display_name(manifest, v) if v else vf, "file": vf,
-                         "frame": None, "name": name, "note": note,
+                         "frame": None, "limit": None, "name": name, "note": note,
                          "reason": "no free frame inside this shot (its cues fill it)"})
             continue
         free_from[vf] = start + offset + 1
+        # `limit` carries this decision through to add_text_task_markers. The
+        # planner's guard alone was not enough: the 12-frame placement nudge knew
+        # nothing about the clip and walked a correctly-planned task onto the next
+        # shot anyway, reporting it `placed` [audit 2026-08-24].
         rows.append({"shot": display_name(manifest, v) if v else vf, "file": vf,
-                     "frame": frame, "name": name, "note": note})
+                     "frame": frame, "name": name, "note": note,
+                     "limit": (start + shot_len) if shot_len is not None else None})
     return rows
 
 
@@ -463,8 +519,28 @@ def _is_text_task_marker(m: dict) -> bool:
     return (m.get("customData") or "") == TEXT_TASK_TAG
 
 
+def _is_stock_marker(m: dict) -> bool:
+    return (m.get("customData") or "") == STOCK_TAG
+
+
+def _placeable(rows: list | None) -> int | None:
+    """How many planned marker rows actually CARRY a frame — i.e. what the build
+    intended to place, as opposed to how many lines the worklist CSV holds.
+
+    The gate used to score `found` against the raw CSV count, so a cue or text
+    task the planner deliberately refused (no room inside its own shot) was
+    counted as a failure and the whole build reported FAIL for behaving exactly
+    as designed [audit 2026-08-24]. Returns None when no plan was handed over,
+    and the caller falls back to the old count."""
+    if rows is None:
+        return None
+    return sum(1 for r in rows if r.get("frame") is not None)
+
+
 def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: bool = True,
-                    text_tasks: list | None = None) -> dict:
+                    text_tasks: list | None = None, planned_cues: list | None = None,
+                    planned_text_tasks: list | None = None, stock_intent: str | None = None,
+                    sidecar_warnings: list | None = None) -> dict:
     """The acceptance gate. observed:
         {"binVideos": set|None, "binAudio": set|None,
          "timeline": {"name", "v1": [{"name","start","duration"}],
@@ -553,22 +629,88 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
             ok = (delta == 0) if pinned else (nearest is not None)
             check(f"VO {fname} @ {label}", expected, nearest, ok, delta=delta, track=track,
                   rule="pinned: exact frame" if pinned else "unpinned: present on an audio track (head when free)")
+            # NARRATION MUST NOT BE ON A1. The `vo_track` feature exists because
+            # the 2026-08-16 live walk found A1 already full of the shot clips'
+            # embedded audio, so Resolve accepted the append and placed nothing.
+            # The gate looked on every track (right, so a take is always found)
+            # and reported which one — but never asserted it, so narration back
+            # on A1 PASSed: the exact defect the feature was built to prevent
+            # [audit 2026-08-24].
+            if track is not None:
+                on_a1 = track.split()[0] == "A1"
+                check(f"VO {fname} not on A1", f"a track named {VO_TRACK_NAME}", track, not on_a1,
+                      rule="narration rides its own track; A1 is the shot clips' embedded audio")
 
     shot_frames = sorted(f for f, m in markers.items() if _is_shot_marker(m))
     expected_frames = sorted(v1_start[n] for n in video_names if n in v1_start)
     check("shot markers", len(video_names), len(shot_frames), len(shot_frames) == len(video_names))
     check("shot marker positions", expected_frames, shot_frames, shot_frames == expected_frames)
 
+    # BIND EACH MARKER TO THE SHOT IT NAMES. The two rows above compare sorted
+    # frame MULTISETS, so rotating every shot marker onto a different clip left
+    # both of them green and the whole gate PASSed a timeline where every marker
+    # named the wrong picture [audit 2026-08-24]. The marker's name is observed
+    # and carried; it was simply never read. This is the row that makes a
+    # mis-zipped build (markers stamped onto the wrong clips) visible.
+    sw = shot_word(manifest)
+    expected_named = {}
+    for v in manifest.get("videos") or []:
+        n = _basename(v["file"])
+        if n in v1_start:
+            expected_named[v1_start[n]] = f"{sw} {v.get('shotNumber', '?')}"
+    # Only TAGGED markers are held to the naming contract. A bare Blue marker
+    # from a pre-0.2 timeline still counts as a shot marker (README: "a bare Blue
+    # marker from a pre-0.2 timeline still counts"), and those were written
+    # before this server named them — holding them to a name this version
+    # invented would fail a timeline that is legitimately fine.
+    tagged = {f: (m.get("name") or "") for f, m in markers.items()
+              if (m.get("customData") or "") == SHOT_TAG}
+    mismatched = sorted(
+        f"frame {f}: expected {want!r}, found {tagged.get(f, '(no marker)')!r}"
+        for f, want in expected_named.items() if f in tagged and tagged[f] != want
+    )
+    check("shot markers name their own shot", expected_named, tagged, not mismatched,
+          mismatched=mismatched,
+          rule="tagged markers only; untagged pre-0.2 Blue markers are exempt")
+
+    # Cue and text-task rows are scored against WHAT THE BUILD INTENDED TO PLACE
+    # (planned rows carrying a frame), not against the raw worklist — a
+    # deliberately skipped row is a correct outcome, not a failure. The raw
+    # counts remain the fallback for a caller that hands over no plan.
     cue_found = sum(1 for m in markers.values() if _is_cue_marker(m))
-    cue_expected = len(cues) if cues_expected else 0
-    check("cue markers", cue_expected, cue_found, cue_found == cue_expected)
+    planned_cue_count = _placeable(planned_cues)
+    cue_expected = 0 if not cues_expected else (
+        planned_cue_count if planned_cue_count is not None else len(cues))
+    cue_skipped = (len(planned_cues) - planned_cue_count) if planned_cue_count is not None else 0
+    check("cue markers", cue_expected, cue_found, cue_found == cue_expected,
+          skippedByDesign=cue_skipped)
 
     # In-frame text (2026-08-17). Checked only when the package HAS a worklist:
     # a package exported before the studio wrote one must still PASS, so an
     # empty list adds no row rather than a row asserting zero.
     if text_tasks:
         text_found = sum(1 for m in markers.values() if _is_text_task_marker(m))
-        check("text-task markers", len(text_tasks), text_found, text_found == len(text_tasks))
+        planned_text_count = _placeable(planned_text_tasks)
+        text_expected = (planned_text_count if planned_text_count is not None
+                         else len(text_tasks))
+        text_skipped = (len(planned_text_tasks) - planned_text_count
+                        if planned_text_count is not None else 0)
+        check("text-task markers", text_expected, text_found, text_found == text_expected,
+              skippedByDesign=text_skipped)
+
+    # The film-stock intent is a SHIPPED feature (0.3.1) that had no gate row at
+    # all — add_stock_marker can report `placed: False` and nothing noticed the
+    # colourist's note had gone missing [audit 2026-08-24].
+    if stock_intent:
+        stock_found = sum(1 for m in markers.values() if _is_stock_marker(m))
+        check("film-stock marker", 1, stock_found, stock_found == 1)
+
+    # A manifest that NAMES a cue or text file which is not on disk is not an
+    # error — the build must not block on an advisory worklist. But reporting
+    # PASS without mentioning it turns a half-copied package into a clean
+    # handoff. "Does not block" and "is not worth saying" are different claims.
+    for w in (sidecar_warnings or []):
+        check("worklist file present", "named by the manifest", w, False, detail=w)
 
     overall = "PASS" if all(c["pass"] for c in checks) else "FAIL"
     return {"checks": checks, "overall": overall, "report": report}
@@ -648,6 +790,51 @@ def stock_intent_note(manifest: dict) -> str | None:
     return f"{head} — {note}" if note else f"{head} — colourist's call, nothing applied."
 
 
+# The enforceable form of "a starting balance, never a creative grade". Depth
+# Converter's own emitter clamps to these (CDL_OFFSET_MAX 0.25, saturation
+# 0.5–1.5, slope/power fixed at 1) — but nothing on THIS side checked, so the
+# promise in apply_look's docstring was carried entirely in prose. A depthc bug
+# emitting saturation 0.1 would have graded every clip and reported success
+# [audit 2026-08-24]. Values outside the envelope are refused per clip, by name,
+# rather than taking the whole tool down.
+CDL_SLOPE_RANGE = (0.5, 2.0)
+CDL_POWER_RANGE = (0.5, 2.0)
+CDL_OFFSET_LIMIT = 0.25
+CDL_SAT_RANGE = (0.5, 1.5)
+
+
+def cdl_problem(cdl) -> str | None:
+    """Why this CDL cannot be applied honestly, or None when it is in bounds.
+
+    Shape first: cdl_payload does `cdl["slope"]` unguarded and joins whatever
+    arity it is handed, so a 2-element vector produced a silently malformed
+    SetCDL argument and a missing key raised KeyError inside apply_look's
+    blanket except — one bad clip entry killed the entire run."""
+    if not isinstance(cdl, dict):
+        return "not a CDL object"
+    for key, rng in (("slope", CDL_SLOPE_RANGE), ("power", CDL_POWER_RANGE), ("offset", None)):
+        v = cdl.get(key)
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            return f"{key} must be a list of 3 numbers"
+        try:
+            nums = [float(x) for x in v]
+        except (TypeError, ValueError):
+            return f"{key} holds a non-numeric value"
+        if any(x != x or x in (float("inf"), float("-inf")) for x in nums):
+            return f"{key} holds a non-finite value"
+        if rng and any(not (rng[0] <= x <= rng[1]) for x in nums):
+            return f"{key} {nums} outside the starting-balance envelope {rng}"
+        if key == "offset" and any(abs(x) > CDL_OFFSET_LIMIT for x in nums):
+            return f"offset {nums} exceeds ±{CDL_OFFSET_LIMIT} — that is a grade, not a balance"
+    try:
+        sat = float(cdl.get("saturation"))
+    except (TypeError, ValueError):
+        return "saturation is missing or non-numeric"
+    if not (CDL_SAT_RANGE[0] <= sat <= CDL_SAT_RANGE[1]):
+        return f"saturation {sat} outside the starting-balance envelope {CDL_SAT_RANGE}"
+    return None
+
+
 def plan_look(manifest: dict, cdl_doc: dict, v1_items: list[dict]) -> dict:
     """Decide, from the manifest + the CDL file + the observed V1 items, what
     apply_look will do — offline-testable. Rows match by clip NAME (the file's
@@ -669,6 +856,10 @@ def plan_look(manifest: dict, cdl_doc: dict, v1_items: list[dict]) -> dict:
             continue
         if name not in on_v1:
             missing.append({"clip": name, "why": "not on V1 of the timeline"})
+            continue
+        problem = cdl_problem(c.get("cdl"))
+        if problem:
+            missing.append({"clip": name, "why": f"CDL refused: {problem}"})
             continue
         rows.append({
             "clip": name,
