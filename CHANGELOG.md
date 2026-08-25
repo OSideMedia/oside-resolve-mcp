@@ -172,7 +172,30 @@ inferences — each one settles something the fake could not.
   set) instead of by trying writes until one sticks. Retrying writes is the
   shape that turns a repeated call into a pile of markers.
 
-`capabilities.features` gains `verify_v3`, `post_save` and `cdl_envelope`.
+### The grade is now READ BACK, not asserted
+
+`apply_look(..., verify=True)` exports the timeline as an EDL carrying ASC CDL
+and compares what comes back against what it set — per clip, with `verified` and
+`readBackDiffs` on each row and a `readback` summary. `complete` now requires the
+read-back to match, so a look that did not take can no longer report success.
+`pipeline.py` uses it.
+
+This is the only witness Resolve offers that is not the writer's own return
+value: there is no `GetCDL`, but `Timeline.Export(path, EXPORT_EDL, EXPORT_CDL)`
+carries the applied numbers out. The EDL has no clip names — every event's reel
+is `AX` — so events match V1 items BY POSITION, which is what the mapping does.
+Measured end to end: 3 events, 3 checked, 3 verified.
+
+### The A1 collision, closed live at last
+
+The 2026-08-16 defect `vo_track` exists for — shot clips carrying embedded audio
+fill A1, so an A1 append at an occupied frame answers truthy and places nothing —
+had only ever been covered by the fake. A walk with a real video+audio package
+now reproduces the condition and shows the fix holding: **A1 carried
+`shot01/02/03` at 0/120/240 and every VO take landed on `A2 VO`, `voLoose: 0`.**
+
+`capabilities.features` gains `verify_v3`, `post_save`, `cdl_envelope` and
+`cdl_readback`.
 
 ## 0.4.0 — 2026-08-17
 

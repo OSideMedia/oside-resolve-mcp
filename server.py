@@ -671,7 +671,8 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
 
 
 @mcp.tool(annotations=IDEMPOTENT_WRITE)
-def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bool = False) -> dict:
+def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bool = False,
+               verify: bool = False) -> dict:
     """"Look travels": put the film's starting balance on every clip. Reads the
     manifest's `look` block and the `look-cdl.json` Depth Converter measured
     beside it (`depthc look-compare --manifest --emit-cdl`), and sets that
@@ -727,14 +728,52 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
                               else "SetCDL returned false and the node count could not be read")
             rows.append(row)
         applied = sum(1 for r in rows if r["applied"])
+
+        # READ BACK. `applied` above is SetCDL's answer about itself; this is the
+        # only witness Resolve offers that is not the writer's own return value.
+        # There is no GetCDL, but EXPORT_EDL+EXPORT_CDL carries the applied
+        # numbers out (proven on the 2026-08-24 walk). The EDL has no clip names
+        # — the reel is `AX` on every event — so events match V1 items BY
+        # POSITION, which is why the mapping goes through `v1` and not the
+        # manifest order.
+        readback = None
+        if verify:
+            text = rapi.export_timeline_cdl(resolve, timeline)
+            if text is None:
+                readback = {"ok": False, "reason": "Timeline.Export returned no EDL — cannot read back"}
+            else:
+                found = handoff.parse_cdl_edl(text)
+                by_clip = {}
+                for i, it in enumerate(v1):
+                    if i < len(found):
+                        by_clip[it["name"]] = found[i]
+                checked = 0
+                for r in rows:
+                    if not r["applied"]:
+                        continue
+                    verdict = handoff.compare_cdl(r["cdl"], by_clip.get(r["clip"]))
+                    r["verified"] = verdict["match"]
+                    if verdict["diffs"]:
+                        r["readBackDiffs"] = verdict["diffs"]
+                    checked += 1
+                matched = sum(1 for r in rows if r.get("verified"))
+                readback = {"ok": True, "events": len(found), "checked": checked,
+                            "verified": matched,
+                            "allMatch": checked > 0 and matched == checked,
+                            "how": "Timeline.Export(EXPORT_EDL, EXPORT_CDL), matched by V1 position"}
+
         # the stock is INTENT: one marker, nothing graded for it.
         stock_marker = rapi.add_stock_marker(timeline, stock_note) if stock_note else None
         # A run where NOTHING applied used to return ok:true. The look is the
         # whole point of the call; a total failure is a failure [audit 2026-08-24].
         complete = (applied == len(rows)) and not plan["missing"]
+        if readback is not None:
+            # a run that could not be read back, or read back wrong, is not complete
+            complete = complete and bool(readback.get("allMatch"))
         return _ok(look=manifest["look"].get("name"), applied=applied, of=len(rows), rows=rows,
                    missing=plan["missing"], extra=plan["extra"],
                    complete=complete,
+                   readback=readback,
                    stockMarker=stock_marker,
                    # The CDL file carries its own honesty — Depth Converter stamps
                    # a `derivation` line saying the gains are a fitted HEURISTIC.
@@ -770,10 +809,12 @@ def handoff_prompt(manifest_path: str = "<package>/manifest.json") -> str:
         f"build_timeline({manifest_path!r}) for real. A NEW timeline: clips in shot order on V1, one Blue "
         "marker per shot, each pinned VO under its shot on its OWN audio track named VO (never A1 — the "
         "shot clips' embedded audio fills it), dialogue cues as range markers.\n"
-        f"3b. (when the manifest carries a `look` block) apply_look({manifest_path!r}) — the film's starting "
+        f"3b. (when the manifest carries a `look` block) apply_look({manifest_path!r}, verify=True) — the film's starting "
         "balance on node 1 of every V1 clip, from the look-cdl.json Depth Converter measured beside the "
         "manifest (`depthc look-compare --manifest --emit-cdl`). Key, temperature, saturation only — never "
-        "a palette fix, never a creative grade. If it `refused`, say why and move on; it never blocks the gate.\n"
+        "a palette fix, never a creative grade. `verify=True` reads the grade BACK out of an EDL+CDL export "
+        "(Resolve has no GetCDL) — quote `readback.verified of checked`, not just `applied`. "
+        "If it `refused`, say why and move on; it never blocks the gate.\n"
         "3c. save_project() — SAVE BEFORE YOU VERIFY. The save is the verification boundary: "
         "placements from an errored append are visible to every in-session read and are discarded "
         "by the save, so a gate run before it cannot contradict them. It reports V1 counts AFTER "

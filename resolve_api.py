@@ -12,7 +12,9 @@
 # ============================================================================
 
 import os
+import shutil
 import sys
+import tempfile
 import time
 import subprocess
 
@@ -406,6 +408,32 @@ def add_text_task_markers(timeline, rows: list[dict]) -> dict:
                         r.get("note", ""), 1, TEXT_TASK_TAG)
         placed += 1
     return {"placed": placed, "skipped": skipped}
+
+
+def export_timeline_cdl(resolve, timeline) -> str | None:
+    """Export the timeline as an EDL carrying ASC CDL and return its TEXT.
+
+    This is the only read-back Resolve offers for a grade: there is no `GetCDL`,
+    but `Timeline.Export(path, EXPORT_EDL, EXPORT_CDL)` writes the applied
+    values (proven on the 2026-08-24 walk — the file came back with exactly the
+    numbers just set). The enum constants must come off the LIVE resolve handle;
+    passing the strings is silently rejected.
+
+    Writes into a temp dir and removes it: the read-back is evidence for one
+    call, not an artefact to leave beside the package.
+    """
+    tmp = tempfile.mkdtemp(prefix="oside-cdl-")
+    path = os.path.join(tmp, "readback.edl")
+    try:
+        ok = timeline.Export(path, resolve.EXPORT_EDL, resolve.EXPORT_CDL)
+        if not ok or not os.path.isfile(path):
+            return None
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (AttributeError, TypeError, OSError):
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def timeline_by_name(project, name: str | None):
