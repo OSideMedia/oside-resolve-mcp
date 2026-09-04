@@ -1525,6 +1525,158 @@ def test_a_resolve_without_versions_falls_back_and_says_so():
     assert v2["version"] is None and "could not create" in v2["why"]
 
 
+
+# ---------------------------------------------------------------------------
+# the handoff SKILL vs the handoff PROMPT — sibling-surface drift
+#
+# `~/.claude/skills/oside-resolve-handoff/SKILL.md` carries a SHORT version of
+# the recipe `handoff_prompt()` ships. The skill says so itself and names the
+# prompt as the source of truth, because the prompt lives inside the server and
+# cannot drift from the tools; the skill is hand-maintained and can. It exists
+# for DISCOVERY: a prompt only arrives when someone already knows to ask for it,
+# and by then the first tool call is usually made.
+#
+# Omission is fine — the skill is deliberately an abridgement. What is NOT fine
+# is the skill going WRONG: a step added to the prompt and missed here, a step
+# removed and still listed, a tool renamed, or the order changed. That is the
+# only class this gate holds, and it is the class that would make an agent
+# follow a stale sequence.
+#
+# The skill is tracked in another repo (claude-commands), so this repo's CI
+# cannot see it. Unreachable is UNKNOWN, never a pass: under pytest that is a
+# visible skip. Registered as `python3 -m pytest -q tests`, which is the path
+# that matters.
+# ---------------------------------------------------------------------------
+
+import ast  # noqa: E402
+import re  # noqa: E402
+
+SKILL_LOCATIONS = (
+    os.path.expanduser("~/.claude/skills/oside-resolve-handoff/SKILL.md"),
+    os.path.expanduser(
+        "~/Projects/Toolkit/claude-commands/skills/oside-resolve-handoff/SKILL.md"),
+)
+
+
+def _skill_text():
+    for p in SKILL_LOCATIONS:
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as fh:
+                return fh.read()
+    return None
+
+
+def _shipped_tool_names():
+    """The tools the server actually ships, read from its own @mcp.tool
+    decorators rather than a list here that would need maintaining."""
+    with open(os.path.join(os.path.dirname(HERE), "server.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for d in node.decorator_list:
+                fn = d.func if isinstance(d, ast.Call) else d
+                if isinstance(fn, ast.Attribute) and fn.attr == "tool":
+                    names.add(node.name)
+    return names
+
+
+def _skill_steps(skill_text):
+    """The ordered call sequence from the skill's fenced order block."""
+    m = re.search(r"## The order, and it matters.*?```\n(.*?)```", skill_text, re.S)
+    if not m:
+        raise AssertionError(
+            "the skill lost its fenced order block — that block IS the contract this "
+            "gate reads; if the skill was restructured, update this test with it")
+    return [re.match(r"\s*(\w+)\(", ln).group(1)
+            for ln in m.group(1).splitlines() if re.match(r"\s*\w+\(", ln)]
+
+
+def _drift(skill_text, prompt_text, shipped):
+    """Pure predicate, so the red case below can run the SAME code on a mutated
+    skill. Returns a list of complaints; empty means the two agree."""
+    out = []
+    steps = _skill_steps(skill_text)
+
+    # 1. every step the skill names is a tool this server still ships
+    for name in dict.fromkeys(steps):
+        if name not in shipped:
+            out.append(f"skill lists {name}(), which the server does not ship")
+
+    # 2. every tool the PROMPT actually invokes must appear in the skill.
+    #    This is the added-a-step case, the one that makes the skill wrong.
+    invoked = dict.fromkeys(re.findall(r"\b(\w+)\(", prompt_text))
+    for name in invoked:
+        if name in shipped and name not in steps:
+            out.append(f"prompt invokes {name}() but the skill's order block omits it")
+
+    # 3. every step the skill names must at least be MENTIONED in the prompt.
+    #    (mentioned, not invoked: the prompt says "call resolve_status." in prose)
+    for name in dict.fromkeys(steps):
+        if not re.search(r"\b" + re.escape(name) + r"\b", prompt_text):
+            out.append(f"skill lists {name}() but the prompt never mentions it")
+
+    # 4. order: first mention of each step in the prompt must run in skill order
+    firsts = []
+    for name in dict.fromkeys(steps):
+        m = re.search(r"\b" + re.escape(name) + r"\b", prompt_text)
+        if m:
+            firsts.append((name, m.start()))
+    for (an, ai), (bn, bi) in zip(firsts, firsts[1:]):
+        if ai >= bi:
+            out.append(f"order: skill puts {an}() before {bn}(); the prompt does not")
+    return out
+
+
+def _skip(why):
+    try:
+        import pytest
+        pytest.skip(why)
+    except ImportError:
+        print(f"UNKNOWN (not a pass): {why}")
+
+
+def test_the_handoff_skill_has_not_drifted_from_the_prompt():
+    """The skill is an abridgement of handoff_prompt(). Omission is allowed;
+    contradiction is not."""
+    skill = _skill_text()
+    if skill is None:
+        _skip("oside-resolve-handoff is not installed on this machine, so skill/prompt "
+              "agreement is UNKNOWN here — it is not passing")
+        return
+    complaints = _drift(skill, server.handoff_prompt(), _shipped_tool_names())
+    assert not complaints, "handoff skill has drifted from the prompt:\n  " + \
+        "\n  ".join(complaints)
+
+
+def test_the_drift_check_can_actually_fail():
+    """The gate above is only worth having if it goes red. Run the SAME predicate
+    over deliberately broken skills and require each to be caught."""
+    skill = _skill_text()
+    if skill is None:
+        _skip("skill absent; the red case has nothing to mutate")
+        return
+    shipped = _shipped_tool_names()
+    prompt = server.handoff_prompt()
+    assert not _drift(skill, prompt, shipped), "precondition: the real pair agrees"
+
+    # a) a reordered skill must be caught
+    swapped = skill.replace("save_project()", "__TMP__(") \
+                   .replace("verify_import(manifest)", "save_project()") \
+                   .replace("__TMP__(", "verify_import(manifest)", 1)
+    assert any("order:" in c for c in _drift(swapped, prompt, shipped)), \
+        "a reordered skill went undetected"
+
+    # b) a step dropped from the skill while the prompt still invokes it
+    dropped = re.sub(r"^\s*apply_look\(.*\n", "", skill, count=1, flags=re.M)
+    assert any("omits it" in c for c in _drift(dropped, prompt, shipped)), \
+        "a step dropped from the skill went undetected"
+
+    # c) a step the server no longer ships
+    renamed = skill.replace("verify_import(manifest)", "verify_importt(manifest)")
+    assert any("does not ship" in c for c in _drift(renamed, prompt, shipped)), \
+        "a renamed/removed tool went undetected"
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
