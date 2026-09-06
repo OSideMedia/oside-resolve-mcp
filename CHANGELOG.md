@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.3 — 2026-09-06
+
+**A malformed manifest is refused with a sentence, never a traceback — and the
+pipeline always prints its report.** From the six-repo ecosystem audit of
+2026-09-06 (OSIDE `DOCS/audits/AUDIT-2026-09-06-ECOSYSTEM.md`, RM-1..RM-6):
+
+- **RM-1 (P0)** `pipeline.py` died with zero bytes on stdout when
+  `manifest.project` was a string (the try/except wrapped only the load), so
+  the studio's one-click door could only say "Pipeline returned no report".
+  The shape is refused at load, and a catch-all past the load still prints the
+  report with the exception in `error`. Test proven red on 0.5.2.
+- **RM-3/4/5/6** `_check_shape()` at load: `project` must be an object; `kind`
+  must be a template (`documentary` used to rehearse green in a dry run and
+  fail only at `create_project`); `videos`/`audio` entries must be objects
+  with a `file` (a string entry died with `'str' object has no attribute
+  'get'`, a missing `file` at handoff.py:405); a wrong-TYPE `cues`/`textTasks`
+  is refused instead of silently dropping the worklist while the gate expected
+  zero markers; `look.schema` other than `oside-look/1` is refused (v2 was
+  consumed as v1). Every sentence has a row in README's error table, and the
+  test requires it.
+- **RM-2** the selftest counted an UNKNOWN as a PASS (`pytest.skip` with no
+  pytest fell through to a print); UNKNOWN is its own tally line and, without
+  `CI=1`, a FAIL naming the missing skill.
+
+Not changed (owed): `verify_import` still counts unmeasurable clip durations
+as "no frame" without ffprobe (RM-11); the failure path in OSIDE discards
+`checks[]` (RM-9, studio side); OSIDE's capability gate wants 5 of 11
+features and never asks for `post_save` (RM-7/E-4, studio side);
+`DOCS/DAVINCI/DAVINCI-HANDOFF.md` A1 copy (RM-8, studio side).
+
 ## 0.5.0 — 2026-08-24
 
 **The plan is not the witness.** A three-seat council audit (Codex, Opus,
