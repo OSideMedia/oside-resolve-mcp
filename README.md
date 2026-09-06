@@ -75,6 +75,8 @@ project:
    starting balance. It nudges past shot 1's marker and reports the frame
    it used; no room means a reported skip, never a silent drop.
 4. `verify_import(manifest_path, timeline_name=None, cues=True)` — the
+  Since 0.5.3+ (step e) it also writes `verify.json` beside the manifest — one row per clip by `generationId`
+  (`placed`, `start`, `duration`), `overall`, `verifiedAt`; OSIDE's build door reads it back onto the generation row.
    acceptance gate: a per-check table `checks: [{check, expected, found,
    pass, …}]` and `overall: PASS|FAIL`. Checks: every package file in its bin;
    V1 clip count; V1 clip order == manifest order (by clip name); no stray V1
