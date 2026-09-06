@@ -1858,6 +1858,58 @@ def test_verify_sidecar_with_no_timeline_places_nothing():
     assert side["timeline"] == {"name": None}
 
 
+def test_pending_take_is_named_on_its_shot_marker_and_in_the_gate():
+    """RM-10: the fixture's shot 2 is `outcome: pending` — its marker name and
+    note say so, its tag and colour stay (identity is the tag), and verify
+    carries an advisory row naming it without failing the build."""
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+    plan = handoff.plan_timeline(
+        manifest, base, "EDIT 01", cues, 24.0, "resolve", True,
+        bin_lookup=lambda kind, name: True,
+        duration_lookup=lambda v, p: (120, "resolve"),
+    )
+    pending = [m for m in plan["markers"] if m.get("outcome") == "pending"]
+    assert len(pending) == 1, [m.get("outcome") for m in plan["markers"]]
+    m = pending[0]
+    assert m["name"].endswith("· PENDING TAKE") and m["note"].startswith("UNAPPROVED TAKE (outcome: pending)")
+    assert m["color"] == "Blue"
+    approved = [x for x in plan["markers"] if x.get("outcome") == "approved"]
+    assert approved and not any("TAKE" in x["name"] for x in approved)
+    v1, a1, markers, vo = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    row = next(c for c in out["checks"] if c["check"] == "unapproved takes on V1")
+    assert row["pass"] is True and row["found"] == 1 and row.get("advisory") is True
+    assert "shot 2" in row["detail"] or "1A" in row["detail"] or "2" in row["detail"]
+    assert out["overall"] == "PASS"
+
+
+def test_no_frame_reason_blames_the_gap_not_a_missing_clip():
+    """RM-11: a planned clip whose start cannot be computed (an earlier clip's
+    duration unmeasurable) must not be reported as 'no clip on V1'."""
+    starts = {"a.mp4": 0, "b.mp4": None}
+    assert handoff.no_frame_reason("zzz.mp4", starts, None).startswith("no frame (shot has no clip on V1)")
+    r = handoff.no_frame_reason("b.mp4", starts, None)
+    assert r.startswith("frame unknown") and "ffprobe" in r and "no clip" not in r
+    # the shot-marker row carries the same reason when its frame is None
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+    # an unmeasurable FIRST clip: every later clip is planned yet has no frame,
+    # and each marker row must say why (RM-11) — never a bare null
+    plan = handoff.plan_timeline(
+        manifest, base, "EDIT 01", cues, 24.0, "resolve", True,
+        bin_lookup=lambda kind, name: True,
+        duration_lookup=lambda v, p: (None, "unknown"),
+    )
+    frameless = [m for m in plan["markers"] if m["frame"] is None]
+    assert frameless, [m["frame"] for m in plan["markers"]]
+    for m in frameless:
+        assert m.get("reason", "").startswith("frame unknown"), m
+    cue_rows = [r for r in plan["cueMarkers"] if r["frame"] is None] if "cueMarkers" in plan else []
+    for r in cue_rows:
+        assert "no clip" not in r["reason"] or r["file"] not in {m["file"] for m in plan["markers"]}, r
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
