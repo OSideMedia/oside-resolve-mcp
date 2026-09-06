@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed — RM-10 and RM-11 (audit 2026-09-06, ow-9415e0)
+
+- **An unapproved take is named on the timeline and in the gate** (RM-10).
+  OSIDE deliberately exports `pending`/`rejected` takes and warns; the MCP laid
+  them on V1 with nothing saying so. The shot marker keeps its tag and colour
+  (identity is the tag) and carries the outcome in its NAME (`shot 2 · PENDING
+  TAKE`) and at the head of its note; `verify_import` adds an advisory row
+  `unapproved takes on V1` naming them without failing the build. The naming
+  contract compares the base name, so a pre-0.6 timeline still passes.
+- **A missing frame says why** (RM-11). `no frame (shot has no clip on V1)`
+  fired whenever a start could not be computed — including a planned clip on
+  disk whose predecessor's duration was unmeasurable (no ffprobe on PATH), so
+  an offline dry run blamed a clip that was there. `no_frame_reason` tells the
+  two apart; shot-marker rows without a frame carry the reason too.
+
 ### Added — `verify_import` writes `verify.json` (PLAN-SHARED-GENERATION-ID step e, 2026-09-06)
 
 - The gate's verdict used to be RETURNED and written nowhere: the manifest's
