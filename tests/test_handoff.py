@@ -708,7 +708,7 @@ def test_tool_annotations_prompt_and_capabilities():
     assert caps["manifest"] == "oside-davinci/v1"
     assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
                                 "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope",
-                                "cdl_readback"]
+                                "cdl_readback", "verify_json"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -1808,6 +1808,55 @@ def test_unknown_is_never_counted_as_a_pass():
         body = fh.read()
     assert "unknown (not passes)" in body and "except Unknown as e:" in body
     assert 'if not os.environ.get("CI")' in body
+
+def test_verify_sidecar_keys_every_clip_by_generation_id():
+    """step (e): the verdict reaches a file OSIDE can read — one row per clip by
+    the manifest's generationId, placed = on V1, start/duration when it is."""
+    import tempfile
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+    v1, a1, markers, vo = _good_timeline()
+    observed = _observed(v1, a1, markers, vo=vo)
+    result = handoff.evaluate_verify(manifest, cues, observed)
+    side = handoff.verify_sidecar(manifest, observed, result, "2026-09-06T00:00:00Z")
+    assert side["format"] == "oside-verify/1" and side["overall"] == "PASS"
+    assert set(side["clips"]) == {v["generationId"] for v in manifest["videos"]}
+    for v in manifest["videos"]:
+        row = side["clips"][v["generationId"]]
+        assert row["placed"] is True and row["file"] == os.path.basename(v["file"])
+        assert isinstance(row["start"], int) and isinstance(row["duration"], int)
+    assert "unkeyed" not in side
+    with tempfile.TemporaryDirectory() as td:
+        path = handoff.write_verify_sidecar(td, side)
+        assert os.path.basename(path) == "verify.json"
+        with open(path, encoding="utf-8") as f:
+            assert json.load(f) == side
+
+
+def test_verify_sidecar_names_the_unplaced_and_the_unkeyed():
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+    v1, a1, markers, vo = _good_timeline()
+    v1 = v1[:-1]  # the last clip never landed
+    observed = _observed(v1, a1, markers, vo=vo)
+    result = handoff.evaluate_verify(manifest, cues, observed)
+    last = manifest["videos"][-1]
+    side = handoff.verify_sidecar(manifest, observed, result, "2026-09-06T00:00:00Z")
+    assert side["overall"] == "FAIL"
+    assert side["clips"][last["generationId"]] == {"file": os.path.basename(last["file"]), "placed": False, "start": None, "duration": None}
+    stripped = dict(manifest, videos=[dict(v) for v in manifest["videos"]])
+    stripped["videos"][0].pop("generationId")
+    side2 = handoff.verify_sidecar(stripped, observed, result, "2026-09-06T00:00:00Z")
+    assert len(side2["clips"]) == len(manifest["videos"]) - 1
+    assert side2["unkeyed"][0]["file"] == os.path.basename(manifest["videos"][0]["file"])
+
+
+def test_verify_sidecar_with_no_timeline_places_nothing():
+    manifest, base = _fixture()
+    side = handoff.verify_sidecar(manifest, {"timeline": None}, {"overall": "FAIL"}, "2026-09-06T00:00:00Z")
+    assert all(row["placed"] is False for row in side["clips"].values())
+    assert side["timeline"] == {"name": None}
+
 
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
