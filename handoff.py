@@ -40,7 +40,65 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             "cdl_envelope",
             # 0.5.0 — apply_look(verify=True) READS THE GRADE BACK out of an
             # EXPORT_EDL+EXPORT_CDL export instead of trusting SetCDL's return.
-            "cdl_readback"]
+            "cdl_readback",
+            # 0.6.0 — verify_import writes verify.json beside the manifest, one
+            # row per clip keyed by the manifest's generationId, so the verdict
+            # reaches OSIDE's ledger (PLAN-SHARED-GENERATION-ID step e).
+            "verify_json"]
+
+VERIFY_FORMAT = "oside-verify/1"
+VERIFY_SIDECAR = "verify.json"
+
+
+def verify_sidecar(manifest: dict, observed: dict, result: dict, verified_at: str) -> dict:
+    """The per-clip verdict OSIDE reads back (PLAN-SHARED-GENERATION-ID step e).
+
+    Until now `verify_import`'s result was RETURNED and never written anywhere:
+    the manifest's per-clip `generationId` was emitted by OSIDE and read by
+    nothing, so the first end-of-pipeline truth about a render never reached
+    the row that paid for it. One row per manifest video, keyed by its
+    generationId: `placed` = that basename sits on V1 of the observed timeline,
+    with its start/duration in frames when it does. A video without a
+    generationId (a hand-built manifest) is listed under `unkeyed` by file so
+    nothing is silently dropped. Pure — the caller writes it."""
+    tl = (observed or {}).get("timeline") or {}
+    v1 = {it.get("name"): it for it in (tl.get("v1") or [])}
+    clips: dict = {}
+    unkeyed: list = []
+    for v in manifest.get("videos") or []:
+        name = os.path.basename(v.get("file", ""))
+        item = v1.get(name)
+        row = {
+            "file": name,
+            "placed": item is not None,
+            "start": item.get("start") if item else None,
+            "duration": item.get("duration") if item else None,
+        }
+        gid = v.get("generationId")
+        if gid:
+            clips[str(gid)] = row
+        else:
+            unkeyed.append(row)
+    return {
+        "format": VERIFY_FORMAT,
+        "verifiedAt": verified_at,
+        "manifest": {"project": manifest.get("project"), "kind": manifest.get("kind"),
+                     "exportedAt": manifest.get("exportedAt")},
+        "timeline": {"name": tl.get("name")},
+        "overall": result.get("overall"),
+        "clips": clips,
+        **({"unkeyed": unkeyed} if unkeyed else {}),
+    }
+
+
+def write_verify_sidecar(base: str, sidecar: dict) -> str:
+    """Write verify.json beside the manifest; returns the path. Overwrites — the
+    latest verify is the truth, and verifiedAt says when."""
+    path = os.path.join(base, VERIFY_SIDECAR)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sidecar, f, indent=2)
+        f.write("\n")
+    return path
 
 # The template a kind maps to fixes the timeline rate. templates/templates.json
 # carries each template's `fps` (server reads it); this is the last-resort

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added — `verify_import` writes `verify.json` (PLAN-SHARED-GENERATION-ID step e, 2026-09-06)
+
+- The gate's verdict used to be RETURNED and written nowhere: the manifest's
+  per-clip `generationId` was emitted by OSIDE and read by nothing, so the first
+  end-of-pipeline truth about a render never reached the row that paid for it.
+  `verify_import` now writes `verify.json` beside the manifest — `format:
+  oside-verify/1`, `verifiedAt`, the timeline name, `overall`, and `clips`
+  keyed by `generationId` with `placed` (the clip sits on V1) and its
+  `start`/`duration` in frames; a video without a generationId is listed under
+  `unkeyed`, never dropped. The result carries `sidecar` (the path) and a
+  `sidecarWarning` when the write failed — a sidecar that cannot be written is
+  never a failed verify. Capability `verify_json`. OSIDE's Build-in-Resolve
+  door reads it back onto `generations.request_payload.resolve`.
+
 ## 0.5.3 — 2026-09-06
 
 **A malformed manifest is refused with a sentence, never a traceback — and the

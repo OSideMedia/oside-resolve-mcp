@@ -12,6 +12,7 @@
 # refuses to reuse an existing project or timeline name.
 # ============================================================================
 
+import datetime
 import json
 import os
 import re
@@ -723,8 +724,24 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
             stock_intent=handoff.stock_intent_note(manifest),
             sidecar_warnings=[w for w in (cue_warn, task_warn) if w],
         )
+        # step (e): the verdict is WRITTEN beside the manifest, per clip by
+        # generationId, so OSIDE's build door can read it back onto the row.
+        # A sidecar that cannot be written is a warning on the result, never a
+        # failed verify — the gate's verdict is the timeline, not the file.
+        sidecar_path = None
+        sidecar_warning = None
+        try:
+            sidecar = handoff.verify_sidecar(
+                manifest, observed, result,
+                datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+            )
+            sidecar_path = handoff.write_verify_sidecar(base, sidecar)
+        except Exception as e:  # noqa: BLE001
+            sidecar_warning = f"verify.json not written: {e}"
         return _ok(overall=result["overall"], clean=result["overall"] == "PASS",
-                   checks=result["checks"], report=result["report"])
+                   checks=result["checks"], report=result["report"],
+                   sidecar=sidecar_path,
+                   **({"sidecarWarning": sidecar_warning} if sidecar_warning else {}))
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
