@@ -725,6 +725,7 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
 # ---------------------------------------------------------------------------
 
 LOOK_CDL_FILE = "look-cdl.json"
+LOOK_SCHEMA = "oside-look/1"  # the manifest's look block; checked at load (RM-4)
 LOOK_CDL_SCHEMA = "oside-look-cdl/1"
 
 

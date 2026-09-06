@@ -56,8 +56,25 @@ def main() -> int:
         print(json.dumps(report))
         return 1
 
+    # EVERYTHING BELOW PRINTS A REPORT, EVEN WHEN IT CRASHES (audit 2026-09-06
+    # RM-1, P0). The try/except above wrapped only the load; a manifest whose
+    # `project` was a string died on the next line with an AttributeError, zero
+    # bytes on stdout, exit 1 — and the studio's one-click door could only say
+    # "Pipeline returned no report". The shape is now refused inside
+    # _load_manifest with an operator sentence (README's error table), and any
+    # exception past this point still lands in the report.
+    try:
+        return _run(args, report, step, manifest, cues)
+    except Exception as e:  # noqa: BLE001
+        report["error"] = f"pipeline crashed before a report could be built: {type(e).__name__}: {e}"
+        print(json.dumps(report))
+        return 1
+
+
+def _run(args, report: dict, step, manifest: dict, cues: bool) -> int:
     kind = manifest.get("kind", "cinematic")
-    name = args.name or manifest.get("project", {}).get("name") or "OSIDE IMPORT"
+    project = manifest.get("project")
+    name = args.name or (project.get("name") if isinstance(project, dict) else None) or "OSIDE IMPORT"
     report["project"] = name
     report["kind"] = kind
 
