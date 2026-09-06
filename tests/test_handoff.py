@@ -1687,6 +1687,128 @@ def test_the_drift_check_can_actually_fail():
     assert any("does not ship" in c for c in _drift(renamed, prompt, shipped)), \
         "a renamed/removed tool went undetected"
 
+
+# ---------------------------------------------------------------------------
+# Manifest SHAPE (audit 2026-09-06 RM-1/3/4/5/6). Fourteen corrupt variants
+# were run by hand on 2026-09-06; these pin the ones that killed the pipeline
+# or lost data silently, and require every refusal to have a README row.
+# ---------------------------------------------------------------------------
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+README_PATH = os.path.join(HERE, "..", "README.md")
+
+
+def _mutated_package(mutate):
+    """A throwaway copy of the fixture package with `mutate(manifest)` applied.
+    Returns (manifest_path, tmpdir) — the caller removes tmpdir."""
+    tmp = tempfile.mkdtemp(prefix="oside-mcp-shape-")
+    pkg = os.path.join(tmp, "pkg")
+    shutil.copytree(os.path.dirname(FIXTURE), pkg)
+    path = os.path.join(pkg, "manifest.json")
+    with open(path, encoding="utf-8") as fh:
+        m = json.load(fh)
+    mutate(m)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(m, fh)
+    return path, tmp
+
+
+def _refusal(mutate) -> str:
+    path, tmp = _mutated_package(mutate)
+    try:
+        server._load_manifest(path)
+    except rapi.ResolveError as e:
+        return str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    raise AssertionError("the corrupt manifest was accepted")
+
+
+def _readme_has(phrase: str) -> bool:
+    with open(README_PATH, encoding="utf-8") as fh:
+        return phrase in fh.read()
+
+
+def test_pipeline_prints_a_json_report_when_project_is_not_an_object():
+    """RM-1 (P0). The one-click door reads stdout as JSON; zero bytes is
+    'Pipeline returned no report'. Red on the pre-fix code: AttributeError
+    outside the try, 0 bytes, exit 1."""
+    path, tmp = _mutated_package(lambda m: m.__setitem__("project", "THE DROP"))
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(HERE, "..", "pipeline.py"), path, "--dry-run"],
+            capture_output=True, text=True, timeout=60,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert proc.stdout.strip(), f"pipeline wrote NO report (stderr: {proc.stderr[-300:]})"
+    report = json.loads(proc.stdout)
+    assert report["ok"] is False and proc.returncode == 1
+    assert "manifest.project" in report["error"], report["error"]
+    assert "features" in report, "the capability block still rides the failure report"
+
+
+def test_pipeline_report_survives_a_crash_past_the_load(monkeypatch=None):
+    """The catch-all: a crash after the manifest loads still prints the
+    report, naming the exception."""
+    src = os.path.join(HERE, "..", "pipeline.py")
+    with open(src, encoding="utf-8") as fh:
+        body = fh.read()
+    assert "pipeline crashed before a report could be built" in body
+    assert body.index("def _run(") > body.index("except Exception as e:  # noqa: BLE001\n        report[\"error\"] = f\"pipeline crashed"), \
+        "the catch-all wraps _run"
+
+
+def test_corrupt_manifest_shapes_are_refused_with_a_readme_sentence():
+    """RM-3/4/5/6: every refusal is an operator sentence with a README row,
+    never a Python traceback or a silent loss."""
+    cases = [
+        ("project as string", lambda m: m.__setitem__("project", "x"), "manifest.project must be an object"),
+        ("videos entry as string", lambda m: m["videos"].__setitem__(0, "videos/x.mp4"), "manifest.videos[0] must be an entry object"),
+        ("videos entry without file", lambda m: m["videos"][0].pop("file"), "manifest.videos[0] has no `file`"),
+        ("audio not a list", lambda m: m.__setitem__("audio", {"file": "a.mp3"}), "manifest.audio must be a list"),
+        ("cues as list (RM-6)", lambda m: m.__setitem__("cues", ["cues.csv"]), "manifest.cues must be the worklist's filename"),
+        ("textTasks as object (RM-6)", lambda m: m.__setitem__("textTasks", {"file": "t.csv"}), "manifest.textTasks must be the worklist's filename"),
+        ("unknown kind (RM-5)", lambda m: m.__setitem__("kind", "documentary"), "Unknown kind 'documentary'"),
+        ("look v2 (RM-4)", lambda m: m.__setitem__("look", {"schema": "oside-look/2", "hex": []}), "manifest.look.schema 'oside-look/2' is not oside-look/1"),
+        ("look as string", lambda m: m.__setitem__("look", "warm"), "manifest.look must be an object"),
+    ]
+    # the README row each sentence lands in (a row may cover a key family)
+    readme_row = {
+        "manifest.audio must be a list": "manifest.videos must be a list of entries",
+        "manifest.textTasks must be the worklist's filename": "manifest.cues must be the worklist's filename",
+    }
+    for label, mutate, expect in cases:
+        msg = _refusal(mutate)
+        assert expect in msg, f"{label}: {msg!r}"
+        # the README row is keyed on the sentence's stable head (before any quoted value)
+        head = expect.split(" '")[0].split("[0]")[0]
+        head = readme_row.get(head, head)
+        assert _readme_has(head), f"{label}: README's error table has no row for {head!r}"
+
+
+def test_shape_check_accepts_the_fixture_and_the_optional_keys_absent():
+    """The counterexample's twin: the real package still loads, and a manifest
+    with none of the optional keys (no look, no cues, no textTasks) is fine."""
+    server._load_manifest(FIXTURE)
+    path, tmp = _mutated_package(lambda m: [m.pop(k, None) for k in ("look", "cues", "textTasks")])
+    try:
+        server._load_manifest(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_unknown_is_never_counted_as_a_pass():
+    """RM-2: the runner tallies UNKNOWN on its own line; without CI the skip
+    is a FAIL that names the missing skill."""
+    src = os.path.join(HERE, "test_handoff.py")
+    with open(src, encoding="utf-8") as fh:
+        body = fh.read()
+    assert "unknown (not passes)" in body and "except Unknown as e:" in body
+    assert 'if not os.environ.get("CI")' in body
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

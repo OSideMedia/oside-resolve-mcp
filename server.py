@@ -119,9 +119,68 @@ def _load_manifest(manifest_path: str) -> tuple[dict, str]:
         manifest = json.load(f)
     if manifest.get("format") != "oside-davinci/v1":
         raise rapi.ResolveError(f"Not an oside-davinci/v1 manifest: {manifest_path}")
+    _check_shape(manifest)
     base = os.path.dirname(os.path.abspath(manifest_path))
     _check_entries(manifest, base)
     return manifest, base
+
+
+def _check_shape(manifest: dict) -> None:
+    """The manifest's SHAPE, refused here with an operator sentence instead of
+    a Python traceback somewhere downstream (audit 2026-09-06 RM-1/3/4/5/6).
+    Fourteen corrupt variants were run: `project` as a string killed the
+    pipeline with zero bytes of report; a string entry in `videos` died with
+    `'str' object has no attribute 'get'`; an entry with no `file` died at
+    handoff.py:405; a wrong-TYPE `cues` value silently lost the whole worklist
+    while a missing file warned loudly; `kind: documentary` rehearsed green in
+    a dry run and was refused only by create_project; `oside-look/2` was
+    consumed as v1 without a word. Every sentence here has a row in README's
+    error table."""
+    project = manifest.get("project")
+    if project is not None and not isinstance(project, dict):
+        raise rapi.ResolveError(
+            f"manifest.project must be an object with a `name` (got {type(project).__name__}) — "
+            "re-export the package from the studio."
+        )
+    kind = manifest.get("kind") or "cinematic"
+    try:
+        known = sorted(_templates().keys())
+    except (OSError, ValueError, json.JSONDecodeError):
+        known = []
+    if known and kind not in known:
+        raise rapi.ResolveError(
+            f"Unknown kind {kind!r} — templates.json knows {', '.join(known)}. See list_templates."
+        )
+    for key in ("videos", "audio"):
+        entries = manifest.get(key)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise rapi.ResolveError(f"manifest.{key} must be a list of entries (got {type(entries).__name__}).")
+        for i, e in enumerate(entries):
+            if not isinstance(e, dict):
+                raise rapi.ResolveError(
+                    f"manifest.{key}[{i}] must be an entry object with a `file` (got {type(e).__name__})."
+                )
+            if not isinstance(e.get("file"), str) or not e.get("file"):
+                raise rapi.ResolveError(f"manifest.{key}[{i}] has no `file` — every entry names its package file.")
+    for key in ("cues", "textTasks"):
+        v = manifest.get(key)
+        if v is not None and not isinstance(v, str):
+            raise rapi.ResolveError(
+                f"manifest.{key} must be the worklist's filename (got {type(v).__name__}) — "
+                "a wrong-typed value would drop the whole worklist silently."
+            )
+    look = manifest.get("look")
+    if look is not None:
+        if not isinstance(look, dict):
+            raise rapi.ResolveError(f"manifest.look must be an object (got {type(look).__name__}).")
+        schema = look.get("schema")
+        if schema is not None and schema != handoff.LOOK_SCHEMA:
+            raise rapi.ResolveError(
+                f"manifest.look.schema {schema!r} is not {handoff.LOOK_SCHEMA} — this MCP reads "
+                f"{handoff.LOOK_SCHEMA} only; update oside-resolve-mcp or re-export."
+            )
 
 
 def _abs_files(base: str, entries: list[dict]) -> list[str]:
