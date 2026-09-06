@@ -270,6 +270,35 @@ def _basename(rel: str) -> str:
     return os.path.basename(rel or "")
 
 
+def shot_marker_name(sw: str, v: dict) -> str:
+    """The shot marker's NAME — the one place the plan and the verify gate must
+    agree. RM-10: an unapproved take carries its outcome in the name."""
+    outcome = (v.get("outcome") or "").strip().lower()
+    base = f"{sw} {v.get('shotNumber', '?')}"
+    return base + (f" · {outcome.upper()} TAKE" if outcome and outcome != "approved" else "")
+
+
+def base_marker_name(name: str) -> str:
+    """A marker name without its outcome suffix — the naming CONTRACT compares
+    the base ("shot 2"), so a timeline built before 0.6.0 (no suffix) and one
+    built after ("shot 2 · PENDING TAKE") both name their own shot."""
+    return re.sub(r"\s·\s[A-Z_-]+ TAKE$", "", name or "")
+
+
+def no_frame_reason(vf: str | None, starts_by_file: dict, start) -> str:
+    """WHY a row has no frame — the clip is not on V1, or it IS planned but its
+    position cannot be computed because a clip before it has no measurable
+    duration. Before 0.6.0 both cases said "shot has no clip on V1", so an
+    offline dry run without ffprobe blamed a clip that was on disk and planned
+    (audit 2026-09-06 RM-11); `durationSource: "unknown"` was the only tell."""
+    if not vf or vf not in starts_by_file:
+        return "no frame (shot has no clip on V1)"
+    if start is None:
+        return ("frame unknown — the clip is planned on V1 but a clip before it has no "
+                "measurable duration (durationSource unknown: is ffprobe on PATH?)")
+    return "no frame"
+
+
 def cumulative_starts(durations: list) -> list:
     """Timeline-relative start of each clip in append order; None once any
     earlier duration is unknown (the position cannot be computed past a gap)."""
@@ -353,7 +382,7 @@ def cue_rows(manifest: dict, cues: list, starts_by_file: dict, durations_by_file
         }
         if start is None or vf not in starts_by_file:
             rows.append({**row, "frame": None, "limit": None,
-                         "reason": "no frame (shot has no clip on V1)"})
+                         "reason": no_frame_reason(vf, starts_by_file, start)})
             continue
         offset = cursor_by_file.get(vf, CUE_FRAME_OFFSET)
         # NEVER LET A CUE LAND PAST ITS OWN CLIP. text_task_rows has enforced
@@ -418,7 +447,7 @@ def text_task_rows(manifest: dict, tasks: list, cue_marker_rows: list,
             rows.append({"shot": (display_name(manifest, v) if v else (vf or None)),
                          "file": vf or None, "frame": None, "limit": None,
                          "name": name, "note": note,
-                         "reason": "no frame (shot has no clip on V1)"})
+                         "reason": no_frame_reason(vf, starts_by_file, start)})
             continue
 
         offset = max(free_from.get(vf, 0) - start, TEXT_TASK_FRAME_OFFSET)
@@ -511,11 +540,25 @@ def plan_timeline(manifest: dict, base: str, timeline_name: str, cues: list,
         note = v.get("description") or ""
         if v.get("vo"):
             note = f"{note}\nVO: {v['vo']}".strip()
-        markers.append({
+        # RM-10 (audit 2026-09-06): OSIDE deliberately exports UNAPPROVED takes
+        # and warns; the MCP laid a `pending` clip on V1 with nothing on the
+        # timeline saying so. The marker keeps the shot colour and tag (identity
+        # is the tag, Resolve's palette is spoken for) and carries the outcome
+        # in its NAME and the head of its note, where the editor reads.
+        outcome = (v.get("outcome") or "").strip().lower()
+        unapproved = bool(outcome) and outcome != "approved"
+        name = shot_marker_name(sw, v)
+        if unapproved:
+            note = f"UNAPPROVED TAKE (outcome: {outcome}) — exported on purpose, not a dailies verdict.\n{note}".strip()
+        row = {
             "frame": c["startFrame"], "color": SHOT_MARKER_COLOR, "duration": 1,
-            "name": f"{sw} {v.get('shotNumber', '?')}", "note": note, "shot": c["shot"],
-            "file": _basename(c["file"]),
-        })
+            "name": name, "note": note, "shot": c["shot"],
+            "file": _basename(c["file"]), "outcome": outcome or None,
+        }
+        if c["startFrame"] is None:
+            # RM-11: a row without a frame says why, never a bare null
+            row["reason"] = no_frame_reason(_basename(c["file"]), starts_by_file, None)
+        markers.append(row)
 
     vo = vo_rows(manifest, starts_by_file, planned, a_on_disk, a_in_bin)
     cue_list = cue_rows(manifest, cues, starts_by_file, durations_by_file, fps)
@@ -706,6 +749,14 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
     shot_frames = sorted(f for f, m in markers.items() if _is_shot_marker(m))
     expected_frames = sorted(v1_start[n] for n in video_names if n in v1_start)
     check("shot markers", len(video_names), len(shot_frames), len(shot_frames) == len(video_names))
+    # RM-10: unapproved takes on V1 are NAMED in the gate — an advisory row
+    # (pass stays true: OSIDE exported them on purpose and warned), so the
+    # verdict carries what the timeline holds instead of a green over it
+    unapproved_takes = [display_name(manifest, v) for v in videos
+                        if (v.get("outcome") or "").strip().lower() not in ("", "approved")]
+    check("unapproved takes on V1", 0, len(unapproved_takes), True,
+          detail=("advisory — " + ", ".join(unapproved_takes)) if unapproved_takes else "none",
+          advisory=True)
     check("shot marker positions", expected_frames, shot_frames, shot_frames == expected_frames)
 
     # BIND EACH MARKER TO THE SHOT IT NAMES. The two rows above compare sorted
@@ -729,7 +780,7 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
               if (m.get("customData") or "") == SHOT_TAG}
     mismatched = sorted(
         f"frame {f}: expected {want!r}, found {tagged.get(f, '(no marker)')!r}"
-        for f, want in expected_named.items() if f in tagged and tagged[f] != want
+        for f, want in expected_named.items() if f in tagged and base_marker_name(tagged[f]) != want
     )
     check("shot markers name their own shot", expected_named, tagged, not mismatched,
           mismatched=mismatched,
