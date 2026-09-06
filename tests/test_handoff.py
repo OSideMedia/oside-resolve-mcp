@@ -1628,12 +1628,22 @@ def _drift(skill_text, prompt_text, shipped):
     return out
 
 
+class Unknown(Exception):
+    """A test that could not run here. NOT a pass (audit 2026-09-06 RM-2): the
+    old _skip fell through to a print when pytest was absent — which it always
+    is in this venv — and the tally still read 64/64 with the skill hidden.
+    The runner counts these on their own line and never folds them into the
+    passes; a skip needs positive evidence (CI=1 means the skill is absent by
+    construction), otherwise the test FAILS naming what is missing."""
+
+
 def _skip(why):
-    try:
-        import pytest
-        pytest.skip(why)
-    except ImportError:
-        print(f"UNKNOWN (not a pass): {why}")
+    if not os.environ.get("CI"):
+        raise AssertionError(
+            f"{why} — install ~/.claude/skills/oside-resolve-handoff (or set CI=1 where the "
+            "skill is absent by construction). An absent subject is not a green gate."
+        )
+    raise Unknown(why)
 
 
 def test_the_handoff_skill_has_not_drifted_from_the_prompt():
@@ -1680,13 +1690,19 @@ def test_the_drift_check_can_actually_fail():
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
+    unknown = 0
     for name, fn in tests:
         try:
             fn()
             print(f"PASS  {name}")
+        except Unknown as e:
+            unknown += 1
+            print(f"UNKNOWN  {name} — {e}")
         except Exception:  # noqa: BLE001
             failed += 1
             print(f"FAIL  {name}")
             traceback.print_exc()
-    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    passed = len(tests) - failed - unknown
+    # never "N/N" over unknowns: the line says what ran, what could not, what broke
+    print(f"\n{passed} passed, {unknown} unknown (not passes), {failed} failed — of {len(tests)}")
     sys.exit(1 if failed else 0)
