@@ -1,0 +1,24 @@
+# The handoff suite, on every push and PR. Resolve is never here — the suite
+# runs OFFLINE by construction (tests set OSIDE_RESOLVE_OFFLINE=1) — and the
+# resolve-handoff skill is absent by construction, which CI=1 declares so the
+# runner counts those cases as UNKNOWN on their own line, never as passes
+# (audit 2026-09-06 RM-2). Any FAIL fails the job; the tally line is the
+# artefact to read.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --quiet -e .
+      - name: plain runner (CI=1 — the skill is absent here by construction)
+        env:
+          CI: "1"
+        run: python tests/test_handoff.py
