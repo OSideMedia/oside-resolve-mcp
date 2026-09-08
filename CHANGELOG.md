@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed — the README is a front door, not the design document
+
+- `Install` was at **line 178 of 280** — a reader scrolled 63% of the document
+  to learn how to run it, past a title that was the repo slug and an opening
+  line reading "(OSIDE-PLAN-2 Phase 4)". It now sits at 22%.
+- The README had grown out of the design doc, so it opened with the exact
+  semantics of tool #3. **Nothing was deleted** — the tool reference moved below
+  the front door, where a reader who is already committed will find it.
+- **New: "Do I need OSIDE to use this?"** The old text said the input was
+  "written by the studio's Export for DaVinci action", so a stranger concluded
+  they could not use this at all — even though the format is a plain documented
+  JSON manifest anything can emit. That section now says so and pastes a minimal
+  working package inline.
+- Readable title, linked badges above it, one sentence about what LANDS in
+  Resolve, and six outcome bullets instead of a numbered list of signatures.
+- The standard this follows is `docs/README-STANDARD.md` in claude-commands.
+
 ### Added — public pre-flight: licence, contributing guide, badges
 
 - **MIT LICENSE.** A public repo without one is "all rights reserved" — readable

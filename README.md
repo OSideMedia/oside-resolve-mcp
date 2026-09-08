@@ -1,14 +1,180 @@
-# oside-resolve-mcp
+[![version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
+[![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
 
-![version](https://img.shields.io/badge/version-0.6.0-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
-![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)
-![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)
+# OSIDE Resolve MCP
 
-The OSIDE studio → DaVinci Resolve bridge (OSIDE-PLAN-2 Phase 4). A small,
-deterministic MCP server that consumes an `oside-davinci/v1` package — written
-by the studio's **Export for DaVinci** action — and turns it into a Resolve
-project:
+An MCP server that turns a folder of clips and a JSON manifest into a finished
+**DaVinci Resolve** project — and then checks its own work.
+
+Point it at a package and you get: a new project from your template, the media
+imported into its bins, every clip on V1 **in shot order**, a named marker on
+each shot, narration laid on its own audio lanes at the right frames, an
+optional colour balance on every clip — and an **acceptance gate** that reports
+`PASS` or `FAIL` per check rather than assuming any of it worked.
+
+## What it does
+
+- **Builds the project** from your own `.drp` template, so settings and the bin
+  tree are yours, not this tool's.
+- **Imports the package** into the right bins, by name.
+- **Lays the timeline** — clips in shot order on V1, one marker per shot
+  carrying its number and description.
+- **Places narration on its own lanes** — board-wide takes on `VO`, takes pinned
+  to a shot on `VO PINS`, at that shot's exact frame. Never on A1, which holds
+  the clips' own audio.
+- **Applies a starting colour balance** (ASC CDL on node 1) when the package
+  carries a look — a matched starting point for the colourist, never a grade.
+- **Verifies the result and can fail.** Clip order, stray clips, every pinned
+  take on its frame at zero tolerance, a marker per shot naming its own shot.
+  A build that went wrong is reported as `FAIL`, not as success.
+
+It **never deletes, never overwrites, and never renders.** An existing project
+or timeline name is a hard refusal.
+
+## Do I need OSIDE to use this?
+
+**No.** The input is a plain folder plus a JSON manifest — nothing proprietary,
+no service to sign up for, no network calls. OSIDE Studio happens to write that
+manifest, but anything can: a script, another editor, your own tool.
+
+A minimal `oside-davinci/v1` package looks like this:
+
+```
+my-package/
+  manifest.json
+  videos/shot1.mp4
+  videos/shot2.mp4
+  vo/narration.mp3
+```
+
+```json
+{
+  "format": "oside-davinci/v1",
+  "kind": "cinematic",
+  "project": { "name": "MY FILM" },
+  "videos": [
+    { "file": "videos/shot1.mp4", "bin": "VIDEOS", "sceneIndex": 1, "shotIndex": 1,
+      "shotNumber": "1A", "description": "Ada enters the diner." },
+    { "file": "videos/shot2.mp4", "bin": "VIDEOS", "sceneIndex": 1, "shotIndex": 2,
+      "shotNumber": "2",  "description": "Two-shot at the counter." }
+  ],
+  "audio": [
+    { "file": "vo/narration.mp3", "bin": "VO", "label": "Narrator",
+      "durationSeconds": 12.0, "placements": [] }
+  ]
+}
+```
+
+`placements: []` means a board-wide take (laid at the head of `VO`). To pin a
+take under one shot, give it the shot it belongs to and it rides `VO PINS` on
+that shot's first frame:
+
+```json
+"placements": [{ "sceneIndex": 1, "shotIndex": 2, "shotNumber": "2",
+                 "videoFile": "videos/shot2.mp4" }]
+```
+
+Everything else — dialogue cues, in-frame text worklists, the look block — is
+optional and described under [The tools](#the-tools).
+
+## Requirements
+
+- **DaVinci Resolve Studio**, running. The free edition has no external
+  scripting and will never answer.
+- Preferences → System → General → **External scripting using: Local**.
+- Python 3.10+.
+- `ffprobe` on `PATH` is optional — it makes offline dry runs more accurate.
+
+## Install
+
+```bash
+git clone https://github.com/OSideMedia/oside-resolve-mcp
+cd oside-resolve-mcp
+python3 -m venv .venv && .venv/bin/python -m pip install -e .
+```
+
+Register it with your MCP client — for Claude Code, in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "oside-resolve": {
+      "command": "/absolute/path/to/oside-resolve-mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/oside-resolve-mcp/server.py"]
+    }
+  }
+}
+```
+
+**Then snapshot your templates once**, with Resolve open. This server builds
+projects from *your* `.drp`, so it needs one per `kind` in
+`templates/templates.json`:
+
+```
+export_template("cinematic")     # or, in Resolve: right-click the template
+export_template("explainer")     # project → Export Project → save to templates/
+```
+
+Verify the install with `resolve_status()` — it answers even when Resolve is
+unreachable, and says why.
+
+## Quick start
+
+```
+resolve_status()                                   # preconditions + capabilities
+build_timeline("…/manifest.json", dry_run=True,    # the plan, before anything exists
+               project="MY FILM")                  # touches nothing
+create_project("cinematic", "MY FILM")
+import_package("…/manifest.json")
+build_timeline("…/manifest.json")                  # V1 + VO lanes + markers
+save_project()                                     # the verification boundary
+verify_import("…/manifest.json")                   # PASS | FAIL, per check
+```
+
+**Always dry-run first.** `dry_run=True` returns the whole plan — clip order,
+what is on disk, where every VO take would land, every marker — and writes
+nothing. It works with Resolve closed.
+
+**Save before you verify.** An errored append's placements survive every
+in-session read and are discarded by the save, so a gate run before the save can
+pass over work that was never written.
+
+Or run the whole thing as one command:
+
+```bash
+.venv/bin/python pipeline.py path/to/manifest.json --name "MY FILM"
+.venv/bin/python pipeline.py path/to/manifest.json --dry-run    # touches nothing
+```
+
+It prints a JSON report and exits non-zero unless the gate passes.
+
+## Working alongside Blackmagic's own MCP
+
+This is deliberately NOT general Resolve remote control. **Blackmagic ships its
+own MCP server** with Studio 21.1, inside the app bundle at
+`DaVinci Resolve.app/Contents/Applications/ResolveMCP`: arbitrary `run_script`
+against the scripting API, plus `search_scripting_api` / `get_scripting_api` /
+`get_whats_new` — version-matched to the Resolve you are running, and so the
+owning source for call SHAPES.
+
+The two do different jobs. Reach for Blackmagic's for API lookup, the changelog
+past your training cutoff, and ad-hoc read-only probing. Reach for THIS one for
+the handoff — a fixed pipeline gets fixed tools so it runs identically every
+time, and the acceptance gate is the part a general tool cannot give you. The
+first-party stubs document call shapes but none of the BEHAVIOURAL lies this
+server is built around (`AppendToTimeline` still promises "the list of appended
+timelineItems" over a silent drop), so ANTI-PATTERNS in `CLAUDE.md` still earns
+its keep. While a build is running, treat the general server as read-only: two
+writers, one Resolve.
+
+[samuelgursky/davinci-resolve-mcp](https://github.com/samuelgursky/davinci-resolve-mcp)
+(MIT) predates both, and its connection pattern informed `resolve_api.py`.
+
+## The tools
+
+The full surface, with the behaviour each one guarantees.
 
 1. `create_project(kind, name)` — new project from the right template snapshot
    (`cinematic` → YT-4K 23.976fps, `explainer` → YT-4K 60fps). Settings and the
@@ -147,48 +313,12 @@ occupied frame answers a truthy `[<PyRemoteObject>]` while placing nothing.
 `OSIDE_RESOLVE_OFFLINE=1` (set by the test module) keeps the offline cases
 offline even with a real Resolve running.
 
-## Working alongside Blackmagic's own MCP
+## The full recipe, end to end
 
-This is deliberately NOT general Resolve remote control. **Blackmagic ships its
-own MCP server** with Studio 21.1, inside the app bundle at
-`DaVinci Resolve.app/Contents/Applications/ResolveMCP`: arbitrary `run_script`
-against the scripting API, plus `search_scripting_api` / `get_scripting_api` /
-`get_whats_new` — version-matched to the Resolve you are running, and so the
-owning source for call SHAPES.
+The quick start above is the short path. This is everything, including the look
+step and the Depth Converter hand-off, as the studio's **Build in Resolve**
+button runs it.
 
-The two do different jobs. Reach for Blackmagic's for API lookup, the changelog
-past your training cutoff, and ad-hoc read-only probing. Reach for THIS one for
-the handoff — a fixed pipeline gets fixed tools so it runs identically every
-time, and the acceptance gate is the part a general tool cannot give you. The
-first-party stubs document call shapes but none of the BEHAVIOURAL lies this
-server is built around (`AppendToTimeline` still promises "the list of appended
-timelineItems" over a silent drop), so ANTI-PATTERNS in `CLAUDE.md` still earns
-its keep. While a build is running, treat the general server as read-only: two
-writers, one Resolve.
-
-[samuelgursky/davinci-resolve-mcp](https://github.com/samuelgursky/davinci-resolve-mcp)
-(MIT) predates both, and its connection pattern informed `resolve_api.py`.
-
-## Requirements
-
-- DaVinci Resolve **Studio** (free edition has no scripting), running.
-- Preferences → System → General → **External scripting using: Local**.
-- Python 3.10+ with the `mcp` package (`.venv` in this repo).
-
-## Setup
-
-```bash
-uv venv && uv pip install mcp        # once
-# then register (already done for OSIDE AI FILMMAKER via .mcp.json):
-#   command: <repo>/.venv/bin/python   args: [<repo>/server.py]
-```
-
-Snapshot the templates once (Resolve open): call `export_template("cinematic")`
-and `export_template("explainer")`, or in Resolve right-click the template
-project → Export Project → save into `templates/` with the names in
-`templates/templates.json`. Re-export whenever a template changes.
-
-## The recipe
 
 ```
 Studio: board → DaVinci → attach VO → Export package (to the working drive)
@@ -261,7 +391,6 @@ appear in the tool's `error` field.
 | `pipeline crashed before a report could be built: …` | an exception past the manifest load — the report still prints, with the Python error in `error` | read the error; if it names a manifest key, it is a shape this table does not know yet — file it |
 | `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |
-
 
 ## Contributing
 
