@@ -48,6 +48,10 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
 
 VERIFY_FORMAT = "oside-verify/1"
 VERIFY_SIDECAR = "verify.json"
+# Frames a PINNED take that landed on its exact frame may fall short of its
+# manifest length before the gate calls it truncated. Absorbs the honest
+# disagreement between the exporter's durationSeconds and the conformed file.
+VO_LENGTH_SLACK = 2
 
 
 def verify_sidecar(manifest: dict, observed: dict, result: dict, verified_at: str) -> dict:
@@ -713,7 +717,7 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
     for tr in audio_tracks:
         label = f"A{tr.get('index')} {tr.get('name') or ''}".strip()
         for it in tr.get("items") or []:
-            audio_by_name.setdefault(it["name"], []).append((it["start"], label))
+            audio_by_name.setdefault(it["name"], []).append((it["start"], label, it.get("duration")))
     for a in audio:
         fname = _basename(a["file"])
         found = audio_by_name.get(fname, [])
@@ -727,12 +731,17 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
             targets = [("head", 0)]
         for label, expected in targets:
             if found:
-                nearest, track = min(found, key=lambda ft: abs(ft[0] - expected))
+                nearest, track, placed_frames = min(found, key=lambda ft: abs(ft[0] - expected))
                 delta = nearest - expected
             else:
-                nearest, track, delta = None, None, None
+                nearest, track, delta, placed_frames = None, None, None, None
             ok = (delta == 0) if pinned else (nearest is not None)
+            # `lengthFrames` rides the row so a FAIL is DIAGNOSABLE: a take that
+            # moved is a relocation, a take that moved AND shrank is Resolve's
+            # truncation mode (21.1.0.14, 2026-09-08 — an append onto an occupied
+            # frame lands at the track tail cut to ~min(recordFrame, clipLength)).
             check(f"VO {fname} @ {label}", expected, nearest, ok, delta=delta, track=track,
+                  lengthFrames=placed_frames,
                   rule="pinned: exact frame" if pinned else "unpinned: present on an audio track (head when free)")
             # NARRATION MUST NOT BE ON A1. The `vo_track` feature exists because
             # the 2026-08-16 live walk found A1 already full of the shot clips'
@@ -745,6 +754,26 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
                 on_a1 = track.split()[0] == "A1"
                 check(f"VO {fname} not on A1", f"a track named {VO_TRACK_NAME}", track, not on_a1,
                       rule="narration rides its own track; A1 is the shot clips' embedded audio")
+            # THE ONE LENGTH CASE THE ROWS ABOVE CANNOT SEE. Every check so far
+            # compares a START frame. Resolve's truncation mode always MOVES the
+            # clip too, so it already reds — except for a take that landed on its
+            # exact frame and is short anyway (a re-cut file, a bad export, a
+            # mode we have not measured). That is the only uncovered gap, so it
+            # is the only thing asserted here.
+            #
+            # Deliberately narrow. `durationSeconds` is the exporter's DB value
+            # and the placed length is the conformed file, so the two disagree by
+            # a frame or so honestly (a 3.1 s take lands 75 where the floor gives
+            # 74) — hence the slack, the one-sided test (short only; longer is
+            # conform rounding), and pinned-only (an unpinned take is MEANT to
+            # slide, and its length is nobody's contract).
+            if pinned and delta == 0 and placed_frames is not None:
+                want = seconds_to_clip_frames(a.get("durationSeconds"), kind_fps(manifest))
+                if want is not None:
+                    short_by = want - int(placed_frames)
+                    check(f"VO {fname} length", want, int(placed_frames),
+                          short_by <= VO_LENGTH_SLACK, shortBy=short_by, track=track,
+                          rule=f"a pinned take on its own frame may not be over {VO_LENGTH_SLACK} frames short")
 
     shot_frames = sorted(f for f, m in markers.items() if _is_shot_marker(m))
     expected_frames = sorted(v1_start[n] for n in video_names if n in v1_start)

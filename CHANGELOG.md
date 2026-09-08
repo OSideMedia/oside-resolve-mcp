@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Measured — the append trap re-verified on Studio 21.1.0.14 (2026-09-08)
+
+- **Anti-pattern 2 was UNDERSTATED, and is rewritten.** A three-cell live walk
+  against 21.1.0.14 (positive control on an empty track, negative control on a
+  free frame of the target track, then the trap) confirms `AppendToTimeline`
+  still answers a truthy one-element list over a silent drop. It also found a
+  SECOND mode and a way to tell them apart:
+  - occupied by the shot clips' embedded audio → places NOTHING, and the
+    returned proxy is NULL (`GetName()`, `GetStart()`, `GetDuration()`,
+    `GetUniqueId()` all `None`).
+  - occupied on a plain audio track → places at the track TAIL **truncated** to
+    about `min(recordFrame, clipLength)`. Replicated 6× (asking 10/30/50/74 on
+    a track holding 0..75 landed at 75 with duration 10/30/50/74). The proxy is
+    live and honest here — it reports the real, wrong start and duration.
+  - free frame → correct.
+  So `bool(r)`/`len(r)` are worthless but `r[0].GetStart()` is a real oracle.
+  **No code changed to rely on it**: the re-read holds on both 21.0.4.5 and
+  21.1, the proxy behaviour is measured on 21.1 only, and swapping a working
+  defence for a newer one buys nothing. The finding is recorded, not adopted.
+- Cell ORDER contaminates these experiments — a "silent drop" measured on a
+  track already appended to twice did not reproduce on a fresh timeline. Every
+  append cell needs its own timeline and seed. (Caught by an adversarial review
+  pass, not by the first read.)
+
+### Added — the gate asserts VO LENGTH, not just the start frame
+
+- Every VO row compared a START frame, so a take sitting on its own frame while
+  carrying a fraction of its audio PASSED. Resolve's truncation mode always
+  moves the clip too, so the existing rows do red on it — the uncovered shape
+  is a take that landed exactly where it was asked and is short anyway. That,
+  and only that, is now asserted: **pinned takes, exact frame, one-sided
+  (short), 2 frames of slack** (`VO_LENGTH_SLACK`), because `durationSeconds`
+  is the exporter's DB value while the placed length is the conformed file and
+  the two disagree honestly by a frame or so. Every VO row now also carries
+  `lengthFrames`, so a FAIL is diagnosable as relocation vs truncation.
+- Shipped with a red-proof (`test_the_vo_length_gate_can_actually_fail`): it
+  asserts the row EXISTS on a good build, goes RED on a truncated take while
+  the start row stays green, and pins both sides of the slack. Against the
+  pre-fix `handoff.py` it fails with "the length row never ran — the gate has
+  no subject". The canonical good fixture now carries real VO durations, since
+  a gate whose subject is absent from the fixture is a gate that cannot fail.
+
+
 ### Fixed — RM-10 and RM-11 (audit 2026-09-06, ow-9415e0)
 
 - **An unapproved take is named on the timeline and in the gate** (RM-10).

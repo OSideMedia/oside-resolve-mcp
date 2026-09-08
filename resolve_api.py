@@ -794,6 +794,15 @@ def append_audio(media_pool, timeline, placements: list, track_index: int) -> di
     the track after each append (a new item, by name, at the frame asked for),
     never by the return value.
 
+    RE-MEASURED ON 21.1.0.14 (2026-09-08) — the trap is NOT fixed, and it has
+    a second mode. An occupied `recordFrame` returns a truthy one-element list
+    in every case, and Resolve either places nothing (when the frame is held by
+    embedded video audio — the returned proxy is then NULL, every getter
+    answering None) or places the clip at the track TAIL **truncated** to about
+    `min(recordFrame, clipLength)` frames (on a plain audio track; replicated
+    6×). The `shifted` branch below catches the second mode, which is why a
+    take that arrived at the wrong frame is `loose` rather than re-appended.
+
     Returns a report: placed under its shot, parked at the head, or appended
     loose (still on the VO track, at its tail) because the exact frame was
     refused — a silent drop is the one outcome worse than a misplaced clip.
