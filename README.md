@@ -1,5 +1,10 @@
 # oside-resolve-mcp
 
+![version](https://img.shields.io/badge/version-0.6.0-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)
+![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)
+
 The OSIDE studio → DaVinci Resolve bridge (OSIDE-PLAN-2 Phase 4). A small,
 deterministic MCP server that consumes an `oside-davinci/v1` package — written
 by the studio's **Export for DaVinci** action — and turns it into a Resolve
@@ -142,6 +147,8 @@ occupied frame answers a truthy `[<PyRemoteObject>]` while placing nothing.
 `OSIDE_RESOLVE_OFFLINE=1` (set by the test module) keeps the offline cases
 offline even with a real Resolve running.
 
+## Working alongside Blackmagic's own MCP
+
 This is deliberately NOT general Resolve remote control. **Blackmagic ships its
 own MCP server** with Studio 21.1, inside the app bundle at
 `DaVinci Resolve.app/Contents/Applications/ResolveMCP`: arbitrary `run_script`
@@ -254,3 +261,20 @@ appear in the tool's `error` field.
 | `pipeline crashed before a report could be built: …` | an exception past the manifest load — the report still prints, with the Python error in `error` | read the error; if it names a manifest key, it is a shape this table does not know yet — file it |
 | `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |
+
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Two things worth knowing before you
+open a PR: the ten tools are deliberately few (a fixed pipeline gets fixed
+tools), and the ANTI-PATTERNS in `CLAUDE.md` are load-bearing — each was bought
+with a live walk, and each looks wrong until you have hit it.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
+
+DaVinci Resolve is a trademark of Blackmagic Design Pty Ltd. This project is an
+independent tool and is **not affiliated with, endorsed by, or supported by
+Blackmagic Design**. It drives Resolve through the public scripting API that
+Resolve Studio exposes.
