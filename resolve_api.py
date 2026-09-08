@@ -53,6 +53,14 @@ SHOT_TAG = "oside:shot"
 # A1 frame while placing NOTHING [live walk 2026-08-16], which is why placement
 # is judged by re-reading the track.
 VO_TRACK_NAME = "VO"
+# Pinned takes ride their OWN lane. The spine (a board-wide narration, often as
+# long as the whole piece) owns VO and would otherwise swallow every pinned
+# frame — the two doors the OSIDE exporter documents genuinely overlap in time
+# and cannot share one mono track. Overflow checkerboards: VO PINS, VO PINS 2…
+VO_PINS_TRACK_NAME = "VO PINS"
+# ponytail: 8 pin lanes, allocated on collision. If a board ever needs more,
+# allocate by SPEAKER (the cue colour map already groups them) instead.
+MAX_PIN_TRACKS = 8
 # Narration is MONO by decision [Peter, 2026-08-25]; stereo is reserved for sound
 # effects and music, which this bridge does not lay today. AddTrack("audio")
 # defaults to mono silently, so the value below is the difference between an
@@ -707,10 +715,20 @@ def track_sub_type(timeline, track_type: str, index: int) -> str:
         return ""
 
 
+def pins_track_name(n: int) -> str:
+    """The name of the n-th pinned-take lane (1-based): VO PINS, VO PINS 2, …"""
+    return VO_PINS_TRACK_NAME if n <= 1 else f"{VO_PINS_TRACK_NAME} {n}"
+
+
 def ensure_vo_track(timeline) -> int:
-    """The index of the timeline's VO audio track — an existing track named
-    VO_TRACK_NAME, else a NEW MONO audio track (named VO when the API can name
-    it). Never A1: the video clips' embedded audio owns A1.
+    """The index of the timeline's VO (spine) track. See ensure_named_audio_track."""
+    return ensure_named_audio_track(timeline, VO_TRACK_NAME)
+
+
+def ensure_named_audio_track(timeline, name: str) -> int:
+    """The index of the audio track called `name` — an existing one, else a NEW
+    MONO audio track carrying that name. Never A1: the video clips' embedded
+    audio owns A1.
 
     NARRATION IS MONO, BY DECISION [Peter, 2026-08-25]. Stereo is reserved for
     sound effects and music, which this bridge does not lay today — when those
@@ -726,7 +744,7 @@ def ensure_vo_track(timeline) -> int:
     """
     count = audio_track_count(timeline)
     for idx in range(1, count + 1):
-        if track_name(timeline, "audio", idx).strip().lower() == VO_TRACK_NAME.lower():
+        if track_name(timeline, "audio", idx).strip().lower() == name.strip().lower():
             return idx
     added = False
     try:
@@ -739,7 +757,7 @@ def ensure_vo_track(timeline) -> int:
         except (AttributeError, TypeError):
             added = False
     if not added:
-        raise ResolveError("AddTrack('audio') failed — could not create the VO track.")
+        raise ResolveError(f"AddTrack('audio') failed — could not create the {name!r} track.")
     idx = audio_track_count(timeline)
     if idx <= count:
         raise ResolveError("AddTrack('audio') answered True but the track count did not grow.")
@@ -751,7 +769,7 @@ def ensure_vo_track(timeline) -> int:
             "whose channel format was not the one asked for."
         )
     try:
-        timeline.SetTrackName("audio", idx, VO_TRACK_NAME)
+        timeline.SetTrackName("audio", idx, name)
     except (AttributeError, TypeError):
         pass  # unnamed A<n> is still its own track — the placement is what matters
     return idx
@@ -772,47 +790,82 @@ def _find_new_item(before: list[dict], after: list[dict], name: str, frame: int 
     return None
 
 
-def append_audio(media_pool, timeline, placements: list, track_index: int) -> dict:
-    """Lay each VO clip on the VO track (`track_index`) — UNDER ITS OWN SHOT
-    when the package says which shot it belongs to, at the head otherwise.
+def _span_free(items: list[dict], record: int, length: int) -> bool:
+    """Is [record, record+length) clear of every item on this track?
+
+    Resolve refuses an append whose recordFrame is occupied — and on 21.1.0.14
+    it refuses SILENTLY, either placing nothing (when the frame is held by the
+    shot clips' embedded audio; the returned proxy is then null) or laying the
+    clip at the track TAIL truncated to ~min(recordFrame, clipLength). Both
+    answer a truthy one-element list. So the collision is judged BEFORE the
+    append, from a read of the track, and the append is aimed at a lane where
+    it can actually land.
+    """
+    end = record + max(1, length)
+    for it in items:
+        if it["start"] < end and record < it["start"] + it["duration"]:
+            return False
+    return True
+
+
+def append_audio(media_pool, timeline, placements: list, track_index: int | None = None) -> dict:
+    """Lay each VO clip on a narration track — UNDER ITS OWN SHOT when the
+    package says which shot it belongs to, at the head otherwise.
 
     placements: [{"item": mediaPoolItem, "recordFrame": int | None, "label": str}]
       recordFrame None  -> the head of the timeline (a board-wide VO, or a pin
                            whose shot has no clip in this package).
 
-    WHY THIS EXISTS. OSIDE's DaVinci export pins narration takes to individual
-    shots and writes `manifest.audio[].placements` naming the owning scene, shot
-    and clip file. This end used to ignore all of that and stamp every clip at
-    `timeline.GetStartFrame()`, so a board with four shot-attached takes handed
-    the editor four clips piled on top of each other at 00:00 [council 2026-08-07].
+    TWO DOORS, TWO LANES. OSIDE's exporter documents VO arriving two ways and
+    ships both: takes attached to the whole board (`placements: []`) and takes
+    pinned to one shot. They OVERLAP IN TIME — a board-wide narration spine is
+    often as long as the finished piece — so one mono track cannot hold them.
+    Laid on a single track the spine went down first and swallowed every pinned
+    frame, and each pin was then refused and slid to the tail: verify FAILed
+    every explainer package that used both doors [measured 2026-09-08].
 
-    WHY ITS OWN TRACK, AND WHY THE TRACK IS RE-READ. On the first live walk
-    (2026-08-16) every shot clip carried embedded audio, so appending the
-    video filled A1; asking for A1 at an occupied frame got `[<PyRemoteObject>]`
-    back — truthy — while Resolve placed NOTHING, and the build reported two
-    VO clips that did not exist. Placement is therefore judged by re-reading
-    the track after each append (a new item, by name, at the frame asked for),
-    never by the return value.
+    So the spine keeps `VO` (unchanged for the many packages that have only
+    board-wide takes) and pinned takes ride `VO PINS`. Pins can still collide
+    with EACH OTHER — a 5 s take pinned to a 3 s shot spills into the next
+    shot's pin — so a pin whose span is occupied opens `VO PINS 2`, and so on:
+    a checkerboard, which is what a dialogue editor does by hand and what
+    Resolve's own IntelliCut does by speaker. **Never a slide to the tail** —
+    that is the behaviour this exists to remove.
 
-    RE-MEASURED ON 21.1.0.14 (2026-09-08) — the trap is NOT fixed, and it has
-    a second mode. An occupied `recordFrame` returns a truthy one-element list
-    in every case, and Resolve either places nothing (when the frame is held by
-    embedded video audio — the returned proxy is then NULL, every getter
-    answering None) or places the clip at the track TAIL **truncated** to about
-    `min(recordFrame, clipLength)` frames (on a plain audio track; replicated
-    6×). The `shifted` branch below catches the second mode, which is why a
-    take that arrived at the wrong frame is `loose` rather than re-appended.
+    WHY THE TRACK IS STILL RE-READ. On the first live walk (2026-08-16) every
+    shot clip carried embedded audio, so appending the video filled A1; asking
+    for A1 at an occupied frame got `[<PyRemoteObject>]` back — truthy — while
+    Resolve placed NOTHING. Re-measured on 21.1.0.14: still true, plus a second
+    mode that places the clip at the tail TRUNCATED. Placement is therefore
+    judged by re-reading the track after each append, never by the return.
 
     Returns a report: placed under its shot, parked at the head, or appended
-    loose (still on the VO track, at its tail) because the exact frame was
-    refused — a silent drop is the one outcome worse than a misplaced clip.
+    loose (still on a narration track, at its tail) — a silent drop is the one
+    outcome worse than a misplaced clip.
     """
     start = int(timeline.GetStartFrame())
     report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": [],
-              "track": track_index, "trackName": track_name(timeline, "audio", track_index) or f"A{track_index}"}
+              "track": None, "trackName": None, "pinTracks": [], "lays": []}
 
-    def read():
-        return track_items(timeline, "audio", track_index, start)
+    spine_idx = track_index
+    pins_idx: list[int] = []
+
+    def read(idx):
+        return track_items(timeline, "audio", idx, start)
+
+    def spine():
+        nonlocal spine_idx
+        if spine_idx is None:
+            spine_idx = ensure_vo_track(timeline)
+        return spine_idx
+
+    def pins(n: int) -> int:
+        """The n-th pin lane (1-based), created on demand."""
+        while len(pins_idx) < n:
+            idx = ensure_named_audio_track(timeline, pins_track_name(len(pins_idx) + 1))
+            pins_idx.append(idx)
+            report["pinTracks"].append({"index": idx, "name": pins_track_name(len(pins_idx))})
+        return pins_idx[n - 1]
 
     for p in placements:
         item = p["item"]
@@ -821,9 +874,23 @@ def append_audio(media_pool, timeline, placements: list, track_index: int) -> di
         at_head = target is None
         end = clip_duration_frames(item)
         record = start if at_head else int(target)
+
+        # CHOOSE THE LANE FIRST. A head take belongs on the spine; a pinned take
+        # takes the first pin lane where its whole span is clear.
+        if at_head:
+            idx = spine()
+        else:
+            idx = pins(1)
+            n = 1
+            while not _span_free(read(idx), record - start, end or 1):
+                n += 1
+                if n > MAX_PIN_TRACKS:
+                    break
+                idx = pins(n)
+
         clip_info = {
             "mediaPoolItem": item,
-            "trackIndex": track_index,
+            "trackIndex": idx,
             "mediaType": 2,  # audio-only
             "recordFrame": record,
         }
@@ -831,11 +898,18 @@ def append_audio(media_pool, timeline, placements: list, track_index: int) -> di
             # endFrame is EXCLUSIVE (measured 2026-08-16: a 47-frame clip with
             # endFrame 47 lands as 47 frames, endFrame 46 as 46)
             clip_info.update({"startFrame": 0, "endFrame": end})
-        before = read()
+
+        before = read(idx)
         media_pool.AppendToTimeline([clip_info])  # return value NOT trusted
-        after = read()
+        after = read(idx)
+        lay = {"name": name, "label": p.get("label"), "track": idx,
+               "trackName": track_name(timeline, "audio", idx) or f"A{idx}",
+               "askedFrame": record - start}
         if _find_new_item(before, after, name, record - start) is not None:
             report["atHead" if at_head else "underShot"] += 1
+            lay["placedAt"] = record - start
+            lay["mode"] = "atHead" if at_head else "underShot"
+            report["lays"].append(lay)
             continue
         # Did it arrive somewhere ELSE? Matching on the exact frame alone meant a
         # placement Resolve honoured at a shifted frame read as "nothing was
@@ -847,20 +921,32 @@ def append_audio(media_pool, timeline, placements: list, track_index: int) -> di
         if shifted is not None:
             report["loose"] += 1
             report["looseLabels"].append(p.get("label") or name)
+            lay["mode"] = "loose"
+            lay["placedAt"] = shifted.get("start")
+            report["lays"].append(lay)
             continue
-        # The exact frame was refused (an occupied slot on the VO track — two
-        # head takes, or overlapping pins). The clip still has to ARRIVE: lay
-        # it at the VO track's tail and re-read again.
+        # The frame was refused even on a lane the pre-read called clear (or the
+        # pin lanes ran out). The clip still has to ARRIVE: lay it at this
+        # track's tail and re-read again.
         tail = max((it["start"] + it["duration"] for it in before), default=0)
         clip_info["recordFrame"] = start + tail
-        before = read()
+        before = read(idx)
         media_pool.AppendToTimeline([clip_info])
-        if _find_new_item(before, read(), name, tail) is None:
+        if _find_new_item(before, read(idx), name, tail) is None:
             raise ResolveError(
-                f"Could not add VO clip {name!r} to the timeline (track {track_index}): "
+                f"Could not add VO clip {name!r} to the timeline (track {idx}): "
                 "Resolve placed nothing at the pinned frame or at the track tail."
             )
         report["loose"] += 1
         report["looseLabels"].append(p.get("label") or name)
+        lay["mode"] = "loose"
+        lay["placedAt"] = tail
+        report["lays"].append(lay)
 
+    if spine_idx is not None:
+        report["track"] = spine_idx
+        report["trackName"] = track_name(timeline, "audio", spine_idx) or f"A{spine_idx}"
+    elif pins_idx:
+        report["track"] = pins_idx[0]
+        report["trackName"] = track_name(timeline, "audio", pins_idx[0]) or f"A{pins_idx[0]}"
     return report
