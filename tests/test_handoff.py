@@ -1756,6 +1756,43 @@ def test_no_template_publishes_a_path_an_email_or_a_hostname():
     )
 
 
+
+def test_the_readme_version_badge_matches_the_shipped_version():
+    """A STATIC BADGE IS A CLAIM THAT ROTS. The README shows a version pill, and
+    pyproject is the single place the version actually lives (`_version()` reads
+    it). Nothing tied the two together, so the first release after the badge was
+    added would have shipped a README advertising the previous version — the
+    same class as the skill/prompt drift, and just as invisible.
+
+    Red-proof: bump either side alone and this fails.
+    """
+    with open(README_PATH, encoding="utf-8") as fh:
+        readme = fh.read()
+    m = re.search(r"img\.shields\.io/badge/version-([0-9][^-\s)]*)-", readme)
+    assert m, "the README has no version badge — the gate has no subject"
+    badge = m.group(1)
+    assert badge == server._version(), (
+        f"README badge says {badge!r} but pyproject says {server._version()!r} — "
+        "bump the badge with the version, or drop the badge"
+    )
+
+
+def test_the_licence_is_present_and_named_consistently():
+    """A public repo with no LICENSE is 'all rights reserved' — readable but not
+    usable, which defeats publishing it. Assert the file exists, that it is the
+    MIT text, and that pyproject and the README agree with it."""
+    root = os.path.dirname(HERE)
+    lic = os.path.join(root, "LICENSE")
+    assert os.path.exists(lic), "no LICENSE file — a public repo without one grants nobody any rights"
+    with open(lic, encoding="utf-8") as fh:
+        text = fh.read()
+    assert "MIT License" in text and "WITHOUT WARRANTY OF ANY KIND" in text
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        assert 'license = "MIT"' in fh.read(), "pyproject does not declare the licence"
+    with open(README_PATH, encoding="utf-8") as fh:
+        assert "badge/license-MIT" in fh.read(), "the README badge does not say MIT"
+
+
 def test_vo_track_is_mono_by_decision_not_by_default():
     """Narration is MONO by decision [Peter, 2026-08-25]; stereo is reserved for
     SFX and music. AddTrack('audio') defaults to mono SILENTLY, so until 0.5.x
