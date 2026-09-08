@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added — a gate so the templates can live in a public repo
+
+- `export_template` snapshots the LIVE Resolve template project straight into
+  `templates/*.drp`, so whatever those projects hold on the day it runs is what
+  lands in the repo. Audited by hand 2026-09-08 and clean (bin and track names
+  only) — but **an audit is a moment and a gate is a guarantee**, and the next
+  snapshot is one command away. The day a bin is named after a client, or a
+  template picks up a render path, the old answer stops being true.
+- `test_no_template_publishes_a_path_an_email_or_a_hostname` scans every
+  `templates/*.drp` for home paths, mounted volumes, Windows paths, email
+  addresses, bonjour hostnames and credential assignments.
+- **It extracts the archive first.** A `.drp` is a ZIP: every path and address
+  inside it is compressed, so a scanner pointed at the file reads nothing and
+  passes clean. The archive is the transform that would blind the guard, so the
+  MEMBERS are scanned, and the test asserts the compressed bytes do NOT contain
+  the planted string — proving the extraction step is load-bearing rather than
+  decorative.
+- **It carries its own counterexample.** A `.drp`-shaped archive holding a real
+  home path and an address runs through the SAME predicate first and must be
+  caught, so "no leaks found" can never be confused with a scanner that cannot
+  read a zip.
+- **Unknown is never a pass.** A `.drp` the scanner cannot open is reported as a
+  leak, not skipped — a future format that defeats the reader must fail loudly.
+  An empty `templates/` fails too, and every `drp` declared in `templates.json`
+  must be on disk, so the subject set cannot quietly shrink to nothing.
+- Red-proofed four ways: a leak planted among the REAL templates (`/Volumes/…`),
+  a corrupt archive, a declared-but-absent template, and the built-in control.
+
 ## 0.6.0 — 2026-09-08
 
 ### Changed — "what this is NOT" points at Blackmagic's own MCP
