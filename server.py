@@ -504,17 +504,21 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
                    project: str | None = None) -> dict:
     """Build a NEW timeline in the currently open project: the package's clips
     in manifest (shot) order on V1, one Blue marker per shot carrying its
-    number + description, each VO clip on ITS OWN audio track named "VO" (added
-    to the timeline; never A1, which the shot clips' embedded audio fills)
-    UNDER THE SHOT it is pinned to (a board-wide VO, or a pin whose shot has no
-    clip here, still goes to the head), and — when the manifest names a
+    number + description, narration on ITS OWN audio lanes (added to the
+    timeline; never A1, which the shot clips' embedded audio fills) — ONE LANE
+    PER DOOR: a board-wide take (or a pin whose shot has no clip here) at the
+    head of "VO", a take PINNED to a shot on "VO PINS" at that shot's own
+    frame. The two overlap in time — a spine is often as long as the piece — so
+    one track cannot hold both. Pins colliding with each other checkerboard
+    onto "VO PINS 2"… and — when the manifest names a
     dialogue-cues file and `cues` is on — one RANGE marker per scripted line
     under its shot (name = speaker, note = the line, colour per speaker). Every
     VO placement is confirmed by re-reading the VO track, not by Resolve's
     return value. Run import_package first.
 
     dry_run=True touches nothing: it returns the full plan (clip order with
-    on-disk / in-bin presence, VO placement per take with `track: "VO"`, shot +
+    on-disk / in-bin presence, VO placement per take with the lane it lands on
+    (`track: "VO"` or `"VO PINS"`), shot +
     cue markers, a `missing` list and `wouldBuild`) in the same shape the real
     build reports, so the two can be diffed. Works without Resolve running (bin
     presence is then reported as unknown). `project` names the project the plan
@@ -928,8 +932,9 @@ def handoff_prompt(manifest_path: str = "<package>/manifest.json") -> str:
         f"'explainer' → 60 fps). An existing project name is refused: choose another, never overwrite.\n"
         f"3. import_package({manifest_path!r}) — clips into the VIDEOS bin, narration into VO. Then "
         f"build_timeline({manifest_path!r}) for real. A NEW timeline: clips in shot order on V1, one Blue "
-        "marker per shot, each pinned VO under its shot on its OWN audio track named VO (never A1 — the "
-        "shot clips' embedded audio fills it), dialogue cues as range markers.\n"
+        "marker per shot, narration on its own lanes and NEVER A1 (the shot clips' embedded audio fills "
+        "it) — one lane per door: board-wide takes at the head of VO, takes PINNED to a shot on VO PINS "
+        "at that shot's frame (colliding pins checkerboard onto VO PINS 2…), dialogue cues as range markers.\n"
         f"3b. (when the manifest carries a `look` block) apply_look({manifest_path!r}, verify=True) — the film's starting "
         "balance on node 1 of every V1 clip, from the look-cdl.json Depth Converter measured beside the "
         "manifest (`depthc look-compare --manifest --emit-cdl`). Key, temperature, saturation only — never "

@@ -39,6 +39,16 @@
 - Verified end to end on live Resolve 21.1.0.14 and read back independently
   through Blackmagic's own MCP: `A2 VO` holds the spine at 0, `A3 VO PINS` holds
   both pins at 119 and 214 at full length. `voUnderShot 2, voLoose 0`, PASS.
+- Declared as the capability **`vo_lanes`**, the way every other behaviour
+  change in this server is: an MCP without it lays both doors on one track,
+  which is precisely the build OSIDE must be able to detect.
+- The `build_timeline` docstring, the `handoff` prompt and the discovery skill
+  all said "its OWN audio track named VO" and are corrected. **The skill/prompt
+  drift gate stayed GREEN over all three** — it compares the skill to the
+  prompt, so two surfaces agreeing with each other while both disagree with the
+  code is exactly the shape it cannot see. Its class is tool names and order;
+  this was prose. Noted rather than widened, since prose equivalence is not a
+  thing that gate can mechanically decide.
 - Three tests, each red-proofed against the pre-fix source: the end-to-end
   regression (which asserts the PRECONDITION that the spine really does cover
   the pinned frame, or it proves nothing), the lane gate's red-proof, and the

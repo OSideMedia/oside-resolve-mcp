@@ -738,7 +738,10 @@ def test_tool_annotations_prompt_and_capabilities():
     text = asyncio.run(server.mcp.get_prompt("handoff", {"manifest_path": "/x/manifest.json"}))
     body = text.messages[0].content.text
     for step in ("create_project", "import_package", "build_timeline", "verify_import", "dry_run", "project=name",
-                 "not imported yet", "OWN audio track named VO"):
+                 "not imported yet",
+                 # the LANE contract, not just "a track called VO": an agent
+                 # reading this prompt must know pins do not ride the spine
+                 "NEVER A1", "head of VO", "VO PINS"):
         assert step in body
     # the dry run comes BEFORE create_project in the recipe
     assert body.index("dry_run=True") < body.index("create_project(kind, name)")
@@ -746,7 +749,7 @@ def test_tool_annotations_prompt_and_capabilities():
     assert caps["manifest"] == "oside-davinci/v1"
     assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
                                 "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope",
-                                "cdl_readback", "verify_json"]
+                                "cdl_readback", "verify_json", "vo_lanes"]
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
