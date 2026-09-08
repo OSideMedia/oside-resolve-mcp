@@ -572,10 +572,12 @@ def _good_timeline():
         {"name": "scene02_shot1.mp4", "start": 216, "duration": 200},
     ]
     a1 = []  # embedded audio from the shot clips — narration never lands here
+    # lengths are the manifest's durationSeconds conformed to 23.976 (12.0s,
+    # 2.0s, 3.1s): the length gate is only real if the good fixture carries one
     vo = [
-        {"name": "vo01_narrator.mp3", "start": 0},
-        {"name": "vo03_scene02-shot9_ben.mp3", "start": 0},
-        {"name": "vo02_scene01-shot2_ada.mp3", "start": 120},
+        {"name": "vo01_narrator.mp3", "start": 0, "duration": 287},
+        {"name": "vo03_scene02-shot9_ben.mp3", "start": 0, "duration": 47},
+        {"name": "vo02_scene01-shot2_ada.mp3", "start": 120, "duration": 74},
     ]
     markers = {
         0: {"color": "Blue", "name": "shot 1A", "customData": rapi.SHOT_TAG},
@@ -1434,6 +1436,50 @@ def test_cdl_readback_catches_a_grade_that_did_not_take():
     # tolerance is real but tight: 6-decimal EDL vs our 4-decimal write
     near = handoff.compare_cdl({**same, "offset": [-0.0250004, -0.02, -0.015]}, got[0])
     assert near["match"] is True
+
+
+
+def test_the_vo_length_gate_can_actually_fail():
+    """RED-PROOF for the length row added 2026-09-08.
+
+    Resolve 21.1.0.14 places a take onto an occupied frame at the track TAIL
+    **truncated** to about min(recordFrame, clipLength), answering truthy the
+    whole way. That mode always MOVES the clip, so the start rows catch it —
+    but nothing in the gate had an opinion about LENGTH, so a take sitting on
+    its own frame carrying a fraction of its audio passed. This proves the new
+    row is wired to a real subject and can go red on it.
+    """
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+
+    # POSITIVE CONTROL — the subject is in the set and it PASSES on a good build
+    v1, a1, markers, vo = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    row = next((c for c in out["checks"] if c["check"] == "VO vo02_scene01-shot2_ada.mp3 length"), None)
+    assert row is not None, "the length row never ran — the gate has no subject"
+    assert row["pass"] and row["expected"] == 74 and row["found"] == 74
+    assert out["overall"] == "PASS"
+
+    # RED — same frame, truncated audio. Ada is pinned to scene01_shot2 (frame
+    # 120) and still lands exactly there, so every START row stays green: this
+    # is the one shape only the length row can see.
+    v1, a1, markers, vo = _good_timeline()
+    vo[2]["duration"] = 20
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    by = {c["check"]: c for c in out["checks"]}
+    assert by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]["pass"] is True, \
+        "the start row must stay GREEN, or this test is not isolating length"
+    bad = by["VO vo02_scene01-shot2_ada.mp3 length"]
+    assert bad["pass"] is False and bad["found"] == 20 and bad["shortBy"] == 54
+    assert out["overall"] == "FAIL"
+
+    # the slack is real: 2 frames short passes, 3 does not
+    for short, want_pass in ((2, True), (3, False)):
+        v1, a1, markers, vo = _good_timeline()
+        vo[2]["duration"] = 74 - short
+        out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+        got = {c["check"]: c for c in out["checks"]}["VO vo02_scene01-shot2_ada.mp3 length"]
+        assert got["pass"] is want_pass, (short, got)
 
 
 def test_vo_track_is_mono_by_decision_not_by_default():
