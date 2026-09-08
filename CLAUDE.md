@@ -40,10 +40,24 @@ of them. If one looks wrong, say so and leave it.**
    the templates ship with `YT` and `YT Shorts`, so that is a template timeline.
    Do not "simplify" it back to a string because a name reads better.
 
-2. **Never trust `AppendToTimeline`'s return.** It answers a truthy
-   `[<PyRemoteObject>]` over a silent drop. `append_audio` re-reads the track
-   after every append and judges placement by what appeared. Do not replace the
-   re-read with the return value, however redundant it looks.
+2. **Never trust `AppendToTimeline`'s TRUTHINESS.** `bool(r)` and `len(r)` are
+   worthless: on an occupied `recordFrame` it returns a one-element list in
+   every case, and does one of THREE things (re-measured on Studio 21.1.0.14,
+   2026-09-08, three-cell design with a positive and a negative control):
+     - occupied by the shot clips' EMBEDDED audio -> places NOTHING, and the
+       returned proxy is NULL: `GetName()`, `GetStart()`, `GetDuration()`,
+       `GetUniqueId()` all answer `None`.
+     - occupied on a plain audio track -> places at the track TAIL, TRUNCATED
+       to about `min(recordFrame, clipLength)` frames. Replicated 6x. The proxy
+       is live and HONEST here: it reports the real, wrong start and duration.
+     - free frame -> correct, proxy reports the asked frame and full length.
+   So a drop IS distinguishable from a placement -- by interrogating
+   `r[0].GetStart()`, never by testing the list. `append_audio` re-reads the
+   track after every append and judges placement by what appeared. **Keep the
+   re-read.** It holds on both 21.0.4.5 and 21.1, the proxy behaviour is
+   measured on 21.1 only, and swapping a working defence for a newer one buys
+   nothing. The truncation mode is why the gate now asserts VO DURATION and not
+   just the start frame.
 
 3. **Resolve collisions from ONE read; never retry writes.** `first_free_frame`
    searches a marker set read once. A loop that calls `AddMarker` until one
