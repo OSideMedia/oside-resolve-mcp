@@ -1658,6 +1658,104 @@ def test_colliding_pins_checkerboard_onto_a_second_lane():
         shutil.rmtree(tmp)
 
 
+
+# ---------------------------------------------------------------------------
+# THE TEMPLATES ARE PUBLISHED BYTES. `export_template` snapshots the LIVE
+# Resolve template project straight into templates/*.drp, so whatever those
+# projects hold on the day it runs is what lands in the repo. Audited by hand
+# 2026-09-08 (clean: bin and track names only) — but an audit is a moment and a
+# gate is a guarantee, and the next snapshot is one command away.
+#
+# THE ZIP IS THE TRANSFORM THAT BLINDS THE GUARD. A .drp is a zip archive: every
+# path, address and hostname inside it is COMPRESSED, so a scanner pointed at the
+# file reads nothing and passes. The archive is therefore extracted and the
+# MEMBERS are scanned — the guard is only as good as what it is allowed to see.
+# ---------------------------------------------------------------------------
+
+TEMPLATE_LEAK_PATTERNS = (
+    (r"/Users/[A-Za-z0-9._-]+", "a macOS home path"),
+    (r"/home/[A-Za-z0-9._-]+", "a Linux home path"),
+    (r"/Volumes/[A-Za-z0-9 ._-]+", "a mounted volume"),
+    (r"\b[A-Za-z]:\\\\[A-Za-z0-9 ._-]+", "a Windows path"),
+    (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "an email address"),
+    (r"\b[A-Za-z0-9-]+\.local\b", "a bonjour hostname"),
+    (r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]", "a credential"),
+)
+
+
+def _scan_drp(path):
+    """Every leak in one .drp, as (member, kind, sample). Extracts first: the
+    archive is the transform, and a scan of the compressed bytes sees nothing."""
+    import zipfile
+    hits = []
+    if not zipfile.is_zipfile(path):
+        # NOT a skip. An unreadable template is UNKNOWN, and unknown is never a
+        # pass — a future .drp format the scanner cannot open must fail loudly
+        # rather than sail through as "no leaks found".
+        return [(os.path.basename(path), "unreadable", "not a zip archive — the scanner cannot see inside it")]
+    with zipfile.ZipFile(path) as z:
+        for member in z.namelist():
+            if member.endswith("/"):
+                continue
+            try:
+                blob = z.read(member).decode("utf-8", "ignore")
+            except Exception as e:  # noqa: BLE001
+                hits.append((member, "unreadable", str(e)))
+                continue
+            for pattern, kind in TEMPLATE_LEAK_PATTERNS:
+                m = re.search(pattern, blob)
+                if m:
+                    hits.append((member, kind, m.group(0)[:80]))
+    return hits
+
+
+def test_no_template_publishes_a_path_an_email_or_a_hostname():
+    """The gate that lets these templates live in a public repo.
+
+    Carries its own counterexample: a .drp-shaped archive with a real home path
+    and an address in it is run through the SAME predicate first, and must be
+    caught. Without that, "no leaks found" is indistinguishable from a scanner
+    that cannot read a zip — which is exactly what a scanner pointed at the
+    compressed file would report.
+    """
+    import zipfile
+
+    # POSITIVE CONTROL — the scanner can SEE, and sees through the compression
+    with tempfile.TemporaryDirectory() as td:
+        planted = os.path.join(td, "LEAKY.drp")
+        with zipfile.ZipFile(planted, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("project.xml", "<Project><Render>/Users/someone/Movies/cut.mov</Render></Project>")
+            z.writestr("MediaPool/Master/MpFolder.xml", "<Name>client@agency.com</Name>")
+        found = {kind for _m, kind, _s in _scan_drp(planted)}
+        assert "a macOS home path" in found, "the scanner cannot see a path through the zip"
+        assert "an email address" in found, "the scanner cannot see an address through the zip"
+        # and the naive scan — the compressed BYTES — must NOT find them, which
+        # is the whole reason the extraction step exists
+        with open(planted, "rb") as fh:
+            raw = fh.read().decode("utf-8", "ignore")
+        assert "/Users/someone" not in raw, "the fixture did not actually compress — control is void"
+
+    # THE SUBJECT SET, NAMED AND NON-EMPTY. An empty templates/ dir would make
+    # every assertion below vacuously true, so the set is asserted first and
+    # tied to what templates.json actually declares.
+    with open(os.path.join(os.path.dirname(HERE), "templates", "templates.json"), encoding="utf-8") as fh:
+        declared = json.load(fh)
+    drps = sorted(glob.glob(os.path.join(os.path.dirname(HERE), "templates", "*.drp")))
+    assert drps, "no templates/*.drp found — the gate has no subject"
+    names = {os.path.basename(p) for p in drps}
+    for kind, spec in declared.items():
+        assert spec["drp"] in names, f"templates.json declares {spec['drp']!r} for {kind!r}, but it is not on disk"
+
+    # THE SUBJECTS THEMSELVES
+    leaks = {os.path.basename(p): _scan_drp(p) for p in drps}
+    dirty = {k: v for k, v in leaks.items() if v}
+    assert not dirty, (
+        "a template would publish identifying data:\n"
+        + "\n".join(f"  {f} :: {m} :: {kind} :: {sample!r}"
+                     for f, hits in dirty.items() for m, kind, sample in hits)
+    )
+
+
 def test_vo_track_is_mono_by_decision_not_by_default():
     """Narration is MONO by decision [Peter, 2026-08-25]; stereo is reserved for
     SFX and music. AddTrack('audio') defaults to mono SILENTLY, so until 0.5.x
@@ -1771,6 +1869,7 @@ def test_a_resolve_without_versions_falls_back_and_says_so():
 # ---------------------------------------------------------------------------
 
 import ast  # noqa: E402
+import glob  # noqa: E402
 import re  # noqa: E402
 
 SKILL_LOCATIONS = (
