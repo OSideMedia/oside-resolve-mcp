@@ -17,10 +17,28 @@ Product detail lives in `README.md`; what changed and why in `CHANGELOG.md`.
 
 ## What this is NOT
 
-Not general Resolve remote control — [samuelgursky/davinci-resolve-mcp][sg]
-(MIT) exists for that and is credited in the README. **A fixed pipeline gets
-fixed tools so it runs identically every time.** Ten tools, one recipe. Every
-proposal to add a tool "while we're here" is answered by that sentence.
+Not general Resolve remote control — **Blackmagic ships its own MCP server**
+since Studio 21.1, inside the app bundle at
+`DaVinci Resolve.app/Contents/Applications/ResolveMCP`. That is where general
+control belongs now: arbitrary `run_script`, plus `search_scripting_api` /
+`get_scripting_api` / `get_whats_new`, version-matched to the Resolve actually
+running and therefore the OWNING source for call shapes. **A fixed pipeline
+gets fixed tools so it runs identically every time.** Ten tools, one recipe.
+Every proposal to add a tool "while we're here" is answered by that sentence.
+
+**It does not make this server redundant, and it is not a safe substitute for
+it.** Its `run_script` makes every mistake in the ANTI-PATTERNS below available
+fresh, and its stubs document NONE of them — a type signature cannot express a
+lie, and `AppendToTimeline`'s stub still promises "the list of appended
+timelineItems" over a silent drop. It also has no gate: the 2026-09-08 VO-lane
+defect was caught by `verify_import` refusing to call the build a success, which
+is the part a general tool cannot give you. Use it for API lookup, the changelog
+past your training cutoff, and ad-hoc READ-ONLY probing; while a handoff runs,
+treat it as read-only — two writers, one Resolve, and `run_script_unsafe` has
+filesystem and process access with no contract.
+
+[samuelgursky/davinci-resolve-mcp][sg] (MIT) predates both; its connection
+pattern informed `resolve_api.py` and it is credited in the README.
 
 Never deletes. Never overwrites a project or timeline name. Never renders —
 renders are user-triggered in Resolve. Nothing listens on a network.

@@ -2,6 +2,24 @@
 
 ## 0.6.0 — 2026-09-08
 
+### Changed — "what this is NOT" points at Blackmagic's own MCP
+
+- Both `CLAUDE.md` and the README sent readers to third-party
+  `samuelgursky/davinci-resolve-mcp` for general Resolve control. **Blackmagic
+  ships its own since Studio 21.1**, inside the app bundle at
+  `DaVinci Resolve.app/Contents/Applications/ResolveMCP` — version-matched to
+  the running Resolve, so its `search_scripting_api` / `get_scripting_api` are
+  the OWNING source for call shapes and retire hand-grepping `README.txt`.
+- Both notes now also say what it does NOT replace, because "there is a
+  first-party general server" invites exactly the wrong conclusion: its
+  `run_script` makes every anti-pattern available fresh, its stubs document
+  none of the behavioural lies (`AppendToTimeline`'s still promises "the list
+  of appended timelineItems" over a silent drop — a type signature cannot
+  express a lie), and it has no gate. This session's VO-lane defect was caught
+  by `verify_import` refusing to call the build a success.
+- samuelgursky's is still credited: it predates both and its connection pattern
+  informed `resolve_api.py`.
+
 ### Fixed — a narration spine no longer swallows every pinned take (2026-09-08)
 
 - **A real explainer package could not pass verify.** OSIDE's exporter

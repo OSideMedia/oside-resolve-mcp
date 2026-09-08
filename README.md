@@ -142,10 +142,25 @@ occupied frame answers a truthy `[<PyRemoteObject>]` while placing nothing.
 `OSIDE_RESOLVE_OFFLINE=1` (set by the test module) keeps the offline cases
 offline even with a real Resolve running.
 
-This is deliberately NOT general Resolve remote control —
+This is deliberately NOT general Resolve remote control. **Blackmagic ships its
+own MCP server** with Studio 21.1, inside the app bundle at
+`DaVinci Resolve.app/Contents/Applications/ResolveMCP`: arbitrary `run_script`
+against the scripting API, plus `search_scripting_api` / `get_scripting_api` /
+`get_whats_new` — version-matched to the Resolve you are running, and so the
+owning source for call SHAPES.
+
+The two do different jobs. Reach for Blackmagic's for API lookup, the changelog
+past your training cutoff, and ad-hoc read-only probing. Reach for THIS one for
+the handoff — a fixed pipeline gets fixed tools so it runs identically every
+time, and the acceptance gate is the part a general tool cannot give you. The
+first-party stubs document call shapes but none of the BEHAVIOURAL lies this
+server is built around (`AppendToTimeline` still promises "the list of appended
+timelineItems" over a silent drop), so ANTI-PATTERNS in `CLAUDE.md` still earns
+its keep. While a build is running, treat the general server as read-only: two
+writers, one Resolve.
+
 [samuelgursky/davinci-resolve-mcp](https://github.com/samuelgursky/davinci-resolve-mcp)
-(MIT) exists for that, and its connection pattern informed `resolve_api.py`.
-A fixed pipeline gets fixed tools so it runs identically every time.
+(MIT) predates both, and its connection pattern informed `resolve_api.py`.
 
 ## Requirements
 
