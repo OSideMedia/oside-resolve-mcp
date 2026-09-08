@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-09-08
 
 ### Fixed — a narration spine no longer swallows every pinned take (2026-09-08)
 
