@@ -24,6 +24,7 @@ import subprocess
 from resolve_api import (
     CUE_MARKER_COLORS, CUE_TAG, SHOT_MARKER_COLOR, SHOT_TAG, STOCK_TAG, TEXT_TASK_TAG,
     VO_TRACK_NAME,
+    VO_PINS_TRACK_NAME,
 )
 
 MANIFEST_FORMAT = "oside-davinci/v1"
@@ -44,7 +45,12 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             # 0.6.0 — verify_import writes verify.json beside the manifest, one
             # row per clip keyed by the manifest's generationId, so the verdict
             # reaches OSIDE's ledger (PLAN-SHARED-GENERATION-ID step e).
-            "verify_json"]
+            "verify_json",
+            # 0.6.0 — narration rides ONE LANE PER DOOR: board-wide takes on
+            # `VO`, pinned takes on `VO PINS` (overflow `VO PINS 2`…). Declared
+            # because an MCP without it lays both on one track, where the spine
+            # swallows every pinned frame and the build cannot pass verify.
+            "vo_lanes"]
 
 VERIFY_FORMAT = "oside-verify/1"
 VERIFY_SIDECAR = "verify.json"
@@ -320,14 +326,22 @@ def vo_rows(manifest: dict, starts_by_file: dict, planned_files: set,
             on_disk: dict, in_bin: dict) -> list[dict]:
     """One row per VO LAY (a take pinned to several shots is laid once per
     shot). mode: underShot | atHead — the same split build_timeline reports.
-    Every row says `track: "VO"` — narration never rides A1 (the shot clips'
-    embedded audio owns it)."""
+
+    The row names the LANE its door uses: a board-wide take rides `VO` (the
+    spine), a pinned take rides `VO PINS`. They overlap in time — a spine is
+    often as long as the finished piece — so one track cannot hold both, and
+    laying them together refused every pin to the tail [measured 2026-09-08].
+    Neither ever rides A1: the shot clips' embedded audio owns it.
+
+    A plan names the lane FAMILY. Pins that collide with each other open
+    `VO PINS 2`, `VO PINS 3`… and which take lands where is decided at build
+    time against the real track, never guessed here."""
     rows = []
     videos_by_file = {_basename(v["file"]): v for v in (manifest.get("videos") or [])}
     for a in manifest.get("audio") or []:
         fname = _basename(a["file"])
         common = {
-            "file": a["file"], "label": a.get("label"), "track": VO_TRACK_NAME,
+            "file": a["file"], "label": a.get("label"),
             "onDisk": on_disk.get(fname), "inBin": in_bin.get(fname),
         }
         placements = a.get("placements") or []
@@ -338,7 +352,7 @@ def vo_rows(manifest: dict, starts_by_file: dict, planned_files: set,
                 laid = True
                 v = videos_by_file.get(vf)
                 rows.append({
-                    **common, "mode": "underShot",
+                    **common, "track": VO_PINS_TRACK_NAME, "mode": "underShot",
                     "targetShot": display_name(manifest, v) if v else vf,
                     "targetFile": p.get("videoFile"),
                     "startFrame": starts_by_file.get(vf),
@@ -346,7 +360,7 @@ def vo_rows(manifest: dict, starts_by_file: dict, planned_files: set,
         if not laid:
             reason = "no placements (board-wide VO)" if not placements else "pinned shot has no clip in this package"
             rows.append({
-                **common, "mode": "atHead", "targetShot": None, "targetFile": None,
+                **common, "track": VO_TRACK_NAME, "mode": "atHead", "targetShot": None, "targetFile": None,
                 "startFrame": 0, "reason": reason,
             })
     return rows
@@ -754,6 +768,19 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
                 on_a1 = track.split()[0] == "A1"
                 check(f"VO {fname} not on A1", f"a track named {VO_TRACK_NAME}", track, not on_a1,
                       rule="narration rides its own track; A1 is the shot clips' embedded audio")
+                # A PINNED TAKE MUST NOT SHARE THE SPINE'S LANE. A board-wide
+                # narration is often as long as the whole piece, so a pin laid
+                # on `VO` behind it is refused and slid to the tail — the exact
+                # failure this split removes [measured 2026-09-08]. The frame
+                # row above catches the slide; this one names the CAUSE, so a
+                # regression reads as "back on the spine" and not as a mystery
+                # 169-frame delta.
+                if pinned:
+                    lane = track.split(" ", 1)[1].strip() if " " in track else track
+                    check(f"VO {fname} rides a pins lane",
+                          f"a track named {VO_PINS_TRACK_NAME}[ n]", track,
+                          lane.upper().startswith(VO_PINS_TRACK_NAME),
+                          rule="pinned takes checkerboard on their own lanes; VO carries the spine")
             # THE ONE LENGTH CASE THE ROWS ABOVE CANNOT SEE. Every check so far
             # compares a START frame. Resolve's truncation mode always MOVES the
             # clip too, so it already reds — except for a take that landed on its

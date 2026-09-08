@@ -1,6 +1,79 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-09-08
+
+### Changed — "what this is NOT" points at Blackmagic's own MCP
+
+- Both `CLAUDE.md` and the README sent readers to third-party
+  `samuelgursky/davinci-resolve-mcp` for general Resolve control. **Blackmagic
+  ships its own since Studio 21.1**, inside the app bundle at
+  `DaVinci Resolve.app/Contents/Applications/ResolveMCP` — version-matched to
+  the running Resolve, so its `search_scripting_api` / `get_scripting_api` are
+  the OWNING source for call shapes and retire hand-grepping `README.txt`.
+- Both notes now also say what it does NOT replace, because "there is a
+  first-party general server" invites exactly the wrong conclusion: its
+  `run_script` makes every anti-pattern available fresh, its stubs document
+  none of the behavioural lies (`AppendToTimeline`'s still promises "the list
+  of appended timelineItems" over a silent drop — a type signature cannot
+  express a lie), and it has no gate. This session's VO-lane defect was caught
+  by `verify_import` refusing to call the build a success.
+- samuelgursky's is still credited: it predates both and its connection pattern
+  informed `resolve_api.py`.
+
+### Fixed — a narration spine no longer swallows every pinned take (2026-09-08)
+
+- **A real explainer package could not pass verify.** OSIDE's exporter
+  documents VO arriving through TWO doors and ships both: takes attached to the
+  whole board (`placements: []` — the recorded spine, or a board narration) and
+  takes pinned to a single shot. `build_timeline` laid them on one track in
+  manifest order, so the spine went down first — and a spine is often as long
+  as the finished piece — after which **every pinned take hit an occupied frame
+  and was refused to the tail**. Measured live on 21.1.0.14: pins expected at
+  119/214 landed at 288/363, `verify` FAIL, exit 1.
+- **One lane per door.** A board-wide take keeps **`VO`** (unchanged for the
+  many packages that only ever use that door); a pinned take rides **`VO
+  PINS`**. Pins can still collide with EACH OTHER — a long take pinned to a
+  short shot spills into the next shot's pin — so a pin whose span is occupied
+  opens **`VO PINS 2`**, and so on: a checkerboard, which is what a dialogue
+  editor does by hand. **Never a slide to the tail** — that is the behaviour
+  this removes, and re-introducing it as the overflow strategy would put the
+  take back where nobody expects it. Capped at 8 lanes.
+- The split is **inferred from `placements` being empty**. No manifest field was
+  added: `placements: []` already carries exactly this information, and a new
+  `track` hint would mean a coordinated release across two repos to transmit
+  something we can already read.
+- The spine lane is created **up front and only when a board-wide take needs
+  it**, so `VO` always precedes `VO PINS` in the track order. Lazy creation
+  would seat whichever door the manifest happens to list first at A2, and an
+  editor should not have to guess which lane is which per package.
+- **Each plan row now names the lane it actually landed on**, plus `placedAt`
+  and `laidAs`. The old code stamped the spine's name onto every row, so a
+  pinned row claimed `track: "VO"` while the take sat elsewhere — an honest
+  aggregate over a lying detail, the same defect as audit 2026-08-24, and
+  `placedAt` was `None` on every row.
+- **`verify` gains one row**: a pinned take must ride a pins lane. The frame row
+  already caught the slide; this one names the CAUSE, so a regression reads as
+  "back on the spine" rather than as an unexplained 169-frame delta.
+- Verified end to end on live Resolve 21.1.0.14 and read back independently
+  through Blackmagic's own MCP: `A2 VO` holds the spine at 0, `A3 VO PINS` holds
+  both pins at 119 and 214 at full length. `voUnderShot 2, voLoose 0`, PASS.
+- Declared as the capability **`vo_lanes`**, the way every other behaviour
+  change in this server is: an MCP without it lays both doors on one track,
+  which is precisely the build OSIDE must be able to detect.
+- The `build_timeline` docstring, the `handoff` prompt and the discovery skill
+  all said "its OWN audio track named VO" and are corrected. **The skill/prompt
+  drift gate stayed GREEN over all three** — it compares the skill to the
+  prompt, so two surfaces agreeing with each other while both disagree with the
+  code is exactly the shape it cannot see. Its class is tool names and order;
+  this was prose. Noted rather than widened, since prose equivalence is not a
+  thing that gate can mechanically decide.
+- Three tests, each red-proofed against the pre-fix source: the end-to-end
+  regression (which asserts the PRECONDITION that the spine really does cover
+  the pinned frame, or it proves nothing), the lane gate's red-proof, and the
+  checkerboard. The canonical good fixture now carries both lanes — it encoded
+  the single-track layout, which is exactly how the previous single-lane defect
+  survived.
+
 
 ### Measured — the append trap re-verified on Studio 21.1.0.14 (2026-09-08)
 
