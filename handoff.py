@@ -45,7 +45,12 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             # 0.6.0 — verify_import writes verify.json beside the manifest, one
             # row per clip keyed by the manifest's generationId, so the verdict
             # reaches OSIDE's ledger (PLAN-SHARED-GENERATION-ID step e).
-            "verify_json"]
+            "verify_json",
+            # 0.6.0 — narration rides ONE LANE PER DOOR: board-wide takes on
+            # `VO`, pinned takes on `VO PINS` (overflow `VO PINS 2`…). Declared
+            # because an MCP without it lays both on one track, where the spine
+            # swallows every pinned frame and the build cannot pass verify.
+            "vo_lanes"]
 
 VERIFY_FORMAT = "oside-verify/1"
 VERIFY_SIDECAR = "verify.json"
