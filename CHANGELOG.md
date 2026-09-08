@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added — public pre-flight: licence, contributing guide, badges
+
+- **MIT LICENSE.** A public repo without one is "all rights reserved" — readable
+  but not legally usable, which defeats publishing it. Declared in `pyproject`
+  and asserted by a test, so the three surfaces cannot drift apart.
+- **CONTRIBUTING.md**, covering the two things that would otherwise produce a
+  rejected patch: the ten tools are deliberately few (a PR adding a tool "while
+  we're here" will be declined — Blackmagic's own MCP is the right home for
+  general control), and the ANTI-PATTERNS are load-bearing, so a "fix" to one
+  needs a live measurement rather than a reading. Also states the house rules
+  every existing test follows: gates must be shown failing, unknown is never a
+  pass, and an assertion needs a named non-empty subject set.
+- **README badges** (version, licence, the Resolve build actually measured
+  against, platform), a findable `## Working alongside Blackmagic's own MCP`
+  section, and a footer noting DaVinci Resolve is a Blackmagic Design trademark
+  and this project is **not affiliated with or endorsed by** them.
+- **The version badge is gated.** A static badge is a claim that rots: the first
+  release after adding one would have shipped a README advertising the previous
+  version, invisibly — the same class as the skill/prompt drift. A test ties the
+  badge to `pyproject`, the one place the version lives, and was red-proofed by
+  desyncing them.
+
 ### Added — a gate so the templates can live in a public repo
 
 - `export_template` snapshots the LIVE Resolve template project straight into
