@@ -568,6 +568,7 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
         plan["vo"] = handoff.vo_rows(manifest, landed, set(landed), vo_on_disk, vo_in_bin)
         vo_report = {"underShot": 0, "atHead": 0, "loose": 0, "looseLabels": [], "track": None, "trackName": None}
         placements = []
+        placed_rows = []
         for r in plan["vo"]:
             item = by_name["audio"].get(os.path.basename(r["file"]))
             if item is None:
@@ -584,16 +585,28 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             r["placed"] = True
             record = None if r["mode"] == "atHead" else tl_start + int(r["startFrame"])
             placements.append({"item": item, "recordFrame": record, "label": r.get("label")})
+            placed_rows.append(r)
         if placements:
-            # narration gets its own track — A1 is already full of the shot
-            # clips' embedded audio, and Resolve answers truthy on a silent drop
-            vo_track = rapi.ensure_vo_track(timeline)
+            # Narration never rides A1 — it is already full of the shot clips'
+            # embedded audio, and Resolve answers truthy on a silent drop. The
+            # SPINE lane is created up front (and only when a board-wide take
+            # actually needs it) so that VO always precedes VO PINS in the track
+            # order: lazy creation would put whichever door the manifest happens
+            # to list first at A2, and an editor should not have to guess which
+            # lane is which from package to package.
+            has_head = any(p["recordFrame"] is None for p in placements)
+            vo_track = rapi.ensure_vo_track(timeline) if has_head else None
             vo_report = rapi.append_audio(media_pool, timeline, placements, vo_track)
-            for r in plan["vo"]:
-                if r.get("placed") is False:
-                    continue        # never appended — leave its honest reason alone
-                r["track"] = vo_report["trackName"]
-                r["trackIndex"] = vo_report["track"]
+            # EACH ROW CARRIES THE LANE IT ACTUALLY LANDED ON. Stamping the
+            # spine's name onto every row (what this did before the lanes) made
+            # every pinned row claim `track: "VO"` while the take sat on VO PINS
+            # — the aggregate was right and the per-row detail was a lie, and the
+            # row is what an agent quotes back [same defect as audit 2026-08-24].
+            for r, lay in zip(placed_rows, vo_report.get("lays") or []):
+                r["track"] = lay["trackName"]
+                r["trackIndex"] = lay["track"]
+                r["placedAt"] = lay.get("placedAt")
+                r["laidAs"] = lay.get("mode")
 
         plan["cueMarkers"] = handoff.cue_rows(manifest, cue_list, landed, lengths, plan["fps"])
         cue_report = rapi.add_range_markers(timeline, plan["cueMarkers"]) if plan["cueMarkers"] else {"placed": 0, "skipped": []}
