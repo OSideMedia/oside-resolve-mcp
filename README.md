@@ -13,12 +13,19 @@ project:
 3. `build_timeline(manifest_path, timeline_name="EDIT 01", dry_run=False,
    cues=True, project=None)` — clips in shot order on V1, one Blue point
    marker per shot carrying its number + description (+ VO line for
-   explainers), each pinned VO take under its own shot **on its own audio
-   track named `VO`** (added to the timeline — never A1, which carries the shot
-   clips' OWN audio: Seedance generates audio and video in one pass and OSIDE
-   directs it, so A1 holds the dialogue, SFX and ambience the director specified.
-   Narration is separate work and gets its own lane; unpinned VO at the head of
-   that track), and — when the
+   explainers), and narration on **its own audio lanes — never A1**, which
+   carries the shot clips' OWN audio: Seedance generates audio and video in one
+   pass and OSIDE directs it, so A1 holds the dialogue, SFX and ambience the
+   director specified. Narration is separate work and gets its own lanes, one
+   per DOOR: a board-wide take (`placements: []` — the recorded spine, or a
+   board narration) rides **`VO`** at the head, and a take **pinned** to a shot
+   rides **`VO PINS`** on that shot's own frame. The two overlap in time — a
+   spine is often as long as the finished piece — so a single track cannot hold
+   both: laid together the spine went down first and every pin was refused to
+   the tail, which failed verify on any package using both doors [measured
+   2026-09-08]. Pins that collide with EACH OTHER (a long take pinned to a
+   short shot spilling into the next pin) checkerboard onto `VO PINS 2`,
+   `VO PINS 3`… — never a slide to the tail. And — when the
    manifest names a `dialogue-cues.csv` — one **range marker per scripted
    line** under its shot: name = speaker, note = the line, length = the line's
    estimate (the shot's length when a cue has none), one colour per speaker

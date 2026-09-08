@@ -301,11 +301,16 @@ class FakeProject:
 
 
 def _fake_resolve(monkeypatch_target=server, videos_frames=(120, 96, 200), audio_frames=(288, 74, 48),
-                  project_name="FIXTURE", with_bins=True, projects=None):
+                  project_name="FIXTURE", with_bins=True, projects=None, manifest_path=None):
     """Wire server/rapi to a fake Resolve holding the fixture's clips in
     VIDEOS / VO bins (or an empty pool with with_bins=False). Returns
-    (project, restore_fn)."""
-    manifest, _ = _fixture()
+    (project, restore_fn).
+
+    `manifest_path` stocks the bins from ANOTHER package instead of the fixture
+    — needed whenever a test builds a manifest the fixture does not contain
+    (an extra take, a different pin), or the clip would never reach the bin and
+    the build would report it unplaced for the wrong reason."""
+    manifest, _ = _fixture() if manifest_path is None else server._load_manifest(manifest_path)
     vclips = [FakeClip(os.path.basename(v["file"]), f) for v, f in zip(manifest["videos"], videos_frames)]
     aclips = [FakeClip(os.path.basename(a["file"]), f) for a, f in zip(manifest["audio"], audio_frames)]
     if with_bins:
@@ -366,7 +371,17 @@ def test_real_build_and_verify_against_fake_resolve():
         # narration rides its OWN track named VO (A2 on a fresh timeline);
         # A1 holds the shot clips' embedded audio and nothing else
         assert real["voTrack"] == "VO" and real["voTrackIndex"] == 2
-        assert all(r["track"] == "VO" and r["trackIndex"] == 2 for r in real["plan"]["vo"])
+        # …and each ROW names the lane it actually landed on, by door: the
+        # board-wide takes on the spine, the pinned take on VO PINS. Stamping
+        # the spine's name onto every row made pinned rows claim "VO" while the
+        # take sat elsewhere — an honest aggregate over a lying detail.
+        lanes = {os.path.basename(r["file"]): (r["track"], r["trackIndex"]) for r in real["plan"]["vo"]}
+        assert lanes == {"vo01_narrator.mp3": ("VO", 2),
+                         "vo03_scene02-shot9_ben.mp3": ("VO", 2),
+                         "vo02_scene01-shot2_ada.mp3": ("VO PINS", 3)}, lanes
+        # placedAt used to be None on every row; the lay now reports it
+        assert {os.path.basename(r["file"]): r["placedAt"] for r in real["plan"]["vo"]} == {
+            "vo01_narrator.mp3": 0, "vo03_scene02-shot9_ben.mp3": 288, "vo02_scene01-shot2_ada.mp3": 120}
         assert real["cueMarkers"] == 3 and real["cueMarkersSkipped"] == []
         # dry and real plans agree on the rows that matter
         for key in ("clips", "markers", "vo", "cueMarkers"):
@@ -376,11 +391,18 @@ def test_real_build_and_verify_against_fake_resolve():
 
         tl = project.GetCurrentTimeline()
         assert tl.GetName() == "EDIT 01"
-        assert tl.GetTrackName("audio", 2) == "VO"
+        assert tl.GetTrackName("audio", 2) == "VO" and tl.GetTrackName("audio", 3) == "VO PINS"
         assert [x.GetName() for x in tl.GetItemListInTrack("audio", 1)] == [
             "scene01_shot1A.mp4", "scene01_shot2.mp4", "scene02_shot1.mp4"]
+        # the spine keeps VO; Ben is a pin whose shot has no clip, so he is a
+        # head take too and slides behind the narrator (unpinned, no contract)
         assert [(x.GetName(), x.GetStart() - 86400, x.GetDuration()) for x in tl.GetItemListInTrack("audio", 2)] == [
-            ("vo01_narrator.mp3", 0, 288), ("vo02_scene01-shot2_ada.mp3", 120, 74), ("vo03_scene02-shot9_ben.mp3", 288, 48)]
+            ("vo01_narrator.mp3", 0, 288), ("vo03_scene02-shot9_ben.mp3", 288, 48)]
+        # Ada is PINNED, so she rides VO PINS and lands on her shot's own frame
+        # — under the single-track layout the narrator held 0..288 and she was
+        # refused to 288, which is the defect this split removes
+        assert [(x.GetName(), x.GetStart() - 86400, x.GetDuration()) for x in tl.GetItemListInTrack("audio", 3)] == [
+            ("vo02_scene01-shot2_ada.mp3", 120, 74)]
         marks = tl.GetMarkers()
         assert {f for f, m in marks.items() if m["customData"] == rapi.SHOT_TAG} == {0, 120, 216}
         assert {f for f, m in marks.items() if m["customData"] == rapi.CUE_TAG} == {121, 145, 217}
@@ -397,14 +419,14 @@ def test_real_build_and_verify_against_fake_resolve():
         assert ben["expected"] == 0 and ben["found"] == 288 and ben["delta"] == 288 and ben["pass"]
         assert ben["track"] == "A2 VO"
         ada0 = next(c for c in ver["checks"] if c["check"].startswith("VO vo02"))
-        assert ada0["found"] == 120 and ada0["delta"] == 0 and ada0["track"] == "A2 VO"
+        assert ada0["found"] == 120 and ada0["delta"] == 0 and ada0["track"] == "A3 VO PINS"
         assert ver["clean"] is True
         # a PINNED take one frame off is a FAIL — zero tolerance
-        tl.GetItemListInTrack("audio", 2)[1]._s += 1  # Ada's clip, on the VO track
+        tl.GetItemListInTrack("audio", 3)[0]._s += 1  # Ada's clip, on the PINS lane
         ver2 = server.verify_import(FIXTURE, "EDIT 01")
         ada = next(c for c in ver2["checks"] if c["check"].startswith("VO vo02"))
         assert ver2["overall"] == "FAIL" and ada["delta"] == 1 and not ada["pass"]
-        tl.GetItemListInTrack("audio", 2)[1]._s -= 1
+        tl.GetItemListInTrack("audio", 3)[0]._s -= 1
 
         # a second build under the same name is refused (create-only guardrail)
         again = server.build_timeline(FIXTURE, "EDIT 01")
@@ -536,14 +558,20 @@ def test_cue_colours_stable_and_not_blue():
     assert rapi.SHOT_MARKER_COLOR not in a.values()
 
 
-def _observed(v1, a1, markers, bins=True, vo=None):
+def _observed(v1, a1, markers, bins=True, vo=None, pins=None):
     """An observation. `vo`, when given, is a second audio track named VO — the
-    layout a correct build produces. Without it the observation carries A1
-    alone, which is what a pre-0.2.1 (or hand-made) timeline looks like."""
+    SPINE lane, carrying board-wide takes. `pins`, when given, is a third track
+    named VO PINS carrying the takes pinned to a shot. That is the layout a
+    correct build produces since 2026-09-08: the two doors OSIDE exports
+    through overlap in time, so they cannot share one track. Without either the
+    observation carries A1 alone, which is what a pre-0.2.1 (or hand-made)
+    timeline looks like."""
     manifest, _ = _fixture()
     tracks = [{"index": 1, "name": "A1", "items": a1}]
     if vo is not None:
         tracks.append({"index": 2, "name": rapi.VO_TRACK_NAME, "items": vo})
+    if pins is not None:
+        tracks.append({"index": len(tracks) + 1, "name": rapi.VO_PINS_TRACK_NAME, "items": pins})
     return {
         "binVideos": {os.path.basename(v["file"]) for v in manifest["videos"]} if bins else set(),
         "binAudio": {os.path.basename(a["file"]) for a in manifest["audio"]} if bins else set(),
@@ -573,10 +601,18 @@ def _good_timeline():
     ]
     a1 = []  # embedded audio from the shot clips — narration never lands here
     # lengths are the manifest's durationSeconds conformed to 23.976 (12.0s,
-    # 2.0s, 3.1s): the length gate is only real if the good fixture carries one
+    # 2.0s, 3.1s): the length gate is only real if the good fixture carries one.
+    # THE SPINE LANE — board-wide takes only. Ben's pin names a shot with no
+    # clip in this package, so he is a head take too and sits behind the
+    # narrator (unpinned takes have no frame contract).
     vo = [
         {"name": "vo01_narrator.mp3", "start": 0, "duration": 287},
-        {"name": "vo03_scene02-shot9_ben.mp3", "start": 0, "duration": 47},
+        {"name": "vo03_scene02-shot9_ben.mp3", "start": 287, "duration": 47},
+    ]
+    # THE PINS LANE — Ada is pinned to scene01_shot2 and lands on its frame.
+    # Under the old single-track layout the narrator held 0..287 and she was
+    # refused to the tail; keeping her here is what makes the gate honest.
+    pins = [
         {"name": "vo02_scene01-shot2_ada.mp3", "start": 120, "duration": 74},
     ]
     markers = {
@@ -587,14 +623,14 @@ def _good_timeline():
         145: {"color": "Green", "customData": rapi.CUE_TAG, "duration": 24},
         217: {"color": "Green", "customData": rapi.CUE_TAG, "duration": 48},
     }
-    return v1, a1, markers, vo
+    return v1, a1, markers, vo, pins
 
 
 def test_verify_pass():
     manifest, base = _fixture()
     cues, _ = handoff.load_cues(manifest, base)
-    v1, a1, markers, vo = _good_timeline()
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    v1, a1, markers, vo, pins = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
     assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
     assert all(c["pass"] for c in out["checks"])
     names = [c["check"] for c in out["checks"]]
@@ -610,7 +646,7 @@ def test_verify_pass():
 def test_verify_fails_on_order_stray_vo_delta_marker_and_cues():
     manifest, base = _fixture()
     cues, _ = handoff.load_cues(manifest, base)
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     # swap two clips, add a stray, shift Ada's VO by 3 frames, lose a shot marker, drop a cue
     v1 = [v1[1], v1[0], v1[2], {"name": "stray.mp4", "start": 416, "duration": 10}]
     v1[0]["start"], v1[1]["start"] = 0, 96
@@ -620,7 +656,7 @@ def test_verify_fails_on_order_stray_vo_delta_marker_and_cues():
     markers = dict(markers)
     del markers[216]
     del markers[217]
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
     assert out["overall"] == "FAIL"
     by = {c["check"]: c for c in out["checks"]}
     assert by["V1 clip order"]["pass"] is False and by["V1 clip order"]["firstDivergence"] == 0
@@ -633,7 +669,7 @@ def test_verify_fails_on_order_stray_vo_delta_marker_and_cues():
     assert by["cue markers"]["expected"] == 3 and by["cue markers"]["found"] == 2 and not by["cue markers"]["pass"]
     # a 1-frame VO miss is still a miss — tolerance is zero
     vo[2]["start"] = 1
-    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
     assert {c["check"]: c for c in out2["checks"]}[ada["check"]]["delta"] == 1
     assert out2["overall"] == "FAIL"
 
@@ -651,9 +687,9 @@ def test_verify_no_timeline_and_missing_bins_fail():
 def test_verify_untagged_blue_markers_count_as_shots():
     """Timelines built by the pre-tag server carry bare Blue markers."""
     manifest, base = _fixture()
-    v1, a1, _, vo = _good_timeline()
+    v1, a1, _, vo, pins = _good_timeline()
     markers = {0: {"color": "Blue"}, 120: {"color": "Blue"}, 216: {"color": "Blue"}}
-    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers, vo=vo), cues_expected=False)
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers, vo=vo, pins=pins), cues_expected=False)
     assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
 
 
@@ -755,30 +791,39 @@ def test_vo_lands_on_own_track_when_embedded_audio_fills_a1():
         answer = media_pool.AppendToTimeline([{"mediaPoolItem": narrator, "trackIndex": 1, "mediaType": 2, "recordFrame": 86400}])
         assert bool(answer) is True and len(tl.GetItemListInTrack("audio", 1)) == before
         # the fix: a VO track exists, named, and holds every take at its frame
-        assert tl.GetTrackCount("audio") == 2 and tl.GetTrackName("audio", 2) == "VO"
+        assert tl.GetTrackCount("audio") == 3
+        assert tl.GetTrackName("audio", 2) == "VO" and tl.GetTrackName("audio", 3) == "VO PINS"
         vo = [(x.GetName(), x.GetStart() - 86400, x.GetDuration()) for x in tl.GetItemListInTrack("audio", 2)]
         # Ben's pin has no clip → head → frame 0 is the narrator's → laid at
-        # the VO track's tail (241 = Ada's end), still on the VO track
-        assert vo == [("vo01_narrator.mp3", 0, 47), ("vo02_scene01-shot2_ada.mp3", 120, 121),
-                      ("vo03_scene02-shot9_ben.mp3", 241, 30)]
+        # the VO track's tail, still on the spine track
+        assert vo == [("vo01_narrator.mp3", 0, 47), ("vo03_scene02-shot9_ben.mp3", 47, 30)]
+        # the PINNED take has its own lane and its own frame
+        pins = [(x.GetName(), x.GetStart() - 86400, x.GetDuration()) for x in tl.GetItemListInTrack("audio", 3)]
+        assert pins == [("vo02_scene01-shot2_ada.mp3", 120, 121)]
         assert real["voUnderShot"] == 1 and real["voAtHead"] == 1 and real["voLoose"] == 1
         assert real["voTrack"] == "VO" and real["voTrackIndex"] == 2
         # the counts are backed by placements, not by return values: observe
         # agrees, and the gate finds every VO row on the VO track
         obs = rapi.observe_timeline(tl)
-        assert [t["name"] for t in obs["audioTracks"]] == ["Audio 1", "VO"]
+        assert [t["name"] for t in obs["audioTracks"]] == ["Audio 1", "VO", "VO PINS"]
         assert obs["a1"] == obs["audioTracks"][0]["items"]
         ver = server.verify_import(FIXTURE, "EDIT 01")
         rows = [c for c in ver["checks"] if c["check"].startswith("VO ") and "@" in c["check"]]
-        assert len(rows) == 3 and all(c["pass"] and c["track"] == "A2 VO" for c in rows), rows
+        assert len(rows) == 3 and all(c["pass"] for c in rows), rows
+        by_track = {c["check"].split()[1]: c["track"] for c in rows}
+        assert by_track["vo01_narrator.mp3"] == "A2 VO"
+        assert by_track["vo03_scene02-shot9_ben.mp3"] == "A2 VO"
+        assert by_track["vo02_scene01-shot2_ada.mp3"] == "A3 VO PINS"
         # and each take now also carries the row that ASSERTS it is off A1 —
         # the gate used to report the track without ever requiring it
         off_a1 = [c for c in ver["checks"] if c["check"].endswith("not on A1")]
-        assert len(off_a1) == 3 and all(c["pass"] and c["found"] == "A2 VO" for c in off_a1), off_a1
+        assert len(off_a1) == 3 and all(c["pass"] for c in off_a1), off_a1
+        assert {c["found"] for c in off_a1} == {"A2 VO", "A3 VO PINS"}
         assert ver["overall"] == "PASS", [c for c in ver["checks"] if not c["pass"]]
         # the dry-run plan says where narration goes: track VO, every row
         dry = server.build_timeline(FIXTURE, "EDIT 02", dry_run=True)
-        assert dry["plan"]["voTrack"] == "VO" and all(r["track"] == "VO" for r in dry["plan"]["vo"])
+        assert dry["plan"]["voTrack"] == "VO"
+        assert {r["mode"]: r["track"] for r in dry["plan"]["vo"]} == {"atHead": "VO", "underShot": "VO PINS"}
     finally:
         restore()
 
@@ -822,21 +867,23 @@ def test_clip_duration_frames_reads_audio_timecode():
 
 def test_verify_finds_vo_on_any_audio_track_and_names_it():
     manifest, base = _fixture()
-    v1, _a1, markers, vo = _good_timeline()
+    v1, _a1, markers, vo, pins = _good_timeline()
     markers = {f: m for f, m in markers.items() if m["customData"] == rapi.SHOT_TAG}
     tracks = [
         {"index": 1, "name": "Audio 1", "items": [{"name": n, "start": s} for n, s in
                                                   (("scene01_shot1A.mp4", 0), ("scene01_shot2.mp4", 120), ("scene02_shot1.mp4", 216))]},
         {"index": 2, "name": "VO", "items": [{"name": "vo01_narrator.mp3", "start": 0},
-                                              {"name": "vo02_scene01-shot2_ada.mp3", "start": 120},
                                               {"name": "vo03_scene02-shot9_ben.mp3", "start": 300}]},
+        # the PINNED take rides its own lane — the gate must still find it on
+        # whatever index it sits at, and name that index back
+        {"index": 3, "name": "VO PINS", "items": [{"name": "vo02_scene01-shot2_ada.mp3", "start": 120}]},
     ]
     obs = _observed(v1, [], markers)
     obs["timeline"]["audioTracks"] = tracks
     out = handoff.evaluate_verify(manifest, [], obs, cues_expected=False)
     by = {c["check"]: c for c in out["checks"]}
     assert out["overall"] == "PASS", [c for c in out["checks"] if not c["pass"]]
-    assert by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]["track"] == "A2 VO"
+    assert by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]["track"] == "A3 VO PINS"
     assert by["VO vo01_narrator.mp3 @ head"]["track"] == "A2 VO"
     # a VO track that is EMPTY (the live defect) → found null, FAIL, even
     # though A1 is full of embedded audio
@@ -1124,7 +1171,7 @@ def test_text_task_that_cannot_fit_inside_its_shot_is_reported_not_misplaced():
 def test_verify_counts_text_task_markers_by_tag():
     manifest, base = _fixture()
     tasks, _ = handoff.load_text_tasks(manifest, base)
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     # every task laid, correctly tagged
     for i, t in enumerate(tasks):
         markers[300 + i] = {"name": f"Text: {t['text']}", "customData": rapi.TEXT_TASK_TAG, "color": "Cream"}
@@ -1138,7 +1185,7 @@ def test_verify_counts_text_task_markers_by_tag():
 def test_verify_fails_when_a_text_task_marker_is_missing():
     manifest, base = _fixture()
     tasks, _ = handoff.load_text_tasks(manifest, base)
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     markers[300] = {"name": "Text: OPEN ALL NIGHT", "customData": rapi.TEXT_TASK_TAG, "color": "Cream"}
     observed = _observed(v1, a1, markers)
     cues, _ = handoff.load_cues(manifest, base)
@@ -1151,7 +1198,7 @@ def test_a_package_with_no_worklist_adds_no_check_and_still_passes():
     """A package exported before the studio wrote text-tasks.csv must not gain
     a failing row asserting zero."""
     manifest, base = _fixture()
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     observed = _observed(v1, a1, markers)
     cues, _ = handoff.load_cues(manifest, base)
     res = handoff.evaluate_verify(manifest, cues, observed, text_tasks=[])
@@ -1205,11 +1252,11 @@ def test_gate_fails_when_a_shot_marker_names_the_wrong_picture():
     """Rotating every shot marker onto a different clip used to return PASS:
     the gate compared sorted frame multisets and never read the marker's name."""
     manifest, base = _fixture()
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     rotated = dict(markers)
     rotated[0] = {**markers[0], "name": "shot 1"}       # belongs on 216
     rotated[216] = {**markers[216], "name": "shot 1A"}  # belongs on 0
-    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, rotated, vo=vo),
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, rotated, vo=vo, pins=pins),
                                   cues_expected=False)
     assert out["overall"] == "FAIL"
     row = {c["check"]: c for c in out["checks"]}["shot markers name their own shot"]
@@ -1223,7 +1270,7 @@ def test_gate_does_not_fail_a_build_that_skipped_a_task_by_design():
     """`expected` must mean what the build INTENDED to place. Scoring against
     the raw worklist made a deliberate, correct skip read as a failure."""
     manifest, base = _fixture()
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     tasks = [{"text": "SALE", "videoFile": "videos/scene01_shot2.mp4", "shotNumber": "2", "sceneName": "X"},
              {"text": "OPEN", "videoFile": "videos/scene01_shot2.mp4", "shotNumber": "2", "sceneName": "X"}]
     # a plan in which only the first task could be placed
@@ -1234,7 +1281,7 @@ def test_gate_does_not_fail_a_build_that_skipped_a_task_by_design():
     m[130] = {"color": "Cream", "name": "Text: SALE", "note": "", "duration": 1,
               "customData": rapi.TEXT_TASK_TAG}
     cues, _ = handoff.load_cues(manifest, base)
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, m, vo=vo),
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, m, vo=vo, pins=pins),
                                   text_tasks=tasks, planned_text_tasks=planned)
     row = {c["check"]: c for c in out["checks"]}["text-task markers"]
     assert row["expected"] == 1 and row["found"] == 1 and row["pass"], row
@@ -1246,7 +1293,7 @@ def test_gate_fails_narration_left_on_a1():
     """The 2026-08-16 defect's own shape. The gate reported which track a take
     sat on and never required it to be off A1."""
     manifest, base = _fixture()
-    v1, _a1, markers, vo = _good_timeline()
+    v1, _a1, markers, vo, pins = _good_timeline()
     out = handoff.evaluate_verify(manifest, [], _observed(v1, vo, markers), cues_expected=False)
     assert out["overall"] == "FAIL"
     rows = [c for c in out["checks"] if c["check"].endswith("not on A1")]
@@ -1255,9 +1302,9 @@ def test_gate_fails_narration_left_on_a1():
 
 def test_gate_requires_the_stock_marker_when_the_manifest_names_a_stock():
     manifest, base = _fixture()
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     cues, _ = handoff.load_cues(manifest, base)
-    obs = _observed(v1, a1, markers, vo=vo)
+    obs = _observed(v1, a1, markers, vo=vo, pins=pins)
     out = handoff.evaluate_verify(manifest, cues, obs,
                                   stock_intent="Stock intent: Kodak 2383 — x")
     by = {c["check"]: c for c in out["checks"]}
@@ -1266,15 +1313,15 @@ def test_gate_requires_the_stock_marker_when_the_manifest_names_a_stock():
     m = dict(markers)
     m[3] = {"color": "Cocoa", "name": "Stock intent", "note": "x", "duration": 1,
             "customData": rapi.STOCK_TAG}
-    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, m, vo=vo),
+    out2 = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, m, vo=vo, pins=pins),
                                    stock_intent="Stock intent: Kodak 2383 — x")
     assert out2["overall"] == "PASS", [c for c in out2["checks"] if not c["pass"]]
 
 
 def test_gate_surfaces_a_named_but_missing_worklist():
     manifest, base = _fixture()
-    v1, a1, markers, vo = _good_timeline()
-    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers, vo=vo),
+    v1, a1, markers, vo, pins = _good_timeline()
+    out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, markers, vo=vo, pins=pins),
                                   cues_expected=False,
                                   sidecar_warnings=["cues file named by the manifest is missing: /x/y.csv"])
     assert out["overall"] == "FAIL"
@@ -1453,8 +1500,8 @@ def test_the_vo_length_gate_can_actually_fail():
     cues, _ = handoff.load_cues(manifest, base)
 
     # POSITIVE CONTROL — the subject is in the set and it PASSES on a good build
-    v1, a1, markers, vo = _good_timeline()
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    v1, a1, markers, vo, pins = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
     row = next((c for c in out["checks"] if c["check"] == "VO vo02_scene01-shot2_ada.mp3 length"), None)
     assert row is not None, "the length row never ran — the gate has no subject"
     assert row["pass"] and row["expected"] == 74 and row["found"] == 74
@@ -1463,9 +1510,9 @@ def test_the_vo_length_gate_can_actually_fail():
     # RED — same frame, truncated audio. Ada is pinned to scene01_shot2 (frame
     # 120) and still lands exactly there, so every START row stays green: this
     # is the one shape only the length row can see.
-    v1, a1, markers, vo = _good_timeline()
-    vo[2]["duration"] = 20
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    v1, a1, markers, vo, pins = _good_timeline()
+    pins[0]["duration"] = 20
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
     by = {c["check"]: c for c in out["checks"]}
     assert by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]["pass"] is True, \
         "the start row must stay GREEN, or this test is not isolating length"
@@ -1475,11 +1522,137 @@ def test_the_vo_length_gate_can_actually_fail():
 
     # the slack is real: 2 frames short passes, 3 does not
     for short, want_pass in ((2, True), (3, False)):
-        v1, a1, markers, vo = _good_timeline()
-        vo[2]["duration"] = 74 - short
-        out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+        v1, a1, markers, vo, pins = _good_timeline()
+        pins[0]["duration"] = 74 - short
+        out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
         got = {c["check"]: c for c in out["checks"]}["VO vo02_scene01-shot2_ada.mp3 length"]
         assert got["pass"] is want_pass, (short, got)
+
+
+
+def test_a_spine_no_longer_swallows_the_pinned_takes():
+    """THE 2026-09-08 DEFECT, end to end.
+
+    OSIDE's exporter documents VO arriving through TWO doors and ships both:
+    board-wide takes (`placements: []`) and takes pinned to one shot. Laid on a
+    single track the spine went down first — a board-wide narration is often as
+    long as the finished piece — and every pinned take was then refused to the
+    tail. A real explainer package with a recorded spine plus any pin could not
+    pass verify: pins expected at 119/214 landed at 288/363.
+
+    The fix is a lane per door. This test asserts the PRECONDITION first (the
+    spine really does cover the pin's frame, or the test proves nothing) and
+    then that the pin lands on its own frame anyway.
+    """
+    project, restore = _fake_resolve()
+    try:
+        real = server.build_timeline(FIXTURE, "EDIT 01")
+        assert real["ok"], real
+        tl = project.GetCurrentTimeline()
+        spine = [(x.GetName(), x.GetStart() - 86400, x.GetDuration())
+                 for x in tl.GetItemListInTrack("audio", 2)]
+        pins = [(x.GetName(), x.GetStart() - 86400, x.GetDuration())
+                for x in tl.GetItemListInTrack("audio", 3)]
+
+        # PRECONDITION — the subject is in the set: the spine occupies Ada's
+        # pinned frame (120). Without this the lanes are untested luxury.
+        narrator = next(c for c in spine if c[0] == "vo01_narrator.mp3")
+        assert narrator[1] <= 120 < narrator[1] + narrator[2], \
+            f"the spine does not cover the pinned frame — this test proves nothing: {narrator}"
+
+        # …and the pin lands on its shot's frame regardless, on its own lane
+        assert tl.GetTrackName("audio", 2) == "VO"
+        assert tl.GetTrackName("audio", 3) == "VO PINS"
+        assert pins == [("vo02_scene01-shot2_ada.mp3", 120, 74)]
+        assert real["voUnderShot"] == 1
+
+        ver = server.verify_import(FIXTURE, "EDIT 01")
+        by = {c["check"]: c for c in ver["checks"]}
+        ada = by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]
+        assert ada["pass"] and ada["delta"] == 0 and ada["track"] == "A3 VO PINS"
+        assert by["VO vo02_scene01-shot2_ada.mp3 rides a pins lane"]["pass"]
+    finally:
+        restore()
+
+
+def test_the_pins_lane_gate_can_actually_fail():
+    """RED-PROOF for the lane row. A pinned take back on the spine track is the
+    regression this split exists to prevent, and it must read as exactly that
+    rather than as an unexplained frame delta."""
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+
+    # POSITIVE CONTROL — the row runs on a good build and passes.
+    # The pins lane is built with a LITERAL name rather than rapi's constant so
+    # that this test still expresses itself against source that has no such
+    # constant: the red must come from the predicate (no lane row) and not from
+    # an AttributeError raised before the gate is ever reached.
+    v1, a1, markers, vo, pins = _good_timeline()
+    obs = _observed(v1, a1, markers, vo=vo)
+    obs["timeline"]["audioTracks"].append({"index": 3, "name": "VO PINS", "items": pins})
+    out = handoff.evaluate_verify(manifest, cues, obs)
+    row = next((c for c in out["checks"]
+                if c["check"] == "VO vo02_scene01-shot2_ada.mp3 rides a pins lane"), None)
+    assert row is not None, "the lane row never ran — the gate has no subject"
+    assert row["pass"] and row["found"] == "A3 VO PINS"
+    assert out["overall"] == "PASS"
+
+    # RED — the pin is back on the spine lane, on its own frame. The FRAME row
+    # stays green, so this shape is only visible to the lane row.
+    v1, a1, markers, vo, pins = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo + pins))
+    by = {c["check"]: c for c in out["checks"]}
+    assert by["VO vo02_scene01-shot2_ada.mp3 @ scene01_shot2.mp4"]["pass"] is True, \
+        "the frame row must stay GREEN, or this test is not isolating the lane"
+    bad = by["VO vo02_scene01-shot2_ada.mp3 rides a pins lane"]
+    assert bad["pass"] is False and bad["found"] == "A2 VO"
+    assert out["overall"] == "FAIL"
+
+    # an UNPINNED take on the spine is correct and must NOT get a lane row
+    assert "VO vo01_narrator.mp3 rides a pins lane" not in by
+
+
+def test_colliding_pins_checkerboard_onto_a_second_lane():
+    """Pins can collide with EACH OTHER — two takes pinned to the same shot
+    want the same frame. The answer is another lane, never a slide to the tail:
+    that slide is the behaviour the split removes, and re-introducing it as the
+    overflow strategy would put the take back where nobody expects it."""
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    dst = os.path.join(tmp, "pkg")
+    shutil.copytree(os.path.dirname(FIXTURE), dst)
+    shutil.copyfile(os.path.join(dst, "vo", "vo02_scene01-shot2_ada.mp3"),
+                    os.path.join(dst, "vo", "vo04_scene01-shot2_ada2.mp3"))
+    mpath = os.path.join(dst, "manifest.json")
+    m = json.load(open(mpath))
+    ada = m["audio"][1]
+    second = json.loads(json.dumps(ada))          # same pin, a different take
+    second["file"] = "vo/vo04_scene01-shot2_ada2.mp3"
+    second["label"] = "Ada (alt)"
+    second["narrationId"] = "n4"
+    m["audio"] = [m["audio"][0], ada, second]     # spine, pin, colliding pin
+    json.dump(m, open(mpath, "w"))
+
+    project, restore = _fake_resolve(manifest_path=mpath, audio_frames=(288, 74, 74))
+    try:
+        real = server.build_timeline(mpath, "EDIT 01")
+        assert real["ok"], real
+        tl = project.GetCurrentTimeline()
+        names = [tl.GetTrackName("audio", i) for i in range(1, tl.GetTrackCount("audio") + 1)]
+        assert names == ["Audio 1", "VO", "VO PINS", "VO PINS 2"], names
+        lane1 = [(x.GetName(), x.GetStart() - 86400) for x in tl.GetItemListInTrack("audio", 3)]
+        lane2 = [(x.GetName(), x.GetStart() - 86400) for x in tl.GetItemListInTrack("audio", 4)]
+        # BOTH takes on their shot's frame — the second checkerboarded, not slid
+        assert lane1 == [("vo02_scene01-shot2_ada.mp3", 120)], lane1
+        assert lane2 == [("vo04_scene01-shot2_ada2.mp3", 120)], lane2
+        assert real["voUnderShot"] == 2 and real["voLoose"] == 0
+        ver = server.verify_import(mpath, "EDIT 01")
+        lanes = {c["check"]: c for c in ver["checks"] if c["check"].endswith("rides a pins lane")}
+        assert len(lanes) == 2 and all(c["pass"] for c in lanes.values()), lanes
+    finally:
+        restore()
+        shutil.rmtree(tmp)
 
 
 def test_vo_track_is_mono_by_decision_not_by_default():
@@ -1861,8 +2034,8 @@ def test_verify_sidecar_keys_every_clip_by_generation_id():
     import tempfile
     manifest, base = _fixture()
     cues, _ = handoff.load_cues(manifest, base)
-    v1, a1, markers, vo = _good_timeline()
-    observed = _observed(v1, a1, markers, vo=vo)
+    v1, a1, markers, vo, pins = _good_timeline()
+    observed = _observed(v1, a1, markers, vo=vo, pins=pins)
     result = handoff.evaluate_verify(manifest, cues, observed)
     side = handoff.verify_sidecar(manifest, observed, result, "2026-09-06T00:00:00Z")
     assert side["format"] == "oside-verify/1" and side["overall"] == "PASS"
@@ -1882,9 +2055,9 @@ def test_verify_sidecar_keys_every_clip_by_generation_id():
 def test_verify_sidecar_names_the_unplaced_and_the_unkeyed():
     manifest, base = _fixture()
     cues, _ = handoff.load_cues(manifest, base)
-    v1, a1, markers, vo = _good_timeline()
+    v1, a1, markers, vo, pins = _good_timeline()
     v1 = v1[:-1]  # the last clip never landed
-    observed = _observed(v1, a1, markers, vo=vo)
+    observed = _observed(v1, a1, markers, vo=vo, pins=pins)
     result = handoff.evaluate_verify(manifest, cues, observed)
     last = manifest["videos"][-1]
     side = handoff.verify_sidecar(manifest, observed, result, "2026-09-06T00:00:00Z")
@@ -1922,8 +2095,8 @@ def test_pending_take_is_named_on_its_shot_marker_and_in_the_gate():
     assert m["color"] == "Blue"
     approved = [x for x in plan["markers"] if x.get("outcome") == "approved"]
     assert approved and not any("TAKE" in x["name"] for x in approved)
-    v1, a1, markers, vo = _good_timeline()
-    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo))
+    v1, a1, markers, vo, pins = _good_timeline()
+    out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
     row = next(c for c in out["checks"] if c["check"] == "unapproved takes on V1")
     assert row["pass"] is True and row["found"] == 1 and row.get("advisory") is True
     assert "shot 2" in row["detail"] or "1A" in row["detail"] or "2" in row["detail"]
