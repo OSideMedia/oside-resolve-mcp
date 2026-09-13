@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --quiet -e .
+      - run: python -m pip install --quiet -e '.[dev]'
       - name: plain runner (CI=1 — the skill is absent here by construction)
         env:
           CI: "1"
