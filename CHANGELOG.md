@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.1 — 2026-09-13
+
 ### Fixed — the public templates no longer publish the operator's filesystem (R-1, ow-8543c5)
 
 - **Both `.drp` templates carried the operator's home directory (the account name) and

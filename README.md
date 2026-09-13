@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.6.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.6.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
