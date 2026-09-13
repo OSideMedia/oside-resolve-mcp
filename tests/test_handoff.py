@@ -1683,9 +1683,64 @@ TEMPLATE_LEAK_PATTERNS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# THE SECOND TRANSFORM (audit 2026-09-12, R-1, ow-8543c5). Unzipped, a member is
+# XML — but its <FieldsBlob> elements are HEX-ENCODED byte strings, and inside
+# them Resolve stores a zstd frame (project.xml, at a small offset behind a
+# header) or a zlib stream (MpFolder.xml). The 2026-09-08 audit "by hand" read
+# the XML, saw bin and track names, and called it clean; the operator's home
+# directory, login and every mounted-volume label sat one decode further in,
+# public, for five days. A guard is only as good as what it is allowed to see:
+# every hex run is decoded, every compressed layer inside it is opened at any
+# offset, and the text is read as UTF-8 AND UTF-16-LE (Resolve stores strings
+# both ways). A decoder that is missing is a RED, never a skip.
+# ---------------------------------------------------------------------------
+
+def _inner_texts(member_bytes):
+    """Every text this member carries, one decode layer at a time: the member
+    itself, then each hex-encoded blob, then each zstd / zlib layer found inside
+    those blobs, each read as UTF-8 and as UTF-16-LE. Yields (layer, text)."""
+    import zlib
+    try:
+        import zstandard
+    except ImportError as e:  # pragma: no cover - the environment is the subject here
+        raise AssertionError(
+            "the template leak gate cannot open Resolve's zstd layer: install the dev extra "
+            "(pip install -e '.[dev]' / uv sync --extra dev) — a missing decoder is a red, not a pass"
+        ) from e
+    yield ("member", member_bytes.decode("utf-8", "ignore"))
+    for i, hexrun in enumerate(re.findall(rb"[0-9a-fA-F]{64,}", member_bytes)):
+        try:
+            dec = bytes.fromhex(hexrun.decode("ascii"))
+        except ValueError:
+            continue
+        layers = [("hex#%d" % i, dec)]
+        for mo in re.finditer(rb"\x28\xb5\x2f\xfd", dec):
+            try:
+                layers.append(("hex#%d/zstd@%d" % (i, mo.start()), zstandard.ZstdDecompressor().decompressobj().decompress(dec[mo.start():])))
+            except Exception as e:  # noqa: BLE001
+                layers.append(("hex#%d/zstd@%d" % (i, mo.start()), b"UNREADABLE zstd frame: " + str(e).encode()))
+        for mo in re.finditer(rb"\x78[\x01\x5e\x9c\xda]", dec):
+            try:
+                text = zlib.decompressobj().decompress(dec[mo.start():])
+            except Exception:  # noqa: BLE001 - not every 0x78 is a stream
+                continue
+            if len(text) > 40:
+                layers.append(("hex#%d/zlib@%d" % (i, mo.start()), text))
+        for layer, raw in layers:
+            yield (layer, raw.decode("utf-8", "ignore"))
+            # UTF-16 at BOTH byte alignments: a string inside a binary record can start on
+            # an odd offset, and a decode from 0 then reads every character as garbage
+            yield (layer + "/utf16", raw.decode("utf-16-le", "ignore"))
+            yield (layer + "/utf16+1", raw[1:].decode("utf-16-le", "ignore"))
+
+
 def _scan_drp(path):
     """Every leak in one .drp, as (member, kind, sample). Extracts first: the
-    archive is the transform, and a scan of the compressed bytes sees nothing."""
+    archive is the transform, and a scan of the compressed bytes sees nothing —
+    then decodes the hex blobs and the zstd/zlib layers inside them, which is
+    where the 2026-09-08 audit's "clean" templates held the operator's home
+    directory (R-1)."""
     import zipfile
     hits = []
     if not zipfile.is_zipfile(path):
@@ -1698,14 +1753,20 @@ def _scan_drp(path):
             if member.endswith("/"):
                 continue
             try:
-                blob = z.read(member).decode("utf-8", "ignore")
+                raw = z.read(member)
             except Exception as e:  # noqa: BLE001
                 hits.append((member, "unreadable", str(e)))
                 continue
-            for pattern, kind in TEMPLATE_LEAK_PATTERNS:
-                m = re.search(pattern, blob)
-                if m:
-                    hits.append((member, kind, m.group(0)[:80]))
+            seen = set()
+            for layer, text in _inner_texts(raw):
+                if text.startswith("UNREADABLE"):
+                    hits.append((member + " :: " + layer, "unreadable", text[:80]))
+                    continue
+                for pattern, kind in TEMPLATE_LEAK_PATTERNS:
+                    m = re.search(pattern, text)
+                    if m and (layer, kind) not in seen:
+                        seen.add((layer, kind))
+                        hits.append((member + " :: " + layer, kind, m.group(0)[:80]))
     return hits
 
 
@@ -1734,6 +1795,33 @@ def test_no_template_publishes_a_path_an_email_or_a_hostname():
         with open(planted, "rb") as fh:
             raw = fh.read().decode("utf-8", "ignore")
         assert "/Users/someone" not in raw, "the fixture did not actually compress — control is void"
+
+    # POSITIVE CONTROL, ONE LAYER IN (R-1): the member's XML is clean; a home path
+    # sits in a zstd frame behind a header inside a hex-encoded <FieldsBlob>, and a
+    # volume label in a zlib stream inside another — Resolve's own shapes, measured
+    # on the published templates 2026-09-13 (zstd at offset 44 in project.xml,
+    # zlib at offset 4 in MpFolder.xml). Both are UTF-16-LE, as Resolve writes them.
+    import zlib
+    import zstandard
+    with tempfile.TemporaryDirectory() as td:
+        planted = os.path.join(td, "DEEP.drp")
+        home = "/Users/someone/Movies/render.mov".encode("utf-16-le")
+        volume = "/Volumes/T7 PROJECTS/clip.mov".encode("utf-16-le")
+        zstd_blob = (b"\x00" * 44) + zstandard.ZstdCompressor().compress(b"\x00\x00" + home + b"\x00\x00")
+        zlib_blob = b"\x00\x00\x00\x00" + zlib.compress(b"pad" + volume)
+        with zipfile.ZipFile(planted, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("project.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % zstd_blob.hex())
+            z.writestr("MediaPool/Master/MpFolder.xml", "<SM_Folder><FieldsBlob>%s</FieldsBlob></SM_Folder>" % zlib_blob.hex())
+        deep = _scan_drp(planted)
+        kinds = {kind for _m, kind, _s in deep}
+        layers = {m for m, _k, _s in deep}
+        assert "a macOS home path" in kinds and any("zstd@" in m for m in layers), "the scanner cannot see a home path through hex + zstd: %r" % (deep,)
+        assert "a mounted volume" in kinds and any("zlib@" in m for m in layers), "the scanner cannot see a volume through hex + zlib: %r" % (deep,)
+        # COUNTEREXAMPLE — the pre-fix scan (the members' own text) sees neither, which is
+        # exactly how two templates carrying the operator's home directory were called clean
+        with zipfile.ZipFile(planted) as z:
+            flat = "".join(z.read(n).decode("utf-8", "ignore") for n in z.namelist())
+        assert not any(re.search(p, flat) for p, _k in TEMPLATE_LEAK_PATTERNS), "the fixture leaks in plain XML — the deep control is void"
 
     # THE SUBJECT SET, NAMED AND NON-EMPTY. An empty templates/ dir would make
     # every assertion below vacuously true, so the set is asserted first and

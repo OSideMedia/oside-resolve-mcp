@@ -6,3 +6,7 @@ license-files = ["LICENSE"]
 description = "OSIDE studio → DaVinci Resolve bridge: build a Resolve project from an oside-davinci/v1 export package (template copy, bin imports, shot-order timeline with markers)."
 requires-python = ">=3.10"
 dependencies = ["mcp>=1.2.0,<2"]
+
+[project.optional-dependencies]
+# the template leak gate opens Resolve's zstd layer (tests/test_handoff.py, R-1)
+dev = ["zstandard>=0.22"]

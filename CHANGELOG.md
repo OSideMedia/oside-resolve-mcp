@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — the public templates no longer publish the operator's filesystem (R-1, ow-8543c5)
+
+- **Both `.drp` templates carried the operator's home directory (the account name) and
+  mounted-volume labels**, one decode layer below what the leak gate could see: a `.drp` is
+  a zip of XML, and the XML's `<FieldsBlob>` elements are hex-encoded records holding a
+  zstd frame (`project.xml`, behind a 44-byte record header) or a zlib stream
+  (`MpFolder.xml`). The 2026-09-08 hand audit read the XML, saw bin and track names, and
+  called it clean. Public since 2026-09-08.
+- **The gate now decodes every hex blob and opens every zstd/zlib layer inside it**, reading
+  the text as UTF-8 and UTF-16-LE at both byte alignments; a missing decoder is a red, never
+  a skip (`zstandard` is the new `dev` extra; CI installs `.[dev]`). It carries a second
+  positive control one layer in — a home path in a hex-encoded zstd frame and a volume label
+  in a hex-encoded zlib stream, with the pre-fix member-text scan as the counterexample that
+  sees neither — and it went RED on the published templates before they were cleaned
+  (five findings: two home paths, three volume labels).
+- **The templates were scrubbed in place**, not re-exported: every leaking path inside the
+  compressed layers was replaced by a neutral path of the same byte length
+  (`/Users/<login>` → `/private/var/tmp/x`, each `/Volumes/<label>` → `/private/var/tmp/sc…`),
+  the layer recompressed, and the record header's two big-endian length fields (frame+9,
+  frame+1) patched — the first cut skipped that patch and the 60 fps template opened at
+  24 fps / 1920 wide. Verified in Resolve 21.1: both scrubbed templates import and read back
+  identical to the originals (frame rate, resolution, colour science, every bin, every
+  timeline with its track counts, render presets), then the probe projects were deleted.
+- The old bytes remain in history; the public history rewrite is Peter's call (b), recipe in
+  the PR.
+
 ### Changed — the README is a front door, not the design document
 
 - `Install` was at **line 178 of 280** — a reader scrolled 63% of the document
