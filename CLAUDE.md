@@ -2,9 +2,11 @@
 
 The OSIDE studio → DaVinci Resolve bridge. A small, deterministic MCP server
 (Python, stdio, local only) that turns an `oside-davinci/v1` export package into
-a Resolve project. Four modules: `resolve_api.py` (the Resolve surface),
-`handoff.py` (the pure half — plan and gate, no Resolve imports), `server.py`
-(the MCP tools), `pipeline.py` (the whole handoff as one command).
+a Resolve project — and, since 0.7.0, lays a spotted SFX pass onto an
+existing timeline. Five modules: `resolve_api.py` (the Resolve surface),
+`handoff.py` (the pure half — plan and gate, no Resolve imports), `sfx.py` (the
+pure half of `place_sfx` — plan, spans, export diff), `server.py` (the MCP
+tools), `pipeline.py` (the whole handoff as one command).
 
 Product detail lives in `README.md`; what changed and why in `CHANGELOG.md`.
 
@@ -23,8 +25,9 @@ since Studio 21.1, inside the app bundle at
 control belongs now: arbitrary `run_script`, plus `search_scripting_api` /
 `get_scripting_api` / `get_whats_new`, version-matched to the Resolve actually
 running and therefore the OWNING source for call shapes. **A fixed pipeline
-gets fixed tools so it runs identically every time.** Ten tools, one recipe.
-Every proposal to add a tool "while we're here" is answered by that sentence.
+gets fixed tools so it runs identically every time.** Twelve tools, two
+recipes (see "Decided" for the second). Every proposal to add a tool "while
+we're here" is answered by that sentence.
 
 **It does not make this server redundant, and it is not a safe substitute for
 it.** Its `run_script` makes every mistake in the ANTI-PATTERNS below available
@@ -136,10 +139,13 @@ of them. If one looks wrong, say so and leave it.**
   21.0.4.5" is the format. A vendor claim you have not reproduced is not a fact
   — say whose claim it is. A fabricated quirk in a comment outlives the session
   that invented it.
-- The authority on the API is on this machine:
-  `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/README.txt`
-  (~1150 lines). Probe it before guessing, and prefer it to any third-party
-  docstring.
+- The authority on the API is on this machine, in
+  `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/`.
+  On 21.0.x that was `README.txt` (~1150 lines); **21.1.1 ships `README.md`
+  (628 lines, mostly deprecations) plus `DaVinciResolveScript.pyi` (2848 lines,
+  the signatures)** and no `README.txt` [checked 2026-10-25]. Older comments
+  here still cite `README.txt` line numbers — they quote the 21.0 file. Probe
+  the stubs before guessing, and prefer them to any third-party docstring.
 
 ## Decided, with the reason — do not reopen without arguing against it
 
@@ -158,6 +164,17 @@ of them. If one looks wrong, say so and leave it.**
   footage carrying BGM nobody asked for; these are the film's own shots. Same
   mechanism, opposite intent. Narration rides its own track because it is
   *separate work*, not because A1 is "taken".
+
+- **`place_sfx` and `snapshot_timeline` are the second recipe, by the owner's
+  call** [decided 2026-10-25]. The first SFX pass on a finished explainer was
+  laid by hand through Blackmagic's `run_script`, with this repo's defences
+  re-typed into each script: one collision read before any write, a re-read
+  after every append, an OTIO export before and after to prove no other track
+  moved. That is exactly the "mistakes available fresh" case above, so the
+  defences became a fixed tool. Scope is deliberately narrow: ONE existing
+  audio track of the CURRENT timeline, existing bin, never creates tracks or
+  bins, never extends the timeline, never saves, never deletes a stray it laid
+  (it reports it). Widening any of those reopens this decision.
 
 ## Open product calls
 

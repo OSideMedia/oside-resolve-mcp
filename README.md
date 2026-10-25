@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.6.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
@@ -276,9 +276,52 @@ The full surface, with the behaviour each one guarantees.
    worklist the manifest names but which is not on disk is reported rather than
    silently passing.
 
+5. `snapshot_timeline(out_path, timeline_name=None)` (0.7.0) — export a
+   timeline (the current one by default) as **OTIO** to a NEW file, and return
+   a per-track summary (`kind`, `index`, `name`, clip count) with the rate and
+   the start/end frames. Read-only on the project; refuses an existing file.
+   This is what a spotting pass reads: which piece of picture sits where, what
+   covers it, which sound lanes are already busy.
+6. `place_sfx(plan_path, dry_run=False, resume=False)` (0.7.0) — lay a spotted sound-effects
+   pass onto **one named audio track of an existing timeline**, from an
+   `oside-sfx-plan/v1` file:
+
+   ```json
+   {"schema": "oside-sfx-plan/v1", "timeline": "YT", "track": "SFX 3", "bin": "SFX",
+    "placements": [{"file": "/abs/path/check.wav", "sourceIn": 0, "sourceOut": 1.633,
+                    "record": 609, "label": "part 1 — check", "kind": "CHECK"}]}
+   ```
+
+   `record` is a timeline frame relative to the timeline's start; trims are
+   **seconds**, because the frame unit is the pool item's own rate and Resolve
+   picks that at import (a WAV can arrive tagged 25 fps on a 60 fps project).
+   The guarantees, in order: refuses unless the plan's timeline is the
+   **current** one (it never switches your editor), the track exists exactly
+   once and the bin exists — it never creates tracks or bins; judges every
+   collision — with the track, with other rows, past the timeline's end, past
+   the end of the file — from **one read before any write**, so a refused plan
+   writes nothing; imports what the pool lacks (matched by `File Path`, never
+   by clip name) and puts your current bin back; exports the timeline, then
+   appends **one clip at a time and re-reads the track** after each — the new
+   item must sit at its frame with its length and its trim, and the first
+   mismatch stops the run (no retry, no delete: the stray is reported); then
+   exports again and proves **every other track is identical**, the target
+   holds exactly what it held plus what was laid, and the timeline end did not
+   move (`diff.checks`). A clip already at its frame with its length reads
+   `alreadyPlaced`, so a re-run is a no-op. A **partly** placed plan is refused
+   unless `resume=True`: rows missing from a track the editor has worked on
+   were most likely deleted on purpose, and re-running would put them back —
+   `resume` is for finishing a run that stopped. `dry_run=True` touches nothing
+   and returns `toPlace`, `alreadyPlaced`, `partial`, `wouldImport` and
+   `collisions`.
+   **It never saves** — `save_project`, then the same plan with
+   `dry_run=True`: every row should come back `alreadyPlaced`.
+   Any producer that writes the schema can use it; a spotting pass that reads
+   the motion-graphics source and a `snapshot_timeline` export is the intended one.
+
 Plus `resolve_status` (with a `capabilities` block — `{"manifest":
 "oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2",
-"vo_track","look","text_tasks"], "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
+"vo_track","look","text_tasks", …, "sfx_plan"], "sfxPlan": "oside-sfx-plan/v1", "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
 before it relies on a feature), `launch_resolve`, `list_templates`, and
 `export_template(kind)` (snapshot a live template project to `templates/`).
 One MCP prompt, `handoff`, carries the recipe below. Every tool declares MCP
@@ -390,12 +433,19 @@ appear in the tool's `error` field.
 | `manifest.look.schema 'X' is not oside-look/1` | the package carries a newer look block than this MCP reads | update oside-resolve-mcp, or re-export from a studio build that writes v1 |
 | `pipeline crashed before a report could be built: …` | an exception past the manifest load — the report still prints, with the Python error in `error` | read the error; if it names a manifest key, it is a shape this table does not know yet — file it |
 | `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |
+| `The current timeline is 'X', not 'Y'.` | `place_sfx` lays into the CURRENT timeline only, and will not switch your editor | open the plan's timeline in Resolve, then run the plan again |
+| `Expected exactly one audio track named 'X' …, found N.` | the plan names a track that is missing, or two tracks share the name | add or rename the track in Resolve — `place_sfx` never creates or renames tracks |
+| `No bin named 'X'. place_sfx imports into an EXISTING bin only.` | the plan's `bin` is not in the media pool (often a typo) | fix the plan, or create the bin in Resolve |
+| `outcome: refused` with `collisions` | a row overlaps a clip already on the track, another row, the timeline's end, or the end of its file — judged before any write, so nothing was placed | move or trim the rows it names; nothing to undo |
+| `outcome: refused` — `… rows are already on the track and … are not` | the plan is partly on the track: a run that stopped, or an editor who deleted some of the cues | if the editor cut them, leave it — that is the edit. To finish a run that stopped, pass `resume=True` |
+| `outcome: failed` with `failure.landed` | Resolve laid a clip somewhere other than its frame, length or trim (or not at all); the run stopped there | remove the item `landed` names in Resolve, then re-run — re-run with `resume=True` — the rows already laid read `alreadyPlaced` |
+| `Timeline.Export (OTIO) answered … and wrote 0 bytes` | no before/after snapshot to judge with, so nothing was laid | check the disk has room and no modal is open in Resolve; retry |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Two things worth knowing before you
-open a PR: the ten tools are deliberately few (a fixed pipeline gets fixed
+open a PR: the twelve tools are deliberately few (a fixed pipeline gets fixed
 tools), and the ANTI-PATTERNS in `CLAUDE.md` are load-bearing — each was bought
 with a live walk, and each looks wrong until you have hit it.
 

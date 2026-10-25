@@ -49,8 +49,9 @@ class FakeItem:
     Before this the fake had no SetCDL and no versions at all, so apply_look's
     impure half had never been exercised by anything.
     """
-    def __init__(self, name, start, duration):
+    def __init__(self, name, start, duration, left_offset=0, media=None, embedded=False):
         self._n, self._s, self._d = name, start, duration
+        self._left, self._media, self._embedded = left_offset, media, embedded
         self._versions = {"Version 1": None}
         self._current = "Version 1"
 
@@ -62,6 +63,15 @@ class FakeItem:
 
     def GetDuration(self):
         return self._d
+
+    def GetLeftOffset(self, subframe_precision=False):
+        """Timeline frames of source before the in-point (measured 2026-10-25 on
+        21.1.1: a 25 fps item trimmed from item frame 5 on a 60 fps timeline
+        answers 12)."""
+        return float(self._left)
+
+    def GetMediaPoolItem(self):
+        return self._media
 
     # ---- colour versions ----
     def GetVersionNameList(self, version_type=0):
@@ -91,9 +101,26 @@ class FakeItem:
         return self._versions.get(version)
 
 
+_EXPORT_OTIO, _EXPORT_NONE, _EXPORT_EDL = object(), object(), object()
+
+
 class FakeTimeline:
-    def __init__(self, name="EDIT 01", start=86400, v1=(), a1=(), markers=None, audio_tracks=1):
+    """`fps`: the timeline's own rate, answered by GetSetting — None leaves the
+    rate to the project, and the clip-info append then lays trims frame for
+    frame as the older cells expect.
+
+    `tail_tracks`: audio tracks that model the 21.1.0.14 PLAIN-TRACK collision
+    (measured 2026-09-08): a clip aimed at an occupied frame lands at the track
+    TAIL, truncated to about min(recordFrame, clipLength), behind a live,
+    honest proxy. Every other track keeps the embedded-audio mode the older
+    cells were written against: nothing placed, a truthy answer.
+    # ponytail: tail mode is opt-in per track; make it the default for plain tracks once append_audio's loose path is re-judged against it
+    """
+    def __init__(self, name="EDIT 01", start=86400, v1=(), a1=(), markers=None, audio_tracks=1,
+                 fps=None, end=None, tail_tracks=(), export_bytes=None):
         self._name, self._start = name, start
+        self._fps, self._end, self._tail = fps, end, set(tail_tracks)
+        self._export_bytes = export_bytes
         self._tracks = {("video", 1): list(v1), ("audio", 1): list(a1)}
         for i in range(2, audio_tracks + 1):
             self._tracks[("audio", i)] = []
@@ -108,6 +135,59 @@ class FakeTimeline:
 
     def GetStartFrame(self):
         return self._start
+
+    def GetEndFrame(self):
+        if self._end is not None:
+            return self._end
+        ends = [x.GetStart() + x.GetDuration() for lane in self._tracks.values() for x in lane]
+        return max(ends, default=self._start)
+
+    def GetSetting(self, key):
+        if key == "timelineFrameRate" and self._fps is not None:
+            return str(self._fps)
+        return None
+
+    def Export(self, path, export_type, export_subtype):
+        """OTIO only, and only with the LIVE enum — a string is refused the way
+        Resolve refuses it (no file, False). Writes the shape Resolve writes
+        (measured 2026-10-25 on 21.1.1): video tracks then audio tracks, each a
+        run of Gap.1 / Clip.2 children at the timeline rate. `export_bytes=0`
+        reproduces the True-over-an-empty-file lie of anti-pattern 9."""
+        if export_type is not _EXPORT_OTIO:
+            return False
+        if self._export_bytes == 0:
+            open(path, "w").close()
+            return True
+        rate = float(self._fps or 24)
+
+        def rt(v):
+            return {"OTIO_SCHEMA": "RationalTime.1", "rate": rate, "value": float(v)}
+
+        def track(kind, idx):
+            pos, kids = self._start, []
+            for x in sorted(self._tracks[(kind, idx)], key=lambda x: x.GetStart()):
+                if x.GetStart() > pos:
+                    kids.append({"OTIO_SCHEMA": "Gap.1", "metadata": {}, "name": "",
+                                 "source_range": {"OTIO_SCHEMA": "TimeRange.1", "duration": rt(x.GetStart() - pos),
+                                                  "start_time": rt(0)}, "effects": [], "markers": [], "enabled": True})
+                kids.append({"OTIO_SCHEMA": "Clip.2", "metadata": {}, "name": x.GetName(),
+                             "source_range": {"OTIO_SCHEMA": "TimeRange.1", "duration": rt(x.GetDuration()),
+                                              "start_time": rt(x._left)}, "effects": [], "markers": [], "enabled": True})
+                pos = x.GetStart() + x.GetDuration()
+            meta = {"Resolve_OTIO": {"Audio Type": self.GetTrackSubType(kind, idx).title()}} if kind == "audio" else {}
+            return {"OTIO_SCHEMA": "Track.1", "metadata": meta, "name": self.GetTrackName(kind, idx),
+                    "source_range": None, "effects": [], "markers": [], "enabled": True,
+                    "children": kids, "kind": kind.title()}
+
+        order = sorted(self._tracks, key=lambda k: (k[0] != "video", k[1]))
+        doc = {"OTIO_SCHEMA": "Timeline.1", "metadata": {"Resolve_OTIO": {"Resolve OTIO Meta Version": "1.0"}},
+               "name": self._name, "global_start_time": rt(self._start),
+               "tracks": {"OTIO_SCHEMA": "Stack.1", "metadata": {}, "name": "", "source_range": None,
+                          "effects": [], "markers": [], "enabled": True,
+                          "children": [track(k, i) for k, i in order]}}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        return True
 
     def GetTrackCount(self, kind):
         return sum(1 for k, _ in self._tracks if k == kind)
@@ -163,8 +243,8 @@ class FakeClip:
     (Seedance 2.x default) carry EMBEDDED AUDIO; audio clips answer '' for
     Frames and only a `Duration` timecode at `FPS` — exactly what Resolve
     21.0.4 hands back [live walk 2026-08-16]."""
-    def __init__(self, name, frames, fps=24.0, embedded_audio=None):
-        self._n, self._f, self._fps = name, frames, fps
+    def __init__(self, name, frames, fps=24.0, embedded_audio=None, path=None):
+        self._n, self._f, self._fps, self._path = name, frames, fps, path
         self._audio_only = name.endswith((".mp3", ".wav"))
         self._embedded = (not self._audio_only) if embedded_audio is None else embedded_audio
 
@@ -180,6 +260,8 @@ class FakeClip:
             return self._fps
         if key == "Type":
             return "Audio" if self._audio_only else ("Video + Audio" if self._embedded else "Video")
+        if key == "File Path":
+            return self._path
         return None
 
 
@@ -212,15 +294,44 @@ class FakeMediaPool:
       * a clip-info append aimed at an OCCUPIED frame answers a truthy
         `[<PyRemoteObject>]` and places NOTHING (never False).
     """
-    def __init__(self, project, root):
+    def __init__(self, project, root, disk=None):
         self._project, self._root, self._current = project, root, root
+        # path -> (frames, fps) for files ImportMedia can read; anything else
+        # is a file Resolve cannot open, and imports nothing
+        self._disk = dict(disk or {})
+        self.imports = []
 
     def GetRootFolder(self):
         return self._root
 
+    def GetCurrentFolder(self):
+        return self._current
+
     def SetCurrentFolder(self, folder):
         self._current = folder
         return True
+
+    def ImportMedia(self, paths):
+        """A plain list of path strings imports into the CURRENT folder. The
+        documented dict form returns None and imports nothing on 21.1 (measured
+        2026-09-08). A path already in the folder comes back as the same item
+        (idempotent across calls, measured 2026-08-25 on 21.0.4.5)."""
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            return None
+        out = []
+        for p in paths:
+            self.imports.append(p)
+            have = [c for c in self._current._clips if c.GetClipProperty("File Path") == p]
+            if have:
+                out.append(have[0])
+                continue
+            if p not in self._disk:
+                continue
+            frames, fps = self._disk[p]
+            clip = FakeClip(os.path.basename(p), frames, fps=fps, path=p)
+            self._current._clips.append(clip)
+            out.append(clip)
+        return out
 
     def CreateEmptyTimeline(self, name):
         tl = FakeTimeline(name=name, start=86400)
@@ -236,15 +347,31 @@ class FakeMediaPool:
                 kind = "audio" if it.get("mediaType") == 2 else "video"
                 track = (kind, int(it.get("trackIndex") or 1))
                 start = it["recordFrame"]
+                left = 0
                 if "endFrame" in it:
-                    length = it["endFrame"] - it["startFrame"]  # endFrame exclusive, as Resolve does it
+                    left = it.get("startFrame", 0)
+                    length = it["endFrame"] - left  # endFrame exclusive, as Resolve does it
+                    # a mismatched source rate conforms by DURATION and floors
+                    # (anti-pattern 7) — only when the timeline states its rate
+                    src = float(clip.GetClipProperty("FPS") or 0)
+                    if tl._fps and src and abs(src - float(tl._fps)) >= 0.05:
+                        k = float(tl._fps) / src
+                        length, left = max(1, int(length * k)), int(left * k)
                 else:
                     length = rapi.clip_duration_frames(clip)
                 lane = tl._tracks.setdefault(track, [])
+                if track in {("audio", i) for i in tl._tail}:
+                    held = [x for x in lane if x.GetStart() <= start < x.GetStart() + x.GetDuration()]
+                    if held and not any(x._embedded for x in held):
+                        tail = max(x.GetStart() + x.GetDuration() for x in lane)
+                        item = FakeItem(clip.GetName(), tail, max(1, min(start - tl._start, length)), left, clip)
+                        lane.append(item)
+                        out.append(item)   # live and honest, and in the wrong place
+                        continue
                 if any(x.GetStart() == start for x in lane):
                     out.append(_RemoteObject())   # truthy — and nothing placed
                     continue
-                item = FakeItem(clip.GetName(), start, length)
+                item = FakeItem(clip.GetName(), start, length, left, clip)
                 lane.append(item)
                 out.append(item)
             else:
@@ -258,7 +385,7 @@ class FakeMediaPool:
                 lane.append(item)
                 out.append(item)
                 if not audio_only and it.GetClipProperty("Type") == "Video + Audio":
-                    tl._tracks[("audio", 1)].append(FakeItem(it.GetName(), end, length))
+                    tl._tracks[("audio", 1)].append(FakeItem(it.GetName(), end, length, embedded=True))
         return out
 
 
@@ -332,6 +459,8 @@ def _fake_resolve(monkeypatch_target=server, videos_frames=(120, 96, 200), audio
 
         def GetVersionString(self):
             return "fake"
+
+        EXPORT_OTIO, EXPORT_NONE, EXPORT_EDL = _EXPORT_OTIO, _EXPORT_NONE, _EXPORT_EDL
 
     orig_connect = rapi.connect
     rapi.connect = lambda: Resolve()
@@ -722,7 +851,8 @@ def test_tool_annotations_prompt_and_capabilities():
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
     assert {"resolve_status", "launch_resolve", "list_templates", "export_template",
-            "create_project", "import_package", "build_timeline", "verify_import"} <= names
+            "create_project", "import_package", "build_timeline", "verify_import",
+            "place_sfx", "snapshot_timeline"} <= names
     for t in tools:
         a = t.annotations
         assert a is not None, f"{t.name} has no annotations"
@@ -733,6 +863,11 @@ def test_tool_annotations_prompt_and_capabilities():
     assert by["verify_import"].readOnlyHint is True and by["resolve_status"].readOnlyHint is True
     assert by["build_timeline"].readOnlyHint is False and by["build_timeline"].destructiveHint is False
     assert by["create_project"].idempotentHint is False
+    # place_sfx writes into an existing timeline but only ADDS, and a re-run is a no-op
+    assert by["place_sfx"].readOnlyHint is False and by["place_sfx"].destructiveHint is False
+    assert by["place_sfx"].idempotentHint is True
+    # snapshot_timeline writes a new file and refuses an existing one
+    assert by["snapshot_timeline"].destructiveHint is False and by["snapshot_timeline"].idempotentHint is False
     prompts = asyncio.run(server.mcp.list_prompts())
     assert [p.name for p in prompts] == ["handoff"]
     text = asyncio.run(server.mcp.get_prompt("handoff", {"manifest_path": "/x/manifest.json"}))
@@ -749,7 +884,8 @@ def test_tool_annotations_prompt_and_capabilities():
     assert caps["manifest"] == "oside-davinci/v1"
     assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
                                 "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope",
-                                "cdl_readback", "verify_json", "vo_lanes"]
+                                "cdl_readback", "verify_json", "vo_lanes", "sfx_plan"]
+    assert caps["sfxPlan"] == "oside-sfx-plan/v1"
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
     st = server.resolve_status()
@@ -2354,6 +2490,459 @@ def test_no_frame_reason_blames_the_gap_not_a_missing_clip():
     cue_rows = [r for r in plan["cueMarkers"] if r["frame"] is None] if "cueMarkers" in plan else []
     for r in cue_rows:
         assert "no clip" not in r["reason"] or r["file"] not in {m["file"] for m in plan["markers"]}, r
+
+
+# ---------------------------------------------------------------------------
+# place_sfx — a spotted SFX pass onto one existing track (0.7.0)
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+import types  # noqa: E402
+
+import sfx  # noqa: E402
+
+
+def _sfx_world(files, pooled=(), start=0, end=6000, fps=60, lane=(), export_bytes=None, pool_cls=None,
+               current="YT", track_names=("SFX", "SFX 3")):
+    """A Resolve holding timeline YT (current) with a picture on V1, a busy SFX
+    lane on A2 and the target `SFX 3` on A3 (a plain track: the TAIL collision
+    mode is on). `files` = {basename: (frames, item fps)} written as empty files
+    in a temp dir; `pooled` are already in the SFX bin, the rest import."""
+    tmp = tempfile.mkdtemp(prefix="sfx-test-")
+    paths = {}
+    for n in files:
+        paths[n] = os.path.join(tmp, n)
+        open(paths[n], "w").close()
+    sfx_bin = FakeFolder("SFX", [FakeClip(n, files[n][0], fps=files[n][1], path=paths[n]) for n in pooled])
+    vo_bin = FakeFolder("VO", [FakeClip("vo.wav", 500, fps=60, path="/elsewhere/vo.wav")])
+    root = FakeFolder("Master", subs=[vo_bin, sfx_bin])
+    disk = {paths[n]: files[n] for n in files}
+    cls = pool_cls or FakeMediaPool
+    project = FakeProject(lambda p: cls(p, root, disk), fps=str(fps), name="DV COLOR MANG")
+    tl = FakeTimeline(name="YT", start=start, v1=[FakeItem("pic.mp4", start, end)], audio_tracks=3, fps=fps,
+                      end=start + end, tail_tracks=(3,), export_bytes=export_bytes)
+    for i, n in enumerate(track_names, start=2):
+        tl.SetTrackName("audio", i, n)
+    tl._tracks[("audio", 2)] = [FakeItem("swoosh.wav", start + 100, 30)]
+    tl._tracks[("audio", 3)] = [FakeItem(n, start + s, d, lo) for n, s, d, lo in lane]
+    other = FakeTimeline(name="YT Shorts", start=start)
+    project._timelines.extend([tl, other])
+    project._current = tl if current == "YT" else other
+
+    class PM:
+        def GetCurrentProject(self):
+            return project
+
+    class Resolve:
+        EXPORT_OTIO, EXPORT_NONE, EXPORT_EDL = _EXPORT_OTIO, _EXPORT_NONE, _EXPORT_EDL
+
+        def GetProjectManager(self):
+            return PM()
+
+    orig = rapi.connect
+    rapi.connect = lambda: Resolve()
+
+    def restore():
+        rapi.connect = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+    return types.SimpleNamespace(project=project, tl=tl, pool=project.GetMediaPool(), bin=sfx_bin,
+                                 paths=paths, tmp=tmp, restore=restore)
+
+
+def _plan(w, rows, **over):
+    doc = {"schema": "oside-sfx-plan/v1", "timeline": "YT", "track": "SFX 3", "bin": "SFX",
+           "placements": [{"file": w.paths[n], "sourceIn": a, "sourceOut": b, "record": r, "label": f"cue {i + 1}"}
+                          for i, (n, a, b, r) in enumerate(rows)]}
+    doc.update(over)
+    path = os.path.join(w.tmp, f"plan-{len(os.listdir(w.tmp))}.json")
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    return path
+
+
+def _lane(tl, idx=3):
+    return [(x.GetName(), x.GetStart() - tl.GetStartFrame(), x.GetDuration(), int(x.GetLeftOffset()))
+            for x in sorted(tl.GetItemListInTrack("audio", idx), key=lambda x: x.GetStart())]
+
+
+SFX_FILES = {"pop.wav": (13, 60), "check.wav": (98, 60), "hit.wav": (227, 25)}
+SFX_ROWS = [("pop.wav", 0, 13 / 60, 212), ("check.wav", 0, 82 / 60, 609), ("hit.wav", 0.2, 4.76, 1200)]
+
+
+def test_sfx_plan_refuses_each_bad_row_with_a_sentence():
+    w = _sfx_world(SFX_FILES)
+    try:
+        good = _plan(w, SFX_ROWS)
+        assert len(sfx.load_plan(good)["placements"]) == 3
+        bad = [
+            ({"schema": "oside-sfx-plan/v0"}, "schema"),
+            ({"track": ""}, "'track'"),
+            ({"placements": []}, "no placements"),
+            ({"placements": [{"file": "pop.wav", "sourceIn": 0, "sourceOut": 1, "record": 0}]}, "absolute"),
+            ({"placements": [{"file": "/nope/x.wav", "sourceIn": 0, "sourceOut": 1, "record": 0}]}, "does not exist"),
+            ({"placements": [{"file": w.paths["pop.wav"], "sourceIn": 1, "sourceOut": 1, "record": 0}]}, "sourceIn < sourceOut"),
+            ({"placements": [{"file": w.paths["pop.wav"], "sourceIn": 0, "sourceOut": 1, "record": 1.5}]}, "whole timeline frame"),
+            ({"placements": [{"file": w.paths["pop.wav"], "sourceIn": 0, "sourceOut": 1, "record": True}]}, "whole timeline frame"),
+            ({"placements": [{"file": w.paths["pop.wav"], "sourceIn": 0, "sourceOut": 1, "record": -1}]}, "whole timeline frame"),
+            ({"placements": [{"file": w.paths["pop.wav"], "sourceIn": "a", "sourceOut": 1, "record": 0}]}, "numbers of seconds"),
+        ]
+        for over, needle in bad:
+            try:
+                sfx.load_plan(_plan(w, SFX_ROWS, **over))
+            except sfx.PlanError as e:
+                assert needle in str(e), (needle, str(e))
+            else:
+                raise AssertionError(f"accepted a plan with {over}")
+    finally:
+        w.restore()
+
+
+def test_sfx_trim_floors_through_float_noise():
+    """A plan written from frames carries 123/60 s. A bare floor reads that
+    back as 122.99999999999999 and lays the clip a frame early — the naive
+    form must fail on this very input, or the test proves nothing."""
+    assert int(123 / 60 * 60) == 122                      # the trap is real on this input
+    assert sfx.item_trim(123 / 60, 245 / 60, 60) == (123, 245)
+    assert sfx.item_trim(29 / 25, 114 / 25, 25) == (29, 114)
+    assert sfx.item_trim(0.2, 4.76, 25) == (5, 119)
+
+
+def test_sfx_expected_lay_conforms_by_duration():
+    # same rate: exact, no tolerance
+    assert sfx.expected_lay(124, 148, 60, 60) == {"length": 24, "leftOffset": 124, "tolerance": 0}
+    assert sfx.expected_lay(0, 24, 24, 23.976) == {"length": 24, "leftOffset": 0, "tolerance": 0}
+    assert sfx.expected_lay(0, 60, 59.94, 60)["tolerance"] == 1      # 0.06 apart is two rates
+    # the measured 2026-10-25 cell: a 25 fps item, 5..119, on 60 → 273 frames, offset 12
+    assert sfx.expected_lay(5, 119, 25, 60) == {"length": 273, "leftOffset": 12, "tolerance": 1}
+
+
+def test_sfx_check_spans_judges_from_one_read():
+    rows = [{"row": 1, "name": "a.wav", "record": 100, "length": 10},
+            {"row": 2, "name": "b.wav", "record": 110, "length": 10},     # back to back: end is exclusive
+            {"row": 3, "name": "c.wav", "record": 200, "length": 5}]
+    clear = sfx.check_spans(rows, [], 1000)
+    assert not clear["collisions"] and [r["row"] for r in clear["toPlace"]] == [1, 2, 3]
+    # identical clip already there: a no-op, not a collision
+    again = sfx.check_spans(rows, [{"name": "c.wav", "start": 200, "duration": 5}], 1000)
+    assert [r["row"] for r in again["alreadyPlaced"]] == [3] and not again["collisions"]
+    # same frame, different clip: a collision, and it names what is in the way
+    hit = sfx.check_spans(rows, [{"name": "z.wav", "start": 115, "duration": 50}], 1000)
+    assert [c["row"] for c in hit["collisions"]] == [2] and "'z.wav'" in hit["collisions"][0]["reason"]
+    # rows that overlap EACH OTHER
+    inner = sfx.check_spans(rows + [{"row": 4, "name": "d.wav", "record": 105, "length": 2}], [], 1000)
+    assert [c["row"] for c in inner["collisions"]] == [4] or {c["row"] for c in inner["collisions"]} == {2, 4}
+    # running past the timeline end would lengthen the timeline
+    late = sfx.check_spans(rows, [], 204)
+    assert [c["row"] for c in late["collisions"]] == [3] and "past the timeline end" in late["collisions"][0]["reason"]
+    assert not sfx.check_spans(rows, [], 205)["collisions"]
+
+
+def test_sfx_otio_diff_goes_red_on_each_kind_of_change():
+    w = _sfx_world(SFX_FILES)
+    try:
+        def snap():
+            path = os.path.join(w.tmp, f"s{len(os.listdir(w.tmp))}.otio")
+            assert w.tl.Export(path, _EXPORT_OTIO, _EXPORT_NONE)
+            with open(path) as f:
+                return json.load(f)
+        before = snap()
+        w.tl._tracks[("audio", 3)].append(FakeItem("pop.wav", 212, 13))
+        ok = sfx.otio_diff(before, snap(), "Audio", 3, [("pop.wav", 212, 13)])
+        assert ok["pass"], ok
+        # the laid clip not declared → the target is not before + placed
+        assert not sfx.otio_diff(before, snap(), "Audio", 3, [])["pass"]
+        # something moved on ANOTHER track
+        w.tl._tracks[("audio", 2)].append(FakeItem("stray.wav", 900, 10))
+        bad = sfx.otio_diff(before, snap(), "Audio", 3, [("pop.wav", 212, 13)])
+        row = {c["check"]: c for c in bad["checks"]}["otherTracksIdentical"]
+        assert not bad["pass"] and not row["pass"] and row["changed"] == ["Audio 2 'SFX'"], row
+        w.tl._tracks[("audio", 2)].pop()
+        # a track renamed
+        w.tl.SetTrackName("audio", 3, "SFX 3b")
+        assert not {c["check"]: c for c in sfx.otio_diff(before, snap(), "Audio", 3, [("pop.wav", 212, 13)])["checks"]}[
+            "targetTrackSettingsUnchanged"]["pass"]
+        # and the clip view skips transitions and counts gaps as room
+        track = {"children": [{"OTIO_SCHEMA": "Gap.1", "source_range": {"duration": {"value": 7}}},
+                              {"OTIO_SCHEMA": "Clip.2", "name": "a", "source_range": {"duration": {"value": 10}}},
+                              {"OTIO_SCHEMA": "Transition.1", "in_offset": {"value": 5}},
+                              {"OTIO_SCHEMA": "Clip.2", "name": "b", "source_range": {"duration": {"value": 4}}}]}
+        assert sfx.otio_clips(track) == [("a", 7, 10), ("b", 17, 4)]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_lays_reads_back_and_proves_nothing_else_moved():
+    """The whole chain on a 60 fps timeline: one file already in the bin, two
+    imported; one of those the pool tags 25 fps, so its trim conforms. Each
+    clip lands at its frame with its length AND its trim, the bin the editor
+    had open is still open, and the export diff passes."""
+    w = _sfx_world(SFX_FILES, pooled=("pop.wav",), start=0)
+    try:
+        before_v1 = _lane(w.tl, 2)
+        w.pool.SetCurrentFolder(w.pool.GetRootFolder())
+        r = server.place_sfx(_plan(w, SFX_ROWS))
+        assert r["ok"] and r["outcome"] == "placed", r
+        assert _lane(w.tl) == [("pop.wav", 212, 13, 0), ("check.wav", 609, 82, 0), ("hit.wav", 1200, 273, 12)]
+        assert sorted(os.path.basename(p) for p in r["imported"]) == ["check.wav", "hit.wav"]
+        assert [p["laidLength"] for p in r["placed"]] == [13, 82, 273]
+        assert r["diff"]["pass"] and {c["check"] for c in r["diff"]["checks"]} >= {
+            "otherTracksIdentical", "targetTrackIsBeforePlusPlaced", "timelineEndUnchanged"}
+        assert _lane(w.tl, 2) == before_v1
+        assert w.pool.GetCurrentFolder() is w.pool.GetRootFolder()       # the editor's bin, restored
+        assert r["saved"] is False
+    finally:
+        w.restore()
+
+
+def test_place_sfx_frames_are_relative_to_the_timeline_start():
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), start=86400)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert r["ok"], r
+        assert [x.GetStart() for x in w.tl.GetItemListInTrack("audio", 3)] == [86400 + 212]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_rerun_is_a_no_op():
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS)
+        assert server.place_sfx(plan)["outcome"] == "placed"
+        lane = _lane(w.tl)
+        again = server.place_sfx(plan)
+        assert again["ok"] and again["outcome"] == "nothing-to-do" and len(again["alreadyPlaced"]) == 3, again
+        assert _lane(w.tl) == lane
+        # and the post-save confirmation the docstring asks for reads the same
+        dry = server.place_sfx(plan, dry_run=True)
+        assert dry["ok"] and len(dry["alreadyPlaced"]) == 3 and dry["toPlace"] == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_will_not_relay_what_an_editor_deleted():
+    """The 2026-10-25 case: a pass was laid, the editor deleted the cues that
+    did not work, and the same plan run again would have put them all back.
+    A partly placed plan is refused (and flagged on the dry run); resume=True
+    is the explicit way to finish a run that stopped."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS)
+        assert server.place_sfx(plan)["outcome"] == "placed"
+        lane = w.tl._tracks[("audio", 3)]
+        lane.remove(next(x for x in lane if x.GetStart() == 609))          # the editor's cut
+        kept = _lane(w.tl)
+        dry = server.place_sfx(plan, dry_run=True)
+        assert dry["ok"] and dry["partial"] is True and [t["record"] for t in dry["toPlace"]] == [609], dry
+        r = server.place_sfx(plan)
+        assert not r["ok"] and r["outcome"] == "refused" and "removed on purpose" in r["failure"]["reason"], r
+        assert _lane(w.tl) == kept
+        done = server.place_sfx(plan, resume=True)
+        assert done["ok"] and [p["record"] for p in done["placed"]] == [609], done
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_a_collision_before_writing_anything():
+    """Row 2 lands on a clip already on the track. The whole plan is refused:
+    nothing imported, nothing appended, nothing exported — not rows 1 and 3
+    with a complaint about 2."""
+    w = _sfx_world(SFX_FILES, lane=[("theirs.wav", 600, 40, 0)])
+    try:
+        exports = []
+        real_export = w.tl.Export
+        w.tl.Export = lambda *a: exports.append(a) or real_export(*a)
+        r = server.place_sfx(_plan(w, SFX_ROWS))
+        assert not r["ok"] and r["outcome"] == "refused", r
+        assert [c["row"] for c in r["collisions"]] == [2] and "'theirs.wav'" in r["collisions"][0]["reason"]
+        assert _lane(w.tl) == [("theirs.wav", 600, 40, 0)]
+        assert w.pool.imports == [] and exports == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_a_trim_past_the_end_of_the_file():
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        r = server.place_sfx(_plan(w, [("pop.wav", 0, 1.0, 212)]))     # pop is 13 frames long
+        assert r["outcome"] == "refused" and "past the clip's 13 frames" in r["collisions"][0]["reason"], r
+        assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_the_wrong_timeline_track_or_bin():
+    for kw, needle in ((dict(current="YT Shorts"), "current timeline is 'YT Shorts'"),
+                       (dict(track_names=("SFX 3", "SFX 3")), "found 2"),
+                       (dict(track_names=("SFX", "FX")), "found 0")):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), **kw)
+        try:
+            r = server.place_sfx(_plan(w, SFX_ROWS))
+            assert not r["ok"] and needle in r["error"], (kw, r)
+        finally:
+            w.restore()
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS, bin="SOUNDS"))
+        assert not r["ok"] and "No bin named 'SOUNDS'" in r["error"], r
+        assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_dry_run_touches_nothing():
+    w = _sfx_world(SFX_FILES, pooled=("pop.wav",))
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS), dry_run=True)
+        assert r["ok"] and r["outcome"] == "dry-run" and len(r["toPlace"]) == 3, r
+        assert sorted(os.path.basename(p) for p in r["wouldImport"]) == ["check.wav", "hit.wav"]
+        assert [t["estimated"] for t in r["toPlace"]] == [False, True, True]
+        assert w.pool.imports == [] and _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_stops_at_the_first_clip_that_lands_wrong():
+    """Resolve lays the second clip a frame late (any of anti-pattern 2's
+    modes looks like this from outside). The read-back must stop the run
+    THERE — the third clip is never appended — name what landed, and the
+    export diff must agree that the track is not before + placed."""
+    class Shifty(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            if items[0]["recordFrame"] == 609:
+                items = [dict(items[0], recordFrame=610)]
+            return super().AppendToTimeline(items)
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Shifty)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS))
+        assert not r["ok"] and r["outcome"] == "failed", r
+        assert [p["record"] for p in r["placed"]] == [212]
+        assert r["failure"]["row"] == 2 and r["failure"]["landed"][0]["start"] == 610
+        assert [x[1] for x in _lane(w.tl)] == [212, 610]                # row 3 never went in
+        assert not {c["check"]: c for c in r["diff"]["checks"]}["targetTrackIsBeforePlusPlaced"]["pass"]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_catches_the_plain_track_tail_mode():
+    """The measured 21.1 lie, end to end, on the measured cell (2026-09-08:
+    asking frame 30 of a track held 0..75 landed at 75, 30 frames long). The
+    pre-read cannot see the occupant (the stand-in hides it from the first
+    read), the append lands at the TAIL truncated, and the read-back calls it
+    — never a placement."""
+    class Blind(FakeMediaPool):
+        pass
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Blind)
+    try:
+        hidden = FakeItem("hidden.wav", 0, 75)
+        w.tl._tracks[("audio", 3)].append(hidden)
+        real = w.tl.GetItemListInTrack
+        reads = {"n": 0}
+
+        def read(kind, idx):
+            reads["n"] += 1
+            lane = real(kind, idx)
+            return [x for x in lane if x is not hidden] if (kind, idx) == ("audio", 3) and reads["n"] <= 1 else lane
+        w.tl.GetItemListInTrack = read
+        r = server.place_sfx(_plan(w, [("check.wav", 0, 82 / 60, 30)]))
+        assert not r["ok"] and r["outcome"] == "failed", r
+        assert r["placed"] == [] and ("check.wav", 75, 30) in [
+            (x["name"], x["start"], x["duration"]) for x in r["failure"]["landed"]], r["failure"]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_catches_a_clip_laid_with_the_wrong_trim():
+    """Right frame, right length, wrong SOUND: the slice taken from the head of
+    the file instead of from its in-point. Only the left offset tells them
+    apart, so the read-back must compare it."""
+    class Untrimmed(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            it = items[0]
+            return super().AppendToTimeline([dict(it, startFrame=0, endFrame=it["endFrame"] - it["startFrame"])])
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Untrimmed)
+    try:
+        r = server.place_sfx(_plan(w, [("check.wav", 0.5, 1.0, 609)]))
+        assert not r["ok"] and r["outcome"] == "failed", r
+        assert r["failure"]["landed"] == [{"name": "check.wav", "start": 609, "duration": 30, "leftOffset": 0}]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_catches_a_silent_drop():
+    class Deaf(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            return [_RemoteObject()]
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Deaf)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS))
+        assert not r["ok"] and r["failure"]["reason"] == "nothing new on the track" and r["placed"] == [], r
+    finally:
+        w.restore()
+
+
+def test_place_sfx_diff_catches_a_change_on_another_track():
+    """A write that also touched a track it was never aimed at. The per-clip
+    read-back of the target cannot see it; the export diff must."""
+    class Leaky(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            self._project.GetCurrentTimeline()._tracks[("audio", 2)].append(FakeItem("leak.wav", 3000, 5))
+            return out
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Leaky)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and r["outcome"] == "failed", r
+        row = {c["check"]: c for c in r["diff"]["checks"]}["otherTracksIdentical"]
+        assert not row["pass"] and row["changed"] == ["Audio 2 'SFX'"]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_on_an_empty_snapshot():
+    """Export answered True over a zero-byte file: no before-state to judge
+    against, so nothing is laid."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), export_bytes=0)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS))
+        assert not r["ok"] and r["outcome"] == "refused" and "0 bytes" in r["failure"]["reason"], r
+        assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_items_by_path_matches_file_path_not_name():
+    """Two libraries, one filename. The pool item in another bin with the same
+    NAME but a different path must not be used for this file."""
+    w = _sfx_world(SFX_FILES, pooled=())
+    try:
+        decoy = FakeClip("pop.wav", 13, fps=60, path="/other/library/pop.wav")
+        w.pool.GetRootFolder()._subs[0]._clips.append(decoy)
+        found = rapi.items_by_path(w.pool, {w.paths["pop.wav"]}, prefer=w.bin)
+        assert found == {}
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert r["ok"] and r["imported"] == [w.paths["pop.wav"]], r
+        assert w.tl.GetItemListInTrack("audio", 3)[0].GetMediaPoolItem() is not decoy
+    finally:
+        w.restore()
+
+
+def test_snapshot_timeline_writes_a_new_file_and_never_overwrites():
+    w = _sfx_world(SFX_FILES)
+    try:
+        out = os.path.join(w.tmp, "yt.otio")
+        r = server.snapshot_timeline(out)
+        assert r["ok"] and r["bytes"] > 0 and r["timeline"] == "YT" and r["timelineFps"] == 60.0, r
+        assert [(t["kind"], t["index"], t["name"], t["clips"]) for t in r["tracks"]] == [
+            ("Video", 1, "Video 1", 1), ("Audio", 1, "Audio 1", 0), ("Audio", 2, "SFX", 1), ("Audio", 3, "SFX 3", 0)]
+        again = server.snapshot_timeline(out)
+        assert not again["ok"] and "never overwrites" in again["error"]
+        other = server.snapshot_timeline(os.path.join(w.tmp, "shorts.otio"), "YT Shorts")
+        assert other["ok"] and other["timeline"] == "YT Shorts"
+        assert not server.snapshot_timeline(os.path.join(w.tmp, "x.otio"), "NOPE")["ok"]
+    finally:
+        w.restore()
 
 
 if __name__ == "__main__":

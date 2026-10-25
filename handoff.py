@@ -50,7 +50,12 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             # `VO`, pinned takes on `VO PINS` (overflow `VO PINS 2`…). Declared
             # because an MCP without it lays both on one track, where the spine
             # swallows every pinned frame and the build cannot pass verify.
-            "vo_lanes"]
+            "vo_lanes",
+            # 0.7.0 — place_sfx lays an oside-sfx-plan/v1 pass onto ONE existing
+            # audio track of an existing timeline and proves, from a before/after
+            # OTIO export, that nothing else moved; snapshot_timeline exports
+            # the OTIO a spotting pass reads.
+            "sfx_plan"]
 
 VERIFY_FORMAT = "oside-verify/1"
 VERIFY_SIDECAR = "verify.json"

@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-25
+
+### Added — a second recipe: lay a spotted SFX pass onto an existing timeline
+
+- **`place_sfx(plan_path, dry_run=False)`** reads an `oside-sfx-plan/v1` file — timeline,
+  one existing audio track, an existing bin, and rows of `{file, sourceIn, sourceOut,
+  record}` — and lays it. Trims are SECONDS: the frame unit `AppendToTimeline` takes is the
+  pool item's own rate, which Resolve assigns at import (measured 2026-10-25 on 21.1.1: a
+  WAV came in tagged 25 fps on a 60 fps project, and its 5..119 trim landed 273 frames
+  long with `GetLeftOffset` 12 — conformed by duration, floored).
+- **Every collision is judged from one read before any write** — with the track, with the
+  other rows, past the timeline end, past the end of the file — so a refused plan writes
+  nothing. Files the pool lacks import as a plain path list into the plan's bin (the
+  documented dict form imports nothing on 21.1) and are re-found by `File Path`, never by
+  name; the editor's current bin is put back.
+- **One append at a time, each judged by re-reading the track**: the new item must sit at
+  its frame with its length and its left offset. The first mismatch stops the run and
+  reports what landed — no retry, no delete. A clip already at its frame reads
+  `alreadyPlaced`, so a re-run is a no-op.
+- **A partly placed plan is refused unless `resume=True`.** Found on the first live dry
+  run: the editor had deleted 21 of a 51-clip pass, and those rows read `toPlace` — the
+  same plan run again would have re-laid every deliberate cut. "Some rows there, some
+  missing" is both a stopped run and an edited track, and the tool cannot tell which, so
+  finishing a run is an explicit ask.
+- **An OTIO export before and after proves nothing else moved**: every other track
+  byte-identical, the timeline and stack metadata unchanged, the target track's settings
+  unchanged, its clips exactly before + laid, the end frame unchanged. Export size is
+  checked, not existence (anti-pattern 9). Never saves.
+- **`snapshot_timeline(out_path, timeline_name=None)`** writes that OTIO export to a new
+  file (never overwrites) with a per-track summary, for a spotting pass to read.
+- New pure module `sfx.py`; capability `sfx_plan` and `sfxPlan: "oside-sfx-plan/v1"`.
+- The test fake gained what the new code leans on, per the vendor contract: `ImportMedia`
+  (plain list imports, dict form returns None), `File Path`, `GetLeftOffset`,
+  `GetMediaPoolItem`, `GetEndFrame`, `GetSetting`, OTIO `Export` (live enum only, and a
+  zero-byte mode), duration conform on mismatched rates, and the 21.1 plain-track TAIL
+  collision mode, opt-in per track (the older cells keep the embedded-audio drop mode they
+  were written against).
+- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 17 mutations, each
+  removing one guard; every one turns its named tests red.
+- CLAUDE.md: the scope decision, and the vendor reference's new location — 21.1.1 ships
+  `README.md` + `DaVinciResolveScript.pyi`, no `README.txt`.
+
 ## 0.6.1 — 2026-09-13
 
 ### Fixed — the public templates no longer publish the operator's filesystem (R-1, ow-8543c5)
