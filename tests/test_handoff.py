@@ -196,8 +196,10 @@ class FakeTimeline:
                     "children": kids, "kind": kind.title()}
 
         order = sorted(self._tracks, key=lambda k: (k[0] != "video", k[1]))
+        # the timeline's own name is NOT in Resolve's export: it writes "" (measured
+        # 2026-10-25 on 21.1.1), which is why snapshot_timeline stamps one
         doc = {"OTIO_SCHEMA": "Timeline.1", "metadata": {"Resolve_OTIO": {"Resolve OTIO Meta Version": "1.0"}},
-               "name": self._name, "global_start_time": rt(self._start),
+               "name": "", "global_start_time": rt(self._start),
                "tracks": {"OTIO_SCHEMA": "Stack.1", "metadata": {}, "name": "", "source_range": None,
                           "effects": [], "markers": [], "enabled": True,
                           "children": [track(k, i) for k, i in order]}}
@@ -900,7 +902,7 @@ def test_tool_annotations_prompt_and_capabilities():
     assert caps["manifest"] == "oside-davinci/v1"
     assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
                                 "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope",
-                                "cdl_readback", "verify_json", "vo_lanes", "sfx_plan"]
+                                "cdl_readback", "verify_json", "vo_lanes", "sfx_plan", "snapshot_stamp"]
     assert caps["sfxPlan"] == "oside-sfx-plan/v1"
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
@@ -3411,19 +3413,70 @@ def test_items_by_path_matches_file_path_not_name():
 
 
 def test_snapshot_timeline_writes_a_new_file_and_never_overwrites():
-    w = _sfx_world(SFX_FILES)
+    w = _sfx_world(SFX_FILES, start=86400)
+    w.project._name = "Another Project"
+    real = rapi.snapshot_otio
+    exports = []
+
+    def counting(resolve, timeline):
+        exports.append(timeline.GetName())
+        return real(resolve, timeline)
+    rapi.snapshot_otio = counting
     try:
         out = os.path.join(w.tmp, "yt.otio")
         r = server.snapshot_timeline(out)
-        assert r["ok"] and r["bytes"] > 0 and r["timeline"] == "YT" and r["timelineFps"] == 60.0, r
+        assert r["ok"] and r["bytes"] == os.path.getsize(out) and r["timeline"] == "YT" and r["timelineFps"] == 60.0, r
+        assert r["startFrame"] == 86400 and r["endFrame"] == 6000, r
         assert [(t["kind"], t["index"], t["name"], t["clips"]) for t in r["tracks"]] == [
             ("Video", 1, "Video 1", 1), ("Audio", 1, "Audio 1", 0), ("Audio", 2, "SFX", 1), ("Audio", 3, "SFX 3", 0)]
+        # the file says which edit it is — Resolve's export alone leaves the name empty
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        stamp = doc["metadata"].pop("oside-resolve-mcp")
+        assert stamp == {"schema": "oside-snapshot/v1", "project": "Another Project", "timeline": "YT",
+                         "timelineFps": 60.0, "startFrame": 86400, "endFrame": 6000, "takenAt": stamp["takenAt"],
+                         "version": server._version()}, stamp
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00", stamp["takenAt"]), stamp
+        # and nothing else differs from Resolve's own export
+        assert doc["name"] == "" and doc == real(w.resolve, w.tl)
+        # an existing file is refused before Resolve is asked to export anything
+        before = list(exports)
         again = server.snapshot_timeline(out)
-        assert not again["ok"] and "never overwrites" in again["error"]
+        assert exports == before, exports
+        assert not again["ok"] and "never overwrites" in again["error"], again
         other = server.snapshot_timeline(os.path.join(w.tmp, "shorts.otio"), "YT Shorts")
         assert other["ok"] and other["timeline"] == "YT Shorts"
+        with open(os.path.join(w.tmp, "shorts.otio"), encoding="utf-8") as f:
+            assert json.load(f)["metadata"]["oside-resolve-mcp"]["timeline"] == "YT Shorts"
         assert not server.snapshot_timeline(os.path.join(w.tmp, "x.otio"), "NOPE")["ok"]
+
+        # a file that appears while Resolve exports is not overwritten either
+        late = os.path.join(w.tmp, "late.otio")
+
+        def racing(resolve, timeline):
+            with open(late, "w", encoding="utf-8") as f:
+                f.write("theirs")
+            return real(resolve, timeline)
+        rapi.snapshot_otio = racing
+        raced = server.snapshot_timeline(late)
+        with open(late, encoding="utf-8") as f:
+            assert not raced["ok"] and f.read() == "theirs", raced
+
+        # an export with no metadata object to stamp writes nothing
+        rapi.snapshot_otio = lambda resolve, timeline: {**real(resolve, timeline), "metadata": None}
+        bare = os.path.join(w.tmp, "bare.otio")
+        r = server.snapshot_timeline(bare)
+        assert not r["ok"] and "no timeline metadata" in r["error"] and not os.path.exists(bare), r
+        rapi.snapshot_otio = counting
+
+        # a timeline that will not say its name gets no snapshot at all
+        for name in ("", 42):
+            w.tl._name = name
+            nameless = os.path.join(w.tmp, f"nameless-{name}.otio")
+            bad = server.snapshot_timeline(nameless)
+            assert not bad["ok"] and "did not report its name" in bad["error"] and not os.path.exists(nameless), bad
     finally:
+        rapi.snapshot_otio = real
         w.restore()
 
 

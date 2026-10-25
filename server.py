@@ -968,11 +968,19 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
 @mcp.tool(annotations=CREATES)
 def snapshot_timeline(out_path: str, timeline_name: str | None = None) -> dict:
     """Export a timeline (the current one when no name is given) as OTIO to a
-    NEW file at `out_path`, and summarise its tracks. Read-only on the project.
+    NEW file at `out_path`, stamped with where it came from, and summarise its
+    tracks. Read-only on the project.
 
-    This is the timeline as Resolve holds it — every clip, gap and transition at
-    the timeline rate — for a spotting pass to read (which part sits where, what
-    covers it, which SFX lanes are already busy). Refuses an existing file."""
+    This is the timeline as Resolve exports it — every clip, gap and transition
+    at the timeline rate — for a spotting pass to read (which part sits where,
+    what covers it, which SFX lanes are already busy), plus ONE key Resolve does
+    not write: `metadata["oside-resolve-mcp"]` (`oside-snapshot/v1`), naming the
+    project and timeline, the rate, the start and end frames, when, and this
+    server's version. Resolve's own export leaves the timeline's name empty, so
+    without the stamp the file cannot say which edit it is. The parsed content
+    is otherwise Resolve's export; the file is re-serialised, so its bytes and
+    formatting are not. Refuses an existing file, and a timeline that does not
+    report its name."""
     try:
         path = os.path.abspath(os.path.expanduser(out_path))
         if os.path.exists(path):
@@ -984,15 +992,28 @@ def snapshot_timeline(out_path: str, timeline_name: str | None = None) -> dict:
         timeline = rapi.timeline_by_name(project, timeline_name)
         if timeline is None:
             raise rapi.ResolveError(f"No timeline named {timeline_name!r}." if timeline_name else "No current timeline.")
-        size = rapi.export_timeline_otio(resolve, timeline, path)
-        with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
+        name = timeline.GetName()
+        if not isinstance(name, str) or not name:
+            raise rapi.ResolveError(f"The timeline did not report its name (got {name!r}) — a snapshot "
+                                    "that cannot say which edit it is would be worse than none.")
+        doc = rapi.snapshot_otio(resolve, timeline)
+        meta = doc.get("metadata") if isinstance(doc, dict) else None
+        if not isinstance(meta, dict):
+            raise rapi.ResolveError("The OTIO export has no timeline metadata to stamp — no snapshot written.")
+        start = int(timeline.GetStartFrame())
+        stamp = {"schema": sfx.SNAPSHOT_FORMAT, "project": project.GetName(), "timeline": name,
+                 "timelineFps": rapi.timeline_fps(project, timeline), "startFrame": start,
+                 "endFrame": int(timeline.GetEndFrame()) - start,
+                 "takenAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                 "version": _version()}
+        meta[sfx.SNAPSHOT_STAMP] = stamp
+        # "x", not "w": never overwrites, even a file that appeared while Resolve exported
+        with open(path, "x", encoding="utf-8") as f:
+            json.dump(doc, f)
         tracks = [{"kind": t["kind"], "index": t["index"], "name": t["name"],
                    "clips": len(sfx.otio_clips(t["json"]))} for t in sfx.otio_tracks(doc)]
-        start = int(timeline.GetStartFrame())
-        return _ok(path=path, bytes=size, timeline=timeline.GetName(),
-                   timelineFps=rapi.timeline_fps(project, timeline),
-                   startFrame=start, endFrame=int(timeline.GetEndFrame()) - start, tracks=tracks)
+        return _ok(path=path, bytes=os.path.getsize(path), timeline=name, timelineFps=stamp["timelineFps"],
+                   startFrame=start, endFrame=stamp["endFrame"], tracks=tracks)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 

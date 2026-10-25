@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.7.1 — 2026-10-25
+
+### Changed — a snapshot says which edit it is
+
+- **`snapshot_timeline` stamps its export** with `metadata["oside-resolve-mcp"]`, an
+  `oside-snapshot/v1` record: project, timeline, rate, start and end frames, when, and this
+  server's version. Resolve's own OTIO leaves the timeline's `name` empty (measured
+  2026-10-25 on 21.1.1), so a spotting pass had no way to tell a snapshot of `YT` from one
+  of `YT Shorts` and could hand `place_sfx` frames from the wrong edit. The parsed content
+  is otherwise Resolve's export unchanged (the test compares it); the file is re-serialised,
+  so its bytes and formatting are not Resolve's. A timeline that does not report its name
+  gets no snapshot, an existing file is refused before anything is exported, and the file
+  is created exclusively, so one that appears while Resolve exports is not overwritten.
+- Capability `snapshot_stamp`.
+- The test fake's OTIO export now writes the empty timeline name Resolve writes; it wrote
+  the timeline's name, which is the gap the stamp closes.
+- `tests/redproof_place_sfx.py`: 46 mutations, all red. Four are new: the stamp removed, a
+  nameless timeline snapshotted, a non-string name stamped, the exclusive create dropped.
+  The overwrite precheck's mutation is now caught by behaviour (an export ran), not by
+  its wording.
+
 ## 0.7.0 — 2026-10-25
 
 ### Added — a second recipe: lay a spotted SFX pass onto an existing timeline
