@@ -2966,7 +2966,7 @@ def test_sfx_a_trim_shorter_than_a_frame_is_refused_not_rounded_up():
     w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
     try:
         r = server.place_sfx(_plan(w, [("pop.wav", 0.001, 0.002, 212)]))
-        assert r["outcome"] == "refused" and any("empty trim" in c["reason"] for c in r["collisions"]), r
+        assert r["outcome"] == "refused" and any("shorter than one frame" in c["reason"] for c in r["collisions"]), r
         assert _lane(w.tl) == []
     finally:
         w.restore()
@@ -3045,7 +3045,7 @@ def test_place_sfx_will_not_relay_a_pass_deleted_whole():
         dry = server.place_sfx(plan, dry_run=True)
         assert dry["ok"] and dry["laidBefore"] == entry["placedAt"] and dry["partial"] is False, dry
         r = server.place_sfx(plan)
-        assert not r["ok"] and r["outcome"] == "refused" and "was laid on" in r["failure"]["reason"], r
+        assert not r["ok"] and r["outcome"] == "refused" and "was laid here on" in r["failure"]["reason"], r
         assert _lane(w.tl) == []
         done = server.place_sfx(plan, resume=True)
         assert done["ok"] and len(done["placed"]) == 3, done
@@ -3077,6 +3077,111 @@ def test_place_sfx_refuses_on_a_ledger_it_cannot_read_and_reports_one_it_cannot_
         w.restore()
 
 
+def test_place_sfx_refuses_a_ledger_that_only_half_reads():
+    """[Codex r2] A ledger with a sound outer shape and a broken entry matched
+    nothing — or matched with no date — and read as "never laid"."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS[:1])
+        good = {"project": "DV COLOR MANG", "timeline": "YT", "track": "SFX 3", "placedAt": "2026-10-25T10:00:00+00:00",
+                "runs": []}
+        for doc, needle in (({"schema": "oside-sfx-ledger/v0", "entries": []}, "is not an"),
+                            ({"schema": "oside-sfx-ledger/v1", "entries": {}}, "is not an"),
+                            ({"schema": "oside-sfx-ledger/v1", "entries": ["YT"]}, "entry 1"),
+                            ({"schema": "oside-sfx-ledger/v1", "entries": [dict(good, placedAt="")]}, "entry 1"),
+                            ({"schema": "oside-sfx-ledger/v1", "entries": [{k: v for k, v in good.items() if k != "runs"}]},
+                             "entry 1"),
+                            ({"schema": "oside-sfx-ledger/v1", "entries": [good, dict(good, project=None)]}, "entry 2")):
+            with open(plan + ".placed.json", "w") as f:
+                json.dump(doc, f)
+            r = server.place_sfx(plan)
+            assert not r["ok"] and needle in r.get("error", ""), (doc, r)
+            assert _lane(w.tl) == [] and w.pool.imports == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_ledger_that_failed_to_write_is_written_by_the_next_run():
+    """[Codex r2] A ledger write that failed left the pass unrecorded, and the
+    clean re-run (nothing to do) never wrote it — so deleting the whole pass
+    brought it back. A run that finds the plan here unrecorded records it."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS)
+        os.chmod(w.tmp, 0o500)
+        first = server.place_sfx(plan)
+        os.chmod(w.tmp, 0o700)
+        assert first["outcome"] == "placed" and first["ledgerWritten"] is False, first
+        dry = server.place_sfx(plan, dry_run=True)
+        assert dry["ok"] and not os.path.exists(plan + ".placed.json"), dry       # a dry run writes nothing
+        again = server.place_sfx(plan)
+        assert again["outcome"] == "nothing-to-do" and again["ledgerWritten"] is True, again
+        with open(plan + ".placed.json") as f:
+            run = json.load(f)["entries"][0]["runs"][0]
+        assert run["placed"] == [] and [x["record"] for x in run["found"]] == [212, 609, 1200], run
+        quiet = server.place_sfx(plan)                                           # recorded: nothing more to write
+        assert quiet["outcome"] == "nothing-to-do" and "ledgerWritten" not in quiet, quiet
+        w.tl._tracks[("audio", 3)].clear()
+        r = server.place_sfx(plan)
+        assert r["outcome"] == "refused" and "was laid here on" in r["failure"]["reason"] and _lane(w.tl) == [], r
+        # and a ledger that fails in a way nobody planned for never eats the placement report
+        orig = sfx.record_run
+        sfx.record_run = lambda *a, **k: (_ for _ in ()).throw(ValueError("odd"))
+        try:
+            done = server.place_sfx(plan, resume=True)
+        finally:
+            sfx.record_run = orig
+        assert done["ok"] and len(done["placed"]) == 3 and done["ledgerWritten"] is False, done
+    finally:
+        w.restore()
+
+
+def test_place_sfx_a_renamed_project_does_not_make_a_deleted_pass_new():
+    """[Codex r2] The ledger matched on names, so renaming the project (or
+    timeline, or track) made a pass the editor deleted read as never laid.
+    A plan laid anywhere is refused with rows missing here."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS)
+        assert server.place_sfx(plan)["outcome"] == "placed"
+        w.project._name = "DV COLOR MANG v2"
+        w.tl._tracks[("audio", 3)].clear()
+        dry = server.place_sfx(plan, dry_run=True)
+        assert dry["laidBefore"] is None and [e["project"] for e in dry["laidElsewhere"]] == ["DV COLOR MANG"], dry
+        r = server.place_sfx(plan)
+        assert r["outcome"] == "refused" and "not here" in r["failure"]["reason"] and _lane(w.tl) == [], r
+        done = server.place_sfx(plan, resume=True)                               # the explicit way
+        assert done["ok"] and len(done["placed"]) == 3, done
+        with open(plan + ".placed.json") as f:
+            assert [e["project"] for e in json.load(f)["entries"]] == ["DV COLOR MANG", "DV COLOR MANG v2"]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_after_snapshot_failure_keeps_what_was_laid():
+    """[Codex r2] The before-export worked, the clips went in, the after-export
+    wrote nothing: the report must keep the placed rows (they ARE on the
+    track) and the ledger must record them."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        real, calls = w.tl.Export, {"n": 0}
+
+        def export(path, *a):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                open(path, "w").close()
+                return True
+            return real(path, *a)
+        w.tl.Export = export
+        plan = _plan(w, SFX_ROWS)
+        r = server.place_sfx(plan)
+        assert not r["ok"] and r["outcome"] == "failed" and "after-snapshot failed" in r["failure"]["reason"], r
+        assert [p["record"] for p in r["placed"]] == [212, 609, 1200] and len(_lane(w.tl)) == 3
+        assert r["ledgerWritten"] is True
+    finally:
+        w.restore()
+
+
 def test_place_sfx_says_so_when_it_refuses_after_importing():
     """[Codex r1] The docs said a refused plan writes nothing. A file not in
     the pool cannot be judged exactly until it is imported — here its trim
@@ -3094,10 +3199,11 @@ def test_place_sfx_says_so_when_it_refuses_after_importing():
 
 
 def test_place_sfx_puts_the_editors_bin_back_or_says_so():
-    """[Codex r1] The bin restore was skipped by an exception and its answer
-    ignored. Three cells: the import raises (restored anyway), the restore is
-    refused (reported, nothing laid), the open bin cannot be read (refused
-    before any import)."""
+    """[Codex r1, r2] The bin restore was skipped by an exception and its
+    answer ignored. Four cells: the import raises (restored anyway, and said
+    so), the import raises AND the restore is refused (both said), the
+    restore is refused (reported, nothing laid), the open bin cannot be read
+    (refused before any import)."""
     class Raises(FakeMediaPool):
         def ImportMedia(self, paths):
             raise RuntimeError("disk went away")
@@ -3108,14 +3214,25 @@ def test_place_sfx_puts_the_editors_bin_back_or_says_so():
                 return False
             return super().SetCurrentFolder(folder)
 
+    class RaisesStuck(Raises, Stuck):
+        pass
+
     class Unread(FakeMediaPool):
         def GetCurrentFolder(self):
             return None
     w = _sfx_world(SFX_FILES, pool_cls=Raises)
     try:
         r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
-        assert not r["ok"] and "disk went away" in r["error"], r
+        assert not r["ok"] and r["outcome"] == "failed" and "disk went away" in r["failure"]["reason"], r
+        assert r["binRestored"] is True and "reselect" not in r["failure"]["reason"]
         assert w.pool.GetCurrentFolder() is w.pool.GetRootFolder() and _lane(w.tl) == []
+    finally:
+        w.restore()
+    w = _sfx_world(SFX_FILES, pool_cls=RaisesStuck)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and r["binRestored"] is False, r
+        assert "disk went away" in r["failure"]["reason"] and "could not be reselected" in r["failure"]["reason"], r
     finally:
         w.restore()
     w = _sfx_world(SFX_FILES, pool_cls=Stuck)

@@ -16,9 +16,11 @@
   other rows, past the timeline end, past the end of the file, a trim under one frame — so
   a plan refused there writes nothing. Files the pool lacks import as a plain path list
   into the plan's bin (the documented dict form imports nothing on 21.1) and are re-found
-  by `File Path`, never by name; the editor's current bin is put back in a `finally`, and a
-  restore Resolve refuses is reported. The plan is then judged again at the rate the pool
-  gave each file; a refusal there HAS imported, and says so.
+  by `File Path`, never by name; the editor's current bin is put back in a `finally`, an
+  open bin that cannot be read is refused before importing, and an import that raises or
+  leaves files out is a `failed` outcome carrying `binRestored` — true only when Resolve
+  confirmed the reselect. The plan is then judged again at the rate the pool gave each
+  file; a refusal there HAS imported, and says so.
 - **Reads fail closed.** A track that does not answer with a list, or an item without a
   readable name, start or length, is an error — never an empty lane. The track read and
   the before-export must agree before either is trusted.
@@ -34,11 +36,15 @@
   missing" is both a stopped run and an edited track, and the tool cannot tell which, so
   finishing a run is an explicit ask.
 - **The ledger, `<plan>.placed.json`.** Every run that lays a clip is recorded beside the
-  plan per project, timeline and track. A plan the ledger says was laid here, with rows
-  now missing, is refused like a partial one — the case the track alone cannot show is a
-  pass deleted WHOLE, which reads exactly like a plan never run. A ledger that does not
-  read is an error, not an empty memory; a ledger that cannot be written is reported
-  (`ledgerWritten: false`) and does not fail the run.
+  plan per project, timeline and track. A plan the ledger says was laid ANYWHERE, with
+  rows now missing here, is refused like a partial one — the case the track alone cannot
+  show is a pass deleted WHOLE, which reads exactly like a plan never run, and a rename of
+  the project, timeline or track must not make it new (`laidElsewhere` names where;
+  `resume=True` lays it here on purpose). A ledger that does not read, or an entry that is
+  not a whole record, is an error, not an empty memory. A ledger that cannot be written is
+  reported (`ledgerWritten: false`, `ledgerError`) and never eats the placement report; the
+  next run that finds the rows on the track unrecorded writes it, so the miss heals on a
+  re-run.
 - **An OTIO export before and after proves nothing else moved**: every other track
   byte-identical, the timeline and stack metadata unchanged, the target track's settings
   unchanged, every clip and transition it had still at its position and byte-identical
@@ -55,13 +61,15 @@
   `GetEndFrame` that grows when a clip is laid past the end, duration conform on mismatched
   rates, and the 21.1 plain-track TAIL collision mode, opt-in per track (the older cells
   keep the embedded-audio drop mode they were written against).
-- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 34 mutations, each
+- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 38 mutations, each
   removing one guard; every one turns its named tests red.
 - Reviewed before release (Codex, 2026-10-25): the first cut matched `alreadyPlaced` by
   name and frame alone, forgot a pass deleted whole, said "a refused plan writes nothing"
   over a refusal that had imported, compared the target track as (name, start, length),
-  and read unreadable evidence as empty. All fixed above, each with a test that goes red
-  without it.
+  and read unreadable evidence as empty. The second read found the ledger matched by name
+  (a rename made a deleted pass new), took a broken entry for no history, could not heal a
+  failed write, and raised an import failure past the bin's state. All fixed above, each
+  with a test that goes red without it.
 - Not yet measured: whether an append into a gap leaves the JSON of the clips beside it
   byte-identical in Resolve's export. Phase 1's real before/after pair passes the new diff,
   but its target track started empty. If it does not hold, the diff fails CLOSED — a

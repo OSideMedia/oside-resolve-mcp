@@ -1099,19 +1099,14 @@ def _sfx_rows(plan: dict, found: dict, tl_fps: float) -> list[dict]:
 
 
 def _trim_problems(rows: list[dict]) -> list[dict]:
-    """Rows that trim past the end of their file, or to nothing. Resolve does
-    not refuse those loudly, so they are refused here: a known item is measured
-    from the pool, a file not imported yet from ffprobe when it is on PATH. A
-    trim of positive seconds can still FLOOR to no frames at the item's rate
-    (0.001..0.002 s is frame 0..0 at 25 or 60)."""
+    """Rows that trim past the end of their file. Resolve does not refuse those
+    loudly, so they are refused here: a known item is measured from the pool,
+    a file not imported yet from ffprobe when it is on PATH. (A trim that
+    floors to NO item frames lays 0 timeline frames, which sfx.check_spans
+    refuses as shorter than one frame.)"""
     from handoff import probe_duration_seconds
     out = []
     for r in rows:
-        if r["endFrame"] <= r["startFrame"]:
-            out.append({"row": r["row"], "label": r["label"], "record": r["record"], "length": r["length"],
-                        "reason": f"sourceIn..sourceOut floors to item frames {r['startFrame']}..{r['endFrame']} "
-                                  f"at {r['itemFps']:g} fps — an empty trim"})
-            continue
         if r["item"] is not None:
             frames = clip_duration_frames(r["item"])
             if frames is not None and r["endFrame"] > frames:
@@ -1152,9 +1147,12 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
          timeline end did not move.
 
     A plan the track only PARTLY holds is refused unless `resume=True`, and so
-    is one this plan's ledger says was laid before (`history`, the
-    `<plan>.placed.json` doc from sfx.read_ledger, matched on project, timeline
-    and track) when any of its rows is now missing.
+    is one this plan's ledger (`history`, the `<plan>.placed.json` doc from
+    sfx.read_ledger) says was laid ANYWHERE before, when any of its rows is
+    missing here. Anywhere, not just here: a project, timeline or track
+    renamed since reads as somewhere else, and a ledger matched on names
+    would hand a deleted pass back. Laying one plan on a second project is
+    the explicit `resume=True`.
     Rows missing from a track an editor has worked on were probably deleted
     on purpose — re-laying a deliberate deletion is the change "do not touch
     anything else" forbids [2026-10-25: the editor removed 21 clips of a
@@ -1195,11 +1193,14 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
     found = items_by_path(media_pool, set(paths), prefer=folder)
     missing = [p for p in paths if p not in found]
     project_name = project.GetName()
-    laid_before = (sfx.ledger_entry(history, project_name, current, plan["track"]) or {}).get("placedAt")
+    here = sfx.ledger_entry(history, project_name, current, plan["track"])
+    laid_before = here["placedAt"] if here else None
+    elsewhere = [{k: e[k] for k in ("project", "timeline", "track", "placedAt")}
+                 for e in (history or {}).get("entries") or [] if e is not here]
     report = {"project": project_name, "timeline": current, "track": plan["track"], "trackIndex": idx,
               "timelineFps": tl_fps, "timelineEnd": end_limit, "planned": len(plan["placements"]),
               "dryRun": bool(dry_run), "imported": [], "wouldImport": missing if dry_run else [],
-              "laidBefore": laid_before, "saved": False}
+              "laidBefore": laid_before, "laidElsewhere": elsewhere, "saved": False}
 
     def judge(rows):
         lane = _read_lane(timeline, idx, start)
@@ -1222,14 +1223,21 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
         return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]])
     if dry_run:
         return finish("dry-run", toPlace=[_public(r) for r in verdict["toPlace"]])
-    if (partial or laid_before) and verdict["toPlace"] and not resume:
+    if (partial or laid_before or elsewhere) and verdict["toPlace"] and not resume:
         n, k = len(rows), len(verdict["toPlace"])
-        said = (f"This plan was laid on {laid_before} and {k} of its {n} rows are not on the track now."
-                if laid_before else f"{len(verdict['alreadyPlaced'])} of {n} rows are already on the track and "
-                                    f"{k} are not.")
-        return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
-            "reason": f"{said} If an editor removed those, they were removed on purpose and this would put "
-                      "them back. Pass resume=True only to finish a run that stopped."})
+        if laid_before or not elsewhere:
+            said = (f"This plan was laid here on {laid_before} and {k} of its {n} rows are not on the track now."
+                    if laid_before else f"{len(verdict['alreadyPlaced'])} of {n} rows are already on the track "
+                                        f"and {k} are not.")
+            said += (" If an editor removed those, they were removed on purpose and this would put them back. "
+                     "Pass resume=True only to finish a run that stopped.")
+        else:
+            e = elsewhere[0]
+            said = (f"This plan was laid on {e['project']!r}, timeline {e['timeline']!r}, track {e['track']!r} "
+                    f"on {e['placedAt']} — not here. A project, timeline or track renamed since reads like this, "
+                    f"and then the {k} missing row(s) were removed on purpose. Pass resume=True only to lay it "
+                    "here anyway.")
+        return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={"reason": said})
     if not verdict["toPlace"]:
         return finish("nothing-to-do", placed=[])
 
@@ -1243,9 +1251,11 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
             return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
                 "reason": "could not read which bin is open in the media pool, so an import would leave "
                           "another one selected — nothing was imported or laid"})
-        restored = False
+        restored, import_error = False, None
         try:
             import_into_bin(media_pool, folder, missing)   # return value not trusted: the pool is re-read
+        except Exception as e:  # noqa: BLE001 — reported with the bin's state, not raised past it
+            import_error = e
         finally:
             try:
                 restored = bool(media_pool.SetCurrentFolder(previous))
@@ -1254,9 +1264,14 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
         found = items_by_path(media_pool, set(paths), prefer=folder)
         report["imported"] = [p for p in missing if p in found]
         report["binRestored"] = restored
+        bin_note = "" if restored else (" Your open bin could not be reselected — reselect it in the "
+                                        "media pool.")
         still = [p for p in missing if p not in found]
-        if still:
-            raise ResolveError(f"Resolve did not import {len(still)} file(s): {still}. Nothing was placed.")
+        if import_error is not None or still:
+            what = f"the import failed ({import_error})" if import_error is not None else \
+                f"Resolve did not import {len(still)} file(s): {still}"
+            return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": f"{what} — nothing was laid.{bin_note}"})
         if not restored:
             return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
                 "reason": f"imported {len(report['imported'])} file(s) into {plan['bin']!r} but could not "

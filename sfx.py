@@ -348,6 +348,15 @@ def read_ledger(plan_path: str) -> dict | None:
     if not isinstance(doc, dict) or doc.get("schema") != SFX_LEDGER_FORMAT or not isinstance(doc.get("entries"), list):
         raise PlanError(f"{path} is not an {SFX_LEDGER_FORMAT} ledger. Move it aside only if you mean to "
                         "lay the plan as new.")
+    for i, e in enumerate(doc["entries"]):
+        # an entry that half-reads is the same lie as no ledger: it would
+        # match nothing, or match with no date, and hand the pass back
+        ok = (isinstance(e, dict)
+              and all(isinstance(e.get(k), str) and e[k].strip() for k in ("project", "timeline", "track", "placedAt"))
+              and isinstance(e.get("runs"), list) and all(isinstance(r, dict) for r in e["runs"]))
+        if not ok:
+            raise PlanError(f"{path}: entry {i + 1} is not a whole record (project, timeline, track, placedAt, "
+                            "runs). Move the ledger aside only if you mean to lay the plan as new.")
     return doc
 
 
@@ -361,7 +370,9 @@ def ledger_entry(doc: dict | None, project: str, timeline: str, track: str) -> d
 
 def record_run(plan_path: str, doc: dict | None, report: dict, at: str) -> dict:
     """The ledger with this run appended, written over the old one atomically.
-    Only a run that laid at least one clip is recorded."""
+    The server records a run that laid a clip, and a run that found the plan's
+    rows already on the track with no record of them here — the second is how
+    a ledger that could not be written last time gets written now."""
     doc = doc or {"schema": SFX_LEDGER_FORMAT, "plan": os.path.abspath(os.path.expanduser(plan_path)),
                   "entries": []}
     entry = ledger_entry(doc, report["project"], report["timeline"], report["track"])
@@ -371,7 +382,9 @@ def record_run(plan_path: str, doc: dict | None, report: dict, at: str) -> dict:
         doc["entries"].append(entry)
     entry["runs"].append({"at": at, "outcome": report["outcome"],
                           "placed": [{"row": p["row"], "label": p["label"], "record": p["placedAt"],
-                                      "length": p["laidLength"]} for p in report["placed"]]})
+                                      "length": p["laidLength"]} for p in report.get("placed") or []],
+                          "found": [{"row": p["row"], "label": p["label"], "record": p["record"]}
+                                    for p in report.get("alreadyPlaced") or []]})
     path = ledger_path(plan_path)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
