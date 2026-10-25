@@ -157,6 +157,13 @@ MUTS = [
      ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
     ("nameless timeline snapshotted", "server.py", "        if not isinstance(name, str) or not name:\n            raise",
      "        if False:\n            raise", ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
+    ("a non-string name stamped", "server.py", "        if not isinstance(name, str) or not name:\n            raise",
+     "        if not name:\n            raise", ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
+    ("snapshot written over a file that appeared mid-export", "server.py", "with open(path, \"x\", encoding=\"utf-8\")",
+     "with open(path, \"w\", encoding=\"utf-8\")", ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
+    # Not mutated: the metadata guard. Without it a stampless export still
+    # refuses (assigning into None raises before any file opens), so removing
+    # it changes the message, not the outcome; the test pins the message only.
 ]
 
 

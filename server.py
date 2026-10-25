@@ -977,8 +977,10 @@ def snapshot_timeline(out_path: str, timeline_name: str | None = None) -> dict:
     not write: `metadata["oside-resolve-mcp"]` (`oside-snapshot/v1`), naming the
     project and timeline, the rate, the start and end frames, when, and this
     server's version. Resolve's own export leaves the timeline's name empty, so
-    without the stamp the file cannot say which edit it is. Refuses an existing
-    file, and a timeline that does not report its name."""
+    without the stamp the file cannot say which edit it is. The parsed content
+    is otherwise Resolve's export; the file is re-serialised, so its bytes and
+    formatting are not. Refuses an existing file, and a timeline that does not
+    report its name."""
     try:
         path = os.path.abspath(os.path.expanduser(out_path))
         if os.path.exists(path):

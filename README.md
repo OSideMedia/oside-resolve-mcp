@@ -285,9 +285,10 @@ The full surface, with the behaviour each one guarantees.
    **stamped** with where it came from, because Resolve's own OTIO leaves the
    timeline's `name` empty: `metadata["oside-resolve-mcp"]` is an
    `oside-snapshot/v1` record of the project, timeline, rate, start and end
-   frames, when it was taken and this server's version. Everything else is
-   Resolve's export as it came. A timeline that does not report its name gets
-   no snapshot.
+   frames, when it was taken and this server's version. The parsed content is
+   otherwise Resolve's export (the file is re-serialised, so its bytes and
+   formatting are not). A timeline that does not report its name gets no
+   snapshot.
 6. `place_sfx(plan_path, dry_run=False, resume=False)` (0.7.0) — lay a spotted sound-effects
    pass onto **one named audio track of an existing timeline**, from an
    `oside-sfx-plan/v1` file:
