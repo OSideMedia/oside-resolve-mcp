@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-25
+
+### Added — a second recipe: lay a spotted SFX pass onto an existing timeline
+
+- **`place_sfx(plan_path, dry_run=False, resume=False)`** reads an `oside-sfx-plan/v1` file — timeline,
+  one existing audio track, an existing bin, and rows of `{file, sourceIn, sourceOut,
+  record}` — and lays it. Trims are SECONDS: the frame unit `AppendToTimeline` takes is the
+  pool item's own rate, which Resolve assigns at import (measured 2026-10-25 on 21.1.1: a
+  WAV came in tagged 25 fps on a 60 fps project, and its 5..119 trim landed 273 frames
+  long with `GetLeftOffset` 12 — conformed by duration, floored).
+- **Every collision is judged from one read before any write** — with the track, with the
+  other rows, past the timeline end, past the end of the file, a trim under one frame — so
+  a plan refused there writes nothing to the project. Files the pool lacks import as a plain path list
+  into the plan's bin (the documented dict form imports nothing on 21.1) and are re-found
+  by `File Path`, never by name; the editor's current bin is put back in a `finally`, an
+  open bin that cannot be read is refused before importing, and an import that raises or
+  leaves files out — or a pool that cannot be read back after it — is a `failed` outcome
+  carrying `binRestored`, true only when Resolve confirmed the reselect. The plan is then judged again at the rate the pool gave each
+  file; a refusal there HAS imported, and says so.
+- **Reads fail closed.** A track that does not answer with a list, or an item without a
+  readable name, start or length, is an error — never an empty lane. The track read and
+  the before-export must agree before either is trusted.
+- **One append at a time, each judged by re-reading the track**: the new item must be the
+  right FILE (by path) at its frame with its length and its left offset, and every item
+  already there must be unchanged. The first mismatch stops the run and reports what
+  landed — no retry, no delete. A clip already at its frame with its file, length and trim
+  (within a conformed row's tolerance) reads `alreadyPlaced`, each track item vouching for
+  one row only, so a re-run is a no-op.
+- **A partly placed plan is refused unless `resume=True`.** Found on the first live dry
+  run: the editor had deleted 21 of a 51-clip pass, and those rows read `toPlace` — the
+  same plan run again would have re-laid every deliberate cut. "Some rows there, some
+  missing" is both a stopped run and an edited track, and the tool cannot tell which, so
+  finishing a run is an explicit ask.
+- **The ledger, `<plan>.placed.json`.** Every run that lays a clip is recorded beside the
+  plan per project, timeline and track. A plan the ledger says was laid ANYWHERE, with
+  rows now missing here, is refused like a partial one — the case the track alone cannot
+  show is a pass deleted WHOLE, which reads exactly like a plan never run, and a rename of
+  the project, timeline or track must not make it new (`laidElsewhere` names where;
+  `resume=True` lays it here on purpose). A ledger that does not read, or an entry that is
+  not a whole record, is an error, not an empty memory. A ledger that cannot be written is
+  reported (`ledgerWritten: false`, `ledgerError`) and never eats the placement report; the
+  next run that finds the rows on the track unrecorded writes it, so the miss heals on a
+  re-run.
+- **An OTIO export before and after proves nothing else moved**: every other track
+  byte-identical, the timeline and stack metadata unchanged, the target track's settings
+  unchanged, every clip and transition it had still at its position and byte-identical
+  (trim, media, effects, markers, enabled) with nothing new beside the clips laid, the end
+  frame unchanged. Export size is
+  checked, not existence (anti-pattern 9). Never saves.
+- **`snapshot_timeline(out_path, timeline_name=None)`** writes that OTIO export to a new
+  file (never overwrites) with a per-track summary, for a spotting pass to read.
+- New pure module `sfx.py`; capability `sfx_plan` and `sfxPlan: "oside-sfx-plan/v1"`.
+- The test fake gained what the new code leans on, per the vendor contract: `ImportMedia`
+  (plain list imports, dict form returns None), `File Path`, `GetLeftOffset`,
+  `GetMediaPoolItem`, `GetEndFrame`, `GetSetting`, OTIO `Export` (live enum only, and a
+  zero-byte mode; every track runs to the timeline end, an empty one as one Gap),
+  `GetEndFrame` that grows when a clip is laid past the end, duration conform on mismatched
+  rates, and the 21.1 plain-track TAIL collision mode, opt-in per track (the older cells
+  keep the embedded-audio drop mode they were written against).
+- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 42 mutations, each
+  removing one guard; every one turns its named tests red.
+- Reviewed before release (Codex, 2026-10-25): the first cut matched `alreadyPlaced` by
+  name and frame alone, forgot a pass deleted whole, said "a refused plan writes nothing"
+  over a refusal that had imported, compared the target track as (name, start, length),
+  and read unreadable evidence as empty. The second read found the ledger matched by name
+  (a rename made a deleted pass new), took a broken entry for no history, could not heal a
+  failed write, and raised an import failure past the bin's state. The third held, with
+  four nits closed here: an import that answers but brings nothing in, a pool that cannot
+  be read back after it (reported with `imported: null`, unknown rather than none), a
+  ledger run that is not a record, and "writes nothing" scoped to the project. All fixed above, each with a test that goes red without it.
+- Not yet measured: whether an append into a gap leaves the JSON of the clips beside it
+  byte-identical in Resolve's export. Phase 1's real before/after pair passes the new diff,
+  but its target track started empty. If it does not hold, the diff fails CLOSED — a
+  `failed` outcome over clips that did land correctly — never a false pass.
+- CLAUDE.md: the scope decision, and the vendor reference's new location — 21.1.1 ships
+  `README.md` + `DaVinciResolveScript.pyi`, no `README.txt`.
+
 ## 0.6.1 — 2026-09-13
 
 ### Fixed — the public templates no longer publish the operator's filesystem (R-1, ow-8543c5)

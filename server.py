@@ -22,6 +22,7 @@ from mcp.types import ToolAnnotations
 
 import handoff
 import resolve_api as rapi
+import sfx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(HERE, "templates")
@@ -44,7 +45,8 @@ def _version() -> str:
 def capabilities() -> dict:
     """What this server understands — OSIDE compares against it before it
     relies on a feature (placements, cues, dry_run, verify_v2)."""
-    return {"manifest": handoff.MANIFEST_FORMAT, "features": list(handoff.FEATURES), "version": _version()}
+    return {"manifest": handoff.MANIFEST_FORMAT, "features": list(handoff.FEATURES),
+            "sfxPlan": sfx.SFX_PLAN_FORMAT, "version": _version()}
 
 
 # Tool annotations (MCP spec hints). Every tool declares them; openWorldHint
@@ -908,6 +910,89 @@ def apply_look(manifest_path: str, timeline_name: str | None = None, dry_run: bo
                    note="node 1 CDL = starting balance (key/temperature/saturation). Not a read-back: Resolve exposes no GetCDL "
                         "(applied values can only be read back out of band, e.g. a Timeline.Export EDL+CDL). "
                         "A film stock, when the manifest names one, travels as a marker only — never a node or a LUT.")
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+@mcp.tool(annotations=IDEMPOTENT_WRITE)
+def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> dict:
+    """Lay a spotted SFX pass onto ONE named audio track of an EXISTING timeline,
+    from an oside-sfx-plan/v1 file, and prove nothing else moved.
+
+    The plan names the timeline (it must be the CURRENT one — this tool will not
+    switch your editor), an existing audio track, an existing bin, and rows of
+    {file, sourceIn, sourceOut (seconds), record (timeline frame), label, kind}.
+    Every collision is judged from one read BEFORE anything is written; a plan
+    refused there writes nothing. Missing files then import into the bin, and
+    the plan is judged again at the rate the pool gave them — a refusal THERE
+    has imported (the report lists what). Each clip is read back after its
+    append (file, frame, length, trim) and the first mismatch stops the run. A
+    before/after OTIO export then proves every other track is identical.
+
+    Re-running a plan is a no-op: a clip already at its frame with its file,
+    length and trim reads `alreadyPlaced`. Every run that lays a clip — or
+    finds the plan's rows already here unrecorded — is recorded beside the plan
+    in `<plan>.placed.json`. A plan the track only PARTLY holds, or one the
+    ledger says was laid anywhere before (a renamed project reads as elsewhere)
+    with rows missing here, is refused unless resume=True — rows missing from
+    a track the editor has worked on were probably deleted on purpose; resume
+    only to finish a run that stopped, or to lay one plan on a second project. Never saves — save_project, then run the plan
+    again with dry_run=True to confirm every row survived the save."""
+    try:
+        plan = sfx.load_plan(plan_path)
+        history = sfx.read_ledger(plan_path)
+        resolve = rapi.connect()
+        _, project = _open_project(resolve)
+        report = rapi.place_sfx(resolve, project, plan, dry_run=dry_run, resume=resume, history=history)
+        ok = report["outcome"] in ("placed", "nothing-to-do", "dry-run")
+        # The track is the truth; the ledger is only how a later run knows a
+        # pass deleted WHOLE was laid at all. Recorded: a run that laid clips,
+        # and a run that found the plan already here with no record of it here
+        # (a ledger that failed to write last time is written now). A failed
+        # write is reported, never allowed to hide the run that happened.
+        here = sfx.ledger_entry(history, report.get("project"), report.get("timeline"), report.get("track"))
+        if not dry_run and (report.get("placed") or (report.get("alreadyPlaced") and here is None)):
+            try:
+                sfx.record_run(plan_path, history, report,
+                               datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
+                report["ledger"] = sfx.ledger_path(plan_path)
+                report["ledgerWritten"] = True
+            except Exception as e:  # noqa: BLE001 — the placement report must survive
+                report["ledgerWritten"] = False
+                report["ledgerError"] = str(e)
+        return {"ok": ok, **report}
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+
+
+@mcp.tool(annotations=CREATES)
+def snapshot_timeline(out_path: str, timeline_name: str | None = None) -> dict:
+    """Export a timeline (the current one when no name is given) as OTIO to a
+    NEW file at `out_path`, and summarise its tracks. Read-only on the project.
+
+    This is the timeline as Resolve holds it — every clip, gap and transition at
+    the timeline rate — for a spotting pass to read (which part sits where, what
+    covers it, which SFX lanes are already busy). Refuses an existing file."""
+    try:
+        path = os.path.abspath(os.path.expanduser(out_path))
+        if os.path.exists(path):
+            raise rapi.ResolveError(f"{path!r} already exists — snapshot_timeline never overwrites.")
+        if not os.path.isdir(os.path.dirname(path)):
+            raise rapi.ResolveError(f"No folder {os.path.dirname(path)!r} to write into.")
+        resolve = rapi.connect()
+        _, project = _open_project(resolve)
+        timeline = rapi.timeline_by_name(project, timeline_name)
+        if timeline is None:
+            raise rapi.ResolveError(f"No timeline named {timeline_name!r}." if timeline_name else "No current timeline.")
+        size = rapi.export_timeline_otio(resolve, timeline, path)
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        tracks = [{"kind": t["kind"], "index": t["index"], "name": t["name"],
+                   "clips": len(sfx.otio_clips(t["json"]))} for t in sfx.otio_tracks(doc)]
+        start = int(timeline.GetStartFrame())
+        return _ok(path=path, bytes=size, timeline=timeline.GetName(),
+                   timelineFps=rapi.timeline_fps(project, timeline),
+                   startFrame=start, endFrame=int(timeline.GetEndFrame()) - start, tracks=tracks)
     except Exception as e:  # noqa: BLE001
         return _err(e)
 

@@ -5,8 +5,10 @@ first will save you a rejected patch.
 
 ## This is a fixed pipeline, not a Resolve remote control
 
-Ten tools, one recipe: package → project → import → timeline → look → verify.
-The tools are deliberately few so the handoff runs identically every time.
+Twelve tools, two recipes: package → project → import → timeline → look →
+verify, and (since 0.7.0, the owner's call) snapshot → spot → place for a sound
+effects pass on an existing timeline. The tools are deliberately few so each
+recipe runs identically every time.
 
 **If you want general Resolve control, you already have it** — DaVinci Resolve
 Studio 21.1 ships its own MCP server inside the app bundle, with `run_script`
@@ -15,7 +17,7 @@ and this server does not try to be it. See "Working alongside Blackmagic's own
 MCP" in the README.
 
 So: **a PR that adds a tool "while we're here" will be declined.** A PR that
-makes one of the ten do its job better is very welcome.
+makes one of the twelve do its job better is very welcome.
 
 ## The ANTI-PATTERNS in CLAUDE.md are load-bearing
 

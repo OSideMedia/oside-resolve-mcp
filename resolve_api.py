@@ -950,3 +950,420 @@ def append_audio(media_pool, timeline, placements: list, track_index: int | None
         report["track"] = pins_idx[0]
         report["trackName"] = track_name(timeline, "audio", pins_idx[0]) or f"A{pins_idx[0]}"
     return report
+
+
+# ---------------------------------------------------------------------------
+# place_sfx — a spotted SFX pass onto ONE named audio track of an EXISTING
+# timeline. The pure rules live in sfx.py; this is the half that talks to
+# Resolve. Added 2026-10-25 at Peter's request (CLAUDE.md "Decided").
+# ---------------------------------------------------------------------------
+
+def export_timeline_otio(resolve, timeline, path: str) -> int:
+    """Write the timeline as OTIO to `path` and return the file's size.
+
+    The enum constants come off the LIVE resolve handle (a string is silently
+    rejected), and the SIZE is checked, not existence: `Timeline.Export` has
+    answered True over a zero-byte file before (anti-pattern 9). Measured
+    2026-10-25 on 21.1.1: EXPORT_OTIO with EXPORT_NONE writes the whole timeline
+    — every track, its clips, gaps and transitions — at the timeline rate."""
+    ok = timeline.Export(path, resolve.EXPORT_OTIO, resolve.EXPORT_NONE)
+    size = os.path.getsize(path) if os.path.isfile(path) else 0
+    if not ok or size == 0:
+        raise ResolveError(
+            f"Timeline.Export (OTIO) answered {ok!r} and wrote {size} bytes — no snapshot to judge against."
+        )
+    return size
+
+
+def snapshot_otio(resolve, timeline) -> dict:
+    """The timeline as parsed OTIO, through a temp file that is removed — the
+    snapshot is evidence for one call, not an artefact to leave behind."""
+    import json
+    tmp = tempfile.mkdtemp(prefix="oside-sfx-")
+    path = os.path.join(tmp, "snapshot.otio")
+    try:
+        export_timeline_otio(resolve, timeline, path)
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except ValueError as e:
+        raise ResolveError(f"The OTIO snapshot did not parse: {e}") from e
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def timeline_fps(project, timeline) -> float:
+    """The timeline's own rate, falling back to the project's."""
+    for src in (timeline, project):
+        try:
+            fps = float(src.GetSetting("timelineFrameRate") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if fps > 0:
+            return fps
+    raise ResolveError("Resolve did not report a timeline frame rate.")
+
+
+def audio_tracks_named(timeline, name: str) -> list[int]:
+    """Every audio track index whose name is `name` (exact, after trimming)."""
+    want = name.strip()
+    return [i for i in range(1, audio_track_count(timeline) + 1)
+            if track_name(timeline, "audio", i).strip() == want]
+
+
+def items_by_path(media_pool, paths: set, prefer=None) -> dict:
+    """File path -> media-pool item, for the paths asked about.
+
+    Matched on `File Path`, never on the clip name: two libraries ship files
+    with the same name, and a name match would lay the wrong sound. The
+    preferred bin is walked first and the rest of the pool only for what is
+    still missing — a file already imported elsewhere is reused rather than
+    imported a second time."""
+    found = {}
+    roots = [prefer] if prefer is not None else []
+    roots.append(media_pool.GetRootFolder())
+    for root in roots:
+        stack = [root]
+        while stack and len(found) < len(paths):
+            folder = stack.pop()
+            for clip in folder.GetClipList() or []:
+                try:
+                    p = clip.GetClipProperty("File Path")
+                except (AttributeError, TypeError):
+                    continue
+                if p in paths and p not in found:
+                    found[p] = clip
+            stack.extend(folder.GetSubFolderList() or [])
+    return found
+
+
+def _item_fps(item, fallback: float) -> float:
+    try:
+        fps = float(item.GetClipProperty("FPS") or 0)
+    except (AttributeError, TypeError, ValueError):
+        fps = 0.0
+    return fps if fps > 0 else fallback
+
+
+def _read_lane(timeline, index: int, start: int) -> list[dict]:
+    """One audio track as plain data: each item's name, frame, length, left
+    offset (timeline frames — proves the TRIM landed, not just the clip) and
+    source file path (proves it is the right SOUND, not a namesake).
+
+    Fails CLOSED. A track that does not answer as a list, or an item without a
+    readable name, start or length, raises: an unreadable lane judged as an
+    empty one sends an append onto an occupied frame. An empty track answers
+    `[]` (measured 2026-10-25 on 21.1.1), so this refuses nothing real. An
+    unreadable left offset or path is kept as None, and None never certifies
+    a placement (sfx.same_clip, the read-back below)."""
+    items = timeline.GetItemListInTrack("audio", index)
+    if not isinstance(items, (list, tuple)):
+        raise ResolveError(f"Audio track {index} did not answer with its items ({items!r}) — "
+                           "refusing to judge collisions blind.")
+    out = []
+    for it in items:
+        try:
+            name = it.GetName()
+            row = {"name": name, "start": int(it.GetStart()) - start, "duration": int(it.GetDuration())}
+            if not isinstance(name, str):
+                raise TypeError(name)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise ResolveError(f"An item on audio track {index} did not report its name, start or length "
+                               f"({e!r}) — refusing to judge collisions blind.") from e
+        try:
+            row["leftOffset"] = int(round(float(it.GetLeftOffset())))
+        except (AttributeError, TypeError, ValueError):
+            row["leftOffset"] = None
+        try:
+            row["path"] = it.GetMediaPoolItem().GetClipProperty("File Path") or None
+        except (AttributeError, TypeError):
+            row["path"] = None
+        out.append(row)
+    return out
+
+
+def _sfx_rows(plan: dict, found: dict, tl_fps: float) -> list[dict]:
+    """The plan's rows with the frames Resolve will use. A file not in the pool
+    yet has no item rate, so its frames are ESTIMATED at the timeline rate —
+    the real run recomputes them from the imported item before any append."""
+    import sfx
+    rows = []
+    for p in plan["placements"]:
+        item = found.get(p["file"])
+        ifps = _item_fps(item, tl_fps) if item is not None else tl_fps
+        s, e = sfx.item_trim(p["sourceIn"], p["sourceOut"], ifps)
+        lay = sfx.expected_lay(s, e, ifps, tl_fps)
+        rows.append({**p, "item": item, "name": item.GetName() if item is not None else os.path.basename(p["file"]),
+                     "itemFps": ifps, "startFrame": s, "endFrame": e, "estimated": item is None,
+                     "length": lay["length"], "leftOffset": lay["leftOffset"], "tolerance": lay["tolerance"]})
+    return rows
+
+
+def _trim_problems(rows: list[dict]) -> list[dict]:
+    """Rows that trim past the end of their file. Resolve does not refuse those
+    loudly, so they are refused here: a known item is measured from the pool,
+    a file not imported yet from ffprobe when it is on PATH. (A trim that
+    floors to NO item frames lays 0 timeline frames, which sfx.check_spans
+    refuses as shorter than one frame.)"""
+    from handoff import probe_duration_seconds
+    out = []
+    for r in rows:
+        if r["item"] is not None:
+            frames = clip_duration_frames(r["item"])
+            if frames is not None and r["endFrame"] > frames:
+                out.append({"row": r["row"], "label": r["label"], "record": r["record"], "length": r["length"],
+                            "reason": f"trims to item frame {r['endFrame']}, past the clip's {frames} frames"})
+        else:
+            secs = probe_duration_seconds(r["file"])
+            if secs is not None and r["sourceOut"] > secs + 1e-3:
+                out.append({"row": r["row"], "label": r["label"], "record": r["record"], "length": r["length"],
+                            "reason": f"sourceOut {r['sourceOut']}s is past the file's {secs:.3f}s"})
+    return out
+
+
+def _public(r: dict) -> dict:
+    return {k: r[k] for k in ("row", "label", "kind", "name", "file", "record", "length", "leftOffset",
+                              "startFrame", "endFrame", "itemFps", "estimated") if k in r}
+
+
+def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool = False,
+              history: dict | None = None) -> dict:
+    """Lay a validated oside-sfx-plan/v1 (sfx.load_plan) onto its track.
+
+    The order is the whole design:
+      1. refuse unless the plan's timeline is the CURRENT one (AppendToTimeline
+         only writes there, and this tool does not move the editor), the track
+         exists exactly once, and the bin exists;
+      2. judge every collision from ONE read of the track, before any write —
+         a refused plan writes nothing (anti-pattern 3);
+      3. import what the pool lacks, as a plain list of paths (the documented
+         dict form imports nothing on 21.1 — measured 2026-09-08), re-read the
+         pool by File Path, recompute exact frames and judge again;
+      4. snapshot the timeline (OTIO), then append ONE clip at a time and
+         re-read the track after each: the new item must sit at its frame with
+         its length and its trim. The first mismatch STOPS the run — no retry,
+         no delete; the stray is reported so the editor can remove it;
+      5. snapshot again and prove every other track is byte-identical, the
+         target holds exactly what it held plus what was laid, and the
+         timeline end did not move.
+
+    A plan the track only PARTLY holds is refused unless `resume=True`, and so
+    is one this plan's ledger (`history`, the `<plan>.placed.json` doc from
+    sfx.read_ledger) says was laid ANYWHERE before, when any of its rows is
+    missing here. Anywhere, not just here: a project, timeline or track
+    renamed since reads as somewhere else, and a ledger matched on names
+    would hand a deleted pass back. Laying one plan on a second project is
+    the explicit `resume=True`.
+    Rows missing from a track an editor has worked on were probably deleted
+    on purpose — re-laying a deliberate deletion is the change "do not touch
+    anything else" forbids [2026-10-25: the editor removed 21 clips of a
+    51-clip pass by hand, and to this tool every one reads `toPlace`]. The partial check alone
+    cannot see a pass deleted WHOLE — no row on the track reads like a plan
+    never run — which is what the ledger is for. Without a ledger (deleted, or
+    a plan never run through this server) a plan with no row on the track is
+    treated as new. Finishing a stopped run is the explicit `resume=True`.
+
+    Never saves. The save is the verification boundary (anti-pattern 5): run
+    save_project, then this plan again with dry_run=True — every row should
+    come back `alreadyPlaced`."""
+    import sfx
+    timeline = project.GetCurrentTimeline()
+    current = timeline.GetName() if timeline is not None else None
+    if current != plan["timeline"]:
+        raise ResolveError(
+            f"The current timeline is {current!r}, not {plan['timeline']!r}. Open {plan['timeline']!r} in "
+            "Resolve first — place_sfx lays into the CURRENT timeline and will not switch your editor."
+        )
+    idxs = audio_tracks_named(timeline, plan["track"])
+    if len(idxs) != 1:
+        raise ResolveError(
+            f"Expected exactly one audio track named {plan['track']!r} on {current!r}, found {len(idxs)}. "
+            "place_sfx never creates or renames tracks — add or rename it in Resolve."
+        )
+    idx = idxs[0]
+    start = int(timeline.GetStartFrame())
+    end_frame = int(timeline.GetEndFrame())
+    end_limit = end_frame - start
+    tl_fps = timeline_fps(project, timeline)
+    media_pool = project.GetMediaPool()
+    folder = find_bin(media_pool, plan["bin"])
+    if folder is None:
+        raise ResolveError(f"No bin named {plan['bin']!r}. place_sfx imports into an EXISTING bin only.")
+
+    paths = sorted({p["file"] for p in plan["placements"]})
+    found = items_by_path(media_pool, set(paths), prefer=folder)
+    missing = [p for p in paths if p not in found]
+    project_name = project.GetName()
+    here = sfx.ledger_entry(history, project_name, current, plan["track"])
+    laid_before = here["placedAt"] if here else None
+    elsewhere = [{k: e[k] for k in ("project", "timeline", "track", "placedAt")}
+                 for e in (history or {}).get("entries") or [] if e is not here]
+    report = {"project": project_name, "timeline": current, "track": plan["track"], "trackIndex": idx,
+              "timelineFps": tl_fps, "timelineEnd": end_limit, "planned": len(plan["placements"]),
+              "dryRun": bool(dry_run), "imported": [], "wouldImport": missing if dry_run else [],
+              "laidBefore": laid_before, "laidElsewhere": elsewhere, "saved": False}
+
+    def judge(rows):
+        lane = _read_lane(timeline, idx, start)
+        verdict = sfx.check_spans(rows, lane, end_limit)
+        verdict["collisions"] += _trim_problems(rows)
+        return lane, verdict
+
+    rows = _sfx_rows(plan, found, tl_fps)
+    lane, verdict = judge(rows)
+
+    def finish(outcome, **kw):
+        report.update(outcome=outcome,
+                      alreadyPlaced=[_public(r) for r in verdict["alreadyPlaced"]],
+                      collisions=verdict["collisions"], **kw)
+        return report
+
+    partial = bool(verdict["alreadyPlaced"]) and bool(verdict["toPlace"])
+    report["partial"] = partial
+    if verdict["collisions"]:
+        return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]])
+    if dry_run:
+        return finish("dry-run", toPlace=[_public(r) for r in verdict["toPlace"]])
+    if (partial or laid_before or elsewhere) and verdict["toPlace"] and not resume:
+        n, k = len(rows), len(verdict["toPlace"])
+        if laid_before or not elsewhere:
+            said = (f"This plan was laid here on {laid_before} and {k} of its {n} rows are not on the track now."
+                    if laid_before else f"{len(verdict['alreadyPlaced'])} of {n} rows are already on the track "
+                                        f"and {k} are not.")
+            said += (" If an editor removed those, they were removed on purpose and this would put them back. "
+                     "Pass resume=True only to finish a run that stopped.")
+        else:
+            e = elsewhere[0]
+            said = (f"This plan was laid on {e['project']!r}, timeline {e['timeline']!r}, track {e['track']!r} "
+                    f"on {e['placedAt']} — not here. A project, timeline or track renamed since reads like this, "
+                    f"and then the {k} missing row(s) were removed on purpose. Pass resume=True only to lay it "
+                    "here anyway.")
+        return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={"reason": said})
+    if not verdict["toPlace"]:
+        return finish("nothing-to-do", placed=[])
+
+    if missing:
+        try:
+            previous = media_pool.GetCurrentFolder()
+        except AttributeError:
+            previous = None
+        if previous is None:
+            # importing selects the plan's bin; without the editor's bin in hand it cannot be put back
+            return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": "could not read which bin is open in the media pool, so an import would leave "
+                          "another one selected — nothing was imported or laid"})
+        restored, import_error = False, None
+        try:
+            import_into_bin(media_pool, folder, missing)   # return value not trusted: the pool is re-read
+        except Exception as e:  # noqa: BLE001 — reported with the bin's state, not raised past it
+            import_error = e
+        finally:
+            try:
+                restored = bool(media_pool.SetCurrentFolder(previous))
+            except Exception:  # noqa: BLE001 — any failure to put it back is reported, never raised past
+                restored = False
+        report["binRestored"] = restored
+        bin_note = "" if restored else (" Your open bin could not be reselected — reselect it in the "
+                                        "media pool.")
+        try:
+            found = items_by_path(media_pool, set(paths), prefer=folder)
+        except Exception as e:  # noqa: BLE001 — the bin's state is reported, not raised past
+            report["imported"] = None    # unknown: the import ran, and what it brought in cannot be read
+            return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": f"the media pool could not be read back after the import ({e}) — nothing was "
+                          f"laid, but files may have been imported into {plan['bin']!r}: check that bin."
+                          f"{bin_note}"})
+        report["imported"] = [p for p in missing if p in found]
+        still = [p for p in missing if p not in found]
+        if import_error is not None or still:
+            what = f"the import failed ({import_error})" if import_error is not None else \
+                f"Resolve did not import {len(still)} file(s): {still}"
+            return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": f"{what} — nothing was laid.{bin_note}"})
+        if not restored:
+            return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": f"imported {len(report['imported'])} file(s) into {plan['bin']!r} but could not "
+                          "reselect the bin you had open — nothing was laid. Reselect it in the media pool."})
+        rows = _sfx_rows(plan, found, tl_fps)
+        lane, verdict = judge(rows)
+        if verdict["collisions"]:
+            # an import cannot be judged exactly before it happens: the pool picks the item's rate
+            return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": f"refused AFTER importing {len(report['imported'])} file(s) into {plan['bin']!r}: "
+                          "frames are exact only once a file is in the pool, and at the rate the pool gave "
+                          "it a row now collides. Nothing was laid; the imported files stay in the bin."})
+
+    try:
+        before_doc = snapshot_otio(resolve, timeline)
+    except ResolveError as e:
+        return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]],
+                      failure={"reason": f"no before-snapshot, so nothing was laid: {e}"})
+    # Two readings of the same track must agree before either is trusted: the
+    # item list the collisions were judged from, and the export the diff
+    # will compare against (names, frames and lengths agree on 21.1.1,
+    # measured 2026-10-25 on a populated SFX track).
+    target = sfx.find_track(before_doc, "Audio", idx)
+    seen = sorted(sfx.otio_clips(target)) if target is not None else None
+    read = sorted((it["name"], it["start"], it["duration"]) for it in lane)
+    if seen != read:
+        return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+            "reason": "the track's item list and its export disagree, so neither can be trusted — nothing "
+                      f"was laid (read {len(read)} item(s), export shows "
+                      f"{'no such track' if seen is None else len(seen)})"})
+    placed, failure = [], None
+    before = lane
+
+    def key(it):
+        return (it["name"], it["start"], it["duration"], it["leftOffset"], it["path"])
+
+    for r in verdict["toPlace"]:
+        try:
+            media_pool.AppendToTimeline([{
+                "mediaPoolItem": r["item"], "startFrame": r["startFrame"], "endFrame": r["endFrame"],
+                "trackIndex": idx, "recordFrame": start + r["record"], "mediaType": 2,
+            }])  # return value NOT trusted (anti-pattern 2)
+        except Exception as e:  # noqa: BLE001 — judged by the re-read below, like any other answer
+            report.setdefault("appendErrors", []).append({"row": r["row"], "error": str(e)})
+        try:
+            after = _read_lane(timeline, idx, start)
+        except ResolveError as e:
+            failure = {**_public(r), "landed": [], "reason": f"the track could not be read back: {e}"}
+            break
+        pool = [key(it) for it in before]
+        new = []
+        for it in after:
+            k = key(it)
+            if k in pool:
+                pool.remove(k)
+            else:
+                new.append(it)
+        # the new item is the row only if sfx.same_clip says so: right file, frame, length, trim
+        good = len(after) == len(before) + 1 and len(new) == 1 and not pool and sfx.same_clip(new[0], r)
+        if not good:
+            failure = {**_public(r), "landed": new,
+                       "reason": "nothing new on the track" if not new else
+                                 "the clip landed somewhere other than its frame, length or trim"
+                                 if not pool else "an item already on the track changed under the append"}
+            break
+        placed.append({**_public(r), "placedAt": new[0]["start"], "laidLength": new[0]["duration"],
+                       "laidLeftOffset": new[0]["leftOffset"]})
+        before = after
+
+    report["placed"] = placed
+    try:
+        after_doc = snapshot_otio(resolve, timeline)
+    except ResolveError as e:
+        return finish("failed", failure=failure or {
+            "reason": f"laid {len(placed)} clip(s) but the after-snapshot failed, so nothing is proven: {e}"})
+    diff = sfx.otio_diff(before_doc, after_doc, "Audio", idx,
+                         [(p["name"], p["placedAt"], p["laidLength"]) for p in placed])
+    end_after = int(timeline.GetEndFrame())
+    diff["checks"].append({"check": "timelineEndUnchanged", "pass": end_after == end_frame,
+                           "before": end_frame - start, "after": end_after - start})
+    diff["pass"] = all(c["pass"] for c in diff["checks"])
+    report.update(placed=placed, diff=diff)
+    if failure is not None:
+        return finish("failed", failure=failure)
+    if not diff["pass"]:
+        return finish("failed", failure={"reason": "the before/after export shows a change beyond the laid clips"})
+    return finish("placed")
+

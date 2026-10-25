@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.6.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
@@ -276,9 +276,70 @@ The full surface, with the behaviour each one guarantees.
    worklist the manifest names but which is not on disk is reported rather than
    silently passing.
 
+5. `snapshot_timeline(out_path, timeline_name=None)` (0.7.0) — export a
+   timeline (the current one by default) as **OTIO** to a NEW file, and return
+   a per-track summary (`kind`, `index`, `name`, clip count) with the rate and
+   the start/end frames. Read-only on the project; refuses an existing file.
+   This is what a spotting pass reads: which piece of picture sits where, what
+   covers it, which sound lanes are already busy.
+6. `place_sfx(plan_path, dry_run=False, resume=False)` (0.7.0) — lay a spotted sound-effects
+   pass onto **one named audio track of an existing timeline**, from an
+   `oside-sfx-plan/v1` file:
+
+   ```json
+   {"schema": "oside-sfx-plan/v1", "timeline": "YT", "track": "SFX 3", "bin": "SFX",
+    "placements": [{"file": "/abs/path/check.wav", "sourceIn": 0, "sourceOut": 1.633,
+                    "record": 609, "label": "part 1 — check", "kind": "CHECK"}]}
+   ```
+
+   `record` is a timeline frame relative to the timeline's start; trims are
+   **seconds**, because the frame unit is the pool item's own rate and Resolve
+   picks that at import (a WAV can arrive tagged 25 fps on a 60 fps project).
+   The guarantees, in order: refuses unless the plan's timeline is the
+   **current** one (it never switches your editor), the track exists exactly
+   once and the bin exists — it never creates tracks or bins; judges every
+   collision — with the track, with other rows, past the timeline's end, past
+   the end of the file, a trim shorter than a frame — from **one read before
+   any write**, so a plan refused there writes nothing to the project (the
+   ledger beside the plan may record rows it found already laid); imports what the pool
+   lacks (matched by `File Path`, never by clip name), puts your current bin
+   back even when the import fails — a failed import is a `failed` outcome
+   with `binRestored`, never an exception that hides the bin — and
+   judges the plan again at the rate the pool gave each file — a refusal at
+   that point **has imported** into the bin, and the report lists `imported`;
+   exports the timeline and refuses unless the export and the track read
+   agree; then appends **one clip at a time and re-reads the track** after
+   each — the new item must be the right file at its frame with its length and
+   its trim, every item already there must be unchanged, and the first
+   mismatch stops the run (no retry, no delete: the stray is reported); then
+   exports again and proves **every other track is identical**, every clip and
+   transition the target had is still there unchanged with nothing new beside
+   what was laid, and the timeline end did not move (`diff.checks`). A track or
+   item that does not answer is an error, never an empty lane. A clip already
+   at its frame with its file, length and trim reads `alreadyPlaced`, so a
+   re-run is a no-op. Every run that lays a clip — or finds the plan on the
+   track with no record of it there — is recorded beside the plan in
+   **`<plan>.placed.json`** (project, timeline, track, when). A **partly**
+   placed plan is refused unless `resume=True`, and so is a plan that ledger
+   says was laid **anywhere** with rows now missing here — which catches a
+   pass the editor deleted *whole*, where nothing on the track says it ever
+   ran, and the same pass after a project, timeline or track rename, which
+   reads like somewhere new. Rows missing from a track the editor has worked
+   on were most likely deleted on purpose, and re-running would put them
+   back — `resume` is for finishing a run that stopped, or for laying the plan
+   on a second timeline on purpose; moving the ledger aside makes the plan
+   new again. A ledger entry that is not a whole record is an error, never
+   "no history".
+   `dry_run=True` touches nothing and returns `toPlace`, `alreadyPlaced`,
+   `partial`, `laidBefore`, `laidElsewhere`, `wouldImport` and `collisions`.
+   **It never saves** — `save_project`, then the same plan with
+   `dry_run=True`: every row should come back `alreadyPlaced`.
+   Any producer that writes the schema can use it; a spotting pass that reads
+   the motion-graphics source and a `snapshot_timeline` export is the intended one.
+
 Plus `resolve_status` (with a `capabilities` block — `{"manifest":
 "oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2",
-"vo_track","look","text_tasks"], "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
+"vo_track","look","text_tasks", …, "sfx_plan"], "sfxPlan": "oside-sfx-plan/v1", "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
 before it relies on a feature), `launch_resolve`, `list_templates`, and
 `export_template(kind)` (snapshot a live template project to `templates/`).
 One MCP prompt, `handoff`, carries the recipe below. Every tool declares MCP
@@ -390,12 +451,31 @@ appear in the tool's `error` field.
 | `manifest.look.schema 'X' is not oside-look/1` | the package carries a newer look block than this MCP reads | update oside-resolve-mcp, or re-export from a studio build that writes v1 |
 | `pipeline crashed before a report could be built: …` | an exception past the manifest load — the report still prints, with the Python error in `error` | read the error; if it names a manifest key, it is a shape this table does not know yet — file it |
 | `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |
+| `The current timeline is 'X', not 'Y'.` | `place_sfx` lays into the CURRENT timeline only, and will not switch your editor | open the plan's timeline in Resolve, then run the plan again |
+| `Expected exactly one audio track named 'X' …, found N.` | the plan names a track that is missing, or two tracks share the name | add or rename the track in Resolve — `place_sfx` never creates or renames tracks |
+| `No bin named 'X'. place_sfx imports into an EXISTING bin only.` | the plan's `bin` is not in the media pool (often a typo) | fix the plan, or create the bin in Resolve |
+| `outcome: refused` with `collisions` | a row overlaps a clip already on the track, another row, the timeline's end, or the end of its file, or trims to under a frame — judged before any write, so nothing was placed | move or trim the rows it names; nothing to undo |
+| `… (the same file at the same frame, with a different trim or length)` | that row's sound is on the track at its frame but cut differently — an editor's trim, or a different plan | leave it if the editor trimmed it; otherwise remove it in Resolve and re-run |
+| `refused AFTER importing N file(s) into 'BIN'` | a row only collides at the rate the pool gave its file, which no read can know before the import | the files stay in the bin (harmless); fix the rows the collisions name and re-run |
+| `outcome: refused` — `… rows are already on the track and … are not` | the plan is partly on the track: a run that stopped, or an editor who deleted some of the cues | if the editor cut them, leave it — that is the edit. To finish a run that stopped, pass `resume=True` |
+| `outcome: refused` — `This plan was laid here on … and k of its n rows are not on the track now` | the ledger `<plan>.placed.json` says this plan ran on this project, timeline and track, and rows are gone — often the editor deleted the whole pass | leave it if that was the edit. To lay it again on purpose, pass `resume=True`, or move the ledger aside |
+| `outcome: refused` — `This plan was laid on '…', timeline …, track … on … — not here` | the ledger has this plan on another project, timeline or track. A rename since reads exactly like this; so does a second timeline | after a rename, the pass was probably deleted on purpose — leave it. To lay it here as well, pass `resume=True` (`laidElsewhere` in the dry run lists where it went) |
+| `<plan>.placed.json does not read` / `is not an oside-sfx-ledger/v1 ledger` / `entry N is not a whole record` | the ledger was hand-edited or truncated; read as "never laid" it could re-lay a deleted pass | move it aside only if you mean to lay the plan as new |
+| `ledgerWritten: false` (with `ledgerError`) | the clips were laid, but the plan's folder would not take the ledger | re-run the plan once the folder takes files, before anyone edits that track: a run that finds the rows already on the track records them. Fixing the permissions alone records nothing |
+| `outcome: failed` — `the import failed (…) — nothing was laid` / `Resolve did not import …` | the import raised or left files out; `binRestored` says whether your open bin came back | check the files exist and the bin is writable; if `binRestored` is false, reselect your bin in the media pool |
+| `outcome: failed` — `the media pool could not be read back after the import` | the import ran but the pool would not answer after it; `imported` is `null` (unknown, not none) | look in the plan's bin for what came in, then re-run — files already there are reused |
+| `could not read which bin is open` / `could not reselect the bin you had open` | the media pool would not report, or would not restore, your current bin — nothing was laid | reselect your bin in the media pool and re-run |
+| `… did not answer with its items` / `did not report its name, start or length` / `the track's item list and its export disagree` | before any append: a read of the target track could not be trusted, so collisions cannot be judged — nothing was laid | close any modal in Resolve and re-run; if it persists, `snapshot_timeline` and look at the track |
+| `outcome: failed` — `the track could not be read back: …` | the same unreadable track, but AFTER an append — `placed` lists what was laid before it | check that row in Resolve, then re-run with `resume=True`; laid rows read `alreadyPlaced` |
+| `outcome: failed` with `failure.landed` | Resolve laid a clip somewhere other than its frame, length or trim (or not at all); the run stopped there | remove the item `landed` names in Resolve, then re-run — re-run with `resume=True` — the rows already laid read `alreadyPlaced` |
+| `no before-snapshot, so nothing was laid: Timeline.Export (OTIO) answered … and wrote 0 bytes` | no before-snapshot to judge with | check the disk has room and no modal is open in Resolve; retry |
+| `laid N clip(s) but the after-snapshot failed, so nothing is proven` | the clips ARE on the track, but the after-export failed, so nothing proves the other tracks are untouched | check the other tracks by eye or with `snapshot_timeline`; the laid rows read `alreadyPlaced` on a re-run |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Two things worth knowing before you
-open a PR: the ten tools are deliberately few (a fixed pipeline gets fixed
+open a PR: the twelve tools are deliberately few (a fixed pipeline gets fixed
 tools), and the ANTI-PATTERNS in `CLAUDE.md` are load-bearing — each was bought
 with a live walk, and each looks wrong until you have hit it.
 
