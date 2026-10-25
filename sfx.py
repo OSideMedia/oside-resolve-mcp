@@ -22,6 +22,14 @@ import os
 
 SFX_PLAN_FORMAT = "oside-sfx-plan/v1"
 
+# snapshot_timeline stamps its export with where it came from, under this key of
+# the timeline's metadata. Resolve's own OTIO leaves the timeline's `name` empty
+# (measured 2026-10-25 on 21.1.1), so the file alone cannot say which edit it is,
+# and a spotting pass that read another timeline would hand place_sfx frames
+# from the wrong edit.
+SNAPSHOT_STAMP = "oside-resolve-mcp"
+SNAPSHOT_FORMAT = "oside-snapshot/v1"
+
 # Frames are FLOORED (CLAUDE.md anti-pattern 7). A seconds value written from a
 # frame count — 124/60 — reads back as 123.99999999999999 frames, and a bare
 # floor drops it a whole frame. The epsilon is far below one frame at any rate.

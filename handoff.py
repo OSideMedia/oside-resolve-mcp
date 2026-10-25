@@ -55,7 +55,10 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             # audio track of an existing timeline and proves, from a before/after
             # OTIO export, that nothing else moved; snapshot_timeline exports
             # the OTIO a spotting pass reads.
-            "sfx_plan"]
+            "sfx_plan",
+            # 0.7.1 — snapshot_timeline stamps the export with the project and
+            # timeline it came from: Resolve's OTIO leaves the timeline unnamed.
+            "snapshot_stamp"]
 
 VERIFY_FORMAT = "oside-verify/1"
 VERIFY_SIDECAR = "verify.json"

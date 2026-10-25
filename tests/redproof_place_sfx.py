@@ -153,6 +153,10 @@ MUTS = [
     ("snapshot overwrites", "server.py", "        if os.path.exists(path):\n            raise rapi.ResolveError(f\"{path!r} already exists",
      "        if False:\n            raise rapi.ResolveError(f\"{path!r} already exists",
      ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
+    ("snapshot unstamped", "server.py", "        meta[sfx.SNAPSHOT_STAMP] = stamp\n", "",
+     ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
+    ("nameless timeline snapshotted", "server.py", "        if not isinstance(name, str) or not name:\n            raise",
+     "        if False:\n            raise", ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
 ]
 
 

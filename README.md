@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
@@ -281,7 +281,13 @@ The full surface, with the behaviour each one guarantees.
    a per-track summary (`kind`, `index`, `name`, clip count) with the rate and
    the start/end frames. Read-only on the project; refuses an existing file.
    This is what a spotting pass reads: which piece of picture sits where, what
-   covers it, which sound lanes are already busy.
+   covers it, which sound lanes are already busy. Since 0.7.1 the file is
+   **stamped** with where it came from, because Resolve's own OTIO leaves the
+   timeline's `name` empty: `metadata["oside-resolve-mcp"]` is an
+   `oside-snapshot/v1` record of the project, timeline, rate, start and end
+   frames, when it was taken and this server's version. Everything else is
+   Resolve's export as it came. A timeline that does not report its name gets
+   no snapshot.
 6. `place_sfx(plan_path, dry_run=False, resume=False)` (0.7.0) — lay a spotted sound-effects
    pass onto **one named audio track of an existing timeline**, from an
    `oside-sfx-plan/v1` file:
