@@ -1267,9 +1267,11 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
         try:
             found = items_by_path(media_pool, set(paths), prefer=folder)
         except Exception as e:  # noqa: BLE001 — the bin's state is reported, not raised past
+            report["imported"] = None    # unknown: the import ran, and what it brought in cannot be read
             return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
                 "reason": f"the media pool could not be read back after the import ({e}) — nothing was "
-                          f"laid.{bin_note}"})
+                          f"laid, but files may have been imported into {plan['bin']!r}: check that bin."
+                          f"{bin_note}"})
         report["imported"] = [p for p in missing if p in found]
         still = [p for p in missing if p not in found]
         if import_error is not None or still:

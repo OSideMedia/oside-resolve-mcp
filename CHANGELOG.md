@@ -61,7 +61,7 @@
   `GetEndFrame` that grows when a clip is laid past the end, duration conform on mismatched
   rates, and the 21.1 plain-track TAIL collision mode, opt-in per track (the older cells
   keep the embedded-audio drop mode they were written against).
-- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 41 mutations, each
+- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 42 mutations, each
   removing one guard; every one turns its named tests red.
 - Reviewed before release (Codex, 2026-10-25): the first cut matched `alreadyPlaced` by
   name and frame alone, forgot a pass deleted whole, said "a refused plan writes nothing"
@@ -70,8 +70,8 @@
   (a rename made a deleted pass new), took a broken entry for no history, could not heal a
   failed write, and raised an import failure past the bin's state. The third held, with
   four nits closed here: an import that answers but brings nothing in, a pool that cannot
-  be read back after it, a ledger run that is not a record, and "writes nothing" scoped to
-  the project. All fixed above, each with a test that goes red without it.
+  be read back after it (reported with `imported: null`, unknown rather than none), a
+  ledger run that is not a record, and "writes nothing" scoped to the project. All fixed above, each with a test that goes red without it.
 - Not yet measured: whether an append into a gap leaves the JSON of the clips beside it
   byte-identical in Resolve's export. Phase 1's real before/after pair passes the new diff,
   but its target track started empty. If it does not hold, the diff fails CLOSED — a

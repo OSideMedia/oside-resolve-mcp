@@ -3265,6 +3265,7 @@ def test_place_sfx_puts_the_editors_bin_back_or_says_so():
     try:
         r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
         assert not r["ok"] and r["outcome"] == "failed" and "pool went quiet" in r["failure"]["reason"], r
+        assert r["imported"] is None and "may have been imported" in r["failure"]["reason"], r   # not "none"
         assert r["binRestored"] is True and _lane(w.tl) == []
     finally:
         w.restore()
