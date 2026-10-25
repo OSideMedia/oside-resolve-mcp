@@ -15,10 +15,18 @@
 - **Breaking for 0.7.x plans:** one with no `project` (or an empty one) is refused with a
   sentence saying what to add. The schema stays `oside-sfx-plan/v1`: the format is a day
   old and has one producer, oside-foley's `motion_sfx.py plan`, which writes the field.
+- **The project and timeline are compared as written.** `load_plan` used to trim the names
+  the guard compares, so a plan for `" Edit A "` would have passed on `"Edit A"`. A project
+  whose name really has the spaces still accepts a plan that says so. Track and bin
+  lookups keep trimming both sides: the track lookup refuses two matches, so a name that
+  differs only in spaces cannot pick the wrong track.
 - A project renamed since the plan was written is now refused by the plan itself; the
   ledger's "laid elsewhere" refusal still stands behind it for a plan pointed at the new
   name, and its test now walks both.
 - Capability `sfx_plan_project`.
+- `tests/redproof_place_sfx.py`: the control now requires the suite's exit 0 and a tally in
+  which every case passed. It used to accept the absence of FAIL lines, which a suite that
+  dies before its first case also shows.
 
 ## 0.7.1 — 2026-10-25
 

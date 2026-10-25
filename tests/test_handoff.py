@@ -2851,6 +2851,31 @@ def test_place_sfx_refuses_a_plan_for_another_project():
             w.restore()
 
 
+def test_place_sfx_compares_the_project_and_timeline_exactly():
+    """[Codex r1 on 0.8.0] load_plan stripped the names the guard then
+    compared, so a plan for " DV COLOR MANG " passed on "DV COLOR MANG" — the
+    transform was part of the guard. Both names are compared as written, and
+    a project that really has the spaces accepts a plan that says so."""
+    for over, needle in (({"project": "DV COLOR MANG "}, "not 'DV COLOR MANG '"),
+                         ({"project": " DV COLOR MANG"}, "not ' DV COLOR MANG'"),
+                         ({"timeline": "YT "}, "current timeline is 'YT', not 'YT '")):
+        w = _sfx_world(SFX_FILES)
+        try:
+            assert sfx.load_plan(_plan(w, SFX_ROWS, **over))[next(iter(over))] == next(iter(over.values()))
+            r = server.place_sfx(_plan(w, SFX_ROWS, **over), dry_run=True)
+            assert not r["ok"] and needle in r.get("error", ""), (over, r)
+            assert _lane(w.tl) == [] and w.pool.imports == [], (over, r)
+        finally:
+            w.restore()
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        w.project._name = "DV COLOR MANG "
+        r = server.place_sfx(_plan(w, SFX_ROWS, project="DV COLOR MANG "))
+        assert r["ok"] and r["outcome"] == "placed" and r["project"] == "DV COLOR MANG ", r
+    finally:
+        w.restore()
+
+
 def test_place_sfx_dry_run_touches_nothing():
     w = _sfx_world(SFX_FILES, pooled=("pop.wav",))
     try:

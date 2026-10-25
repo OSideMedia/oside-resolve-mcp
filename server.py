@@ -938,7 +938,8 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
     ledger says was laid anywhere before (a renamed project reads as elsewhere)
     with rows missing here, is refused unless resume=True — rows missing from
     a track the editor has worked on were probably deleted on purpose; resume
-    only to finish a run that stopped, or to lay one plan on a second project. Never saves — save_project, then run the plan
+    only to finish a run that stopped, or to lay one plan file on a second project once its
+    `project` names that one. Never saves — save_project, then run the plan
     again with dry_run=True to confirm every row survived the save."""
     try:
         plan = sfx.load_plan(plan_path)

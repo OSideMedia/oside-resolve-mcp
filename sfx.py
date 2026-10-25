@@ -119,7 +119,12 @@ def load_plan(path: str) -> dict:
             "row": i + 1, "file": f, "sourceIn": s_in, "sourceOut": s_out, "record": rec,
             "label": str(r.get("label") or ""), "kind": str(r.get("kind") or ""),
         })
-    return {"project": plan["project"].strip(), "timeline": plan["timeline"].strip(), "track": plan["track"].strip(),
+    # The project and timeline go to the guard AS WRITTEN: each is compared
+    # exactly with a name Resolve reports, and trimming here first would let
+    # " Edit A " pass on "Edit A" [Codex r1 on 0.8.0]. The track and bin lookups
+    # trim both sides on purpose, and the track one refuses two matches, so a
+    # name that differs only in spaces still cannot pick the wrong track.
+    return {"project": plan["project"], "timeline": plan["timeline"], "track": plan["track"].strip(),
             "bin": plan["bin"].strip(), "placements": out}
 
 

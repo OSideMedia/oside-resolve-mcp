@@ -1153,8 +1153,9 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
     sfx.read_ledger) says was laid ANYWHERE before, when any of its rows is
     missing here. Anywhere, not just here: a project, timeline or track
     renamed since reads as somewhere else, and a ledger matched on names
-    would hand a deleted pass back. Laying one plan on a second project is
-    the explicit `resume=True`.
+    would hand a deleted pass back. Laying one plan file on a second project
+    takes both: its `project` pointed at that project (step 1 refuses any
+    other), then the explicit `resume=True`.
     Rows missing from a track an editor has worked on were probably deleted
     on purpose — re-laying a deliberate deletion is the change "do not touch
     anything else" forbids [2026-10-25: the editor removed 21 clips of a
