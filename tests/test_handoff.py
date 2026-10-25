@@ -3442,7 +3442,8 @@ def test_snapshot_timeline_writes_a_new_file_and_never_overwrites():
         # an existing file is refused before Resolve is asked to export anything
         before = list(exports)
         again = server.snapshot_timeline(out)
-        assert not again["ok"] and "never overwrites" in again["error"] and exports == before, (again, exports)
+        assert exports == before, exports
+        assert not again["ok"] and "never overwrites" in again["error"], again
         other = server.snapshot_timeline(os.path.join(w.tmp, "shorts.otio"), "YT Shorts")
         assert other["ok"] and other["timeline"] == "YT Shorts"
         with open(os.path.join(w.tmp, "shorts.otio"), encoding="utf-8") as f:
