@@ -14,12 +14,12 @@
   long with `GetLeftOffset` 12 — conformed by duration, floored).
 - **Every collision is judged from one read before any write** — with the track, with the
   other rows, past the timeline end, past the end of the file, a trim under one frame — so
-  a plan refused there writes nothing. Files the pool lacks import as a plain path list
+  a plan refused there writes nothing to the project. Files the pool lacks import as a plain path list
   into the plan's bin (the documented dict form imports nothing on 21.1) and are re-found
   by `File Path`, never by name; the editor's current bin is put back in a `finally`, an
   open bin that cannot be read is refused before importing, and an import that raises or
-  leaves files out is a `failed` outcome carrying `binRestored` — true only when Resolve
-  confirmed the reselect. The plan is then judged again at the rate the pool gave each
+  leaves files out — or a pool that cannot be read back after it — is a `failed` outcome
+  carrying `binRestored`, true only when Resolve confirmed the reselect. The plan is then judged again at the rate the pool gave each
   file; a refusal there HAS imported, and says so.
 - **Reads fail closed.** A track that does not answer with a list, or an item without a
   readable name, start or length, is an error — never an empty lane. The track read and
@@ -61,15 +61,17 @@
   `GetEndFrame` that grows when a clip is laid past the end, duration conform on mismatched
   rates, and the 21.1 plain-track TAIL collision mode, opt-in per track (the older cells
   keep the embedded-audio drop mode they were written against).
-- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 38 mutations, each
+- `tests/redproof_place_sfx.py` (not in CI): a positive control, then 41 mutations, each
   removing one guard; every one turns its named tests red.
 - Reviewed before release (Codex, 2026-10-25): the first cut matched `alreadyPlaced` by
   name and frame alone, forgot a pass deleted whole, said "a refused plan writes nothing"
   over a refusal that had imported, compared the target track as (name, start, length),
   and read unreadable evidence as empty. The second read found the ledger matched by name
   (a rename made a deleted pass new), took a broken entry for no history, could not heal a
-  failed write, and raised an import failure past the bin's state. All fixed above, each
-  with a test that goes red without it.
+  failed write, and raised an import failure past the bin's state. The third held, with
+  four nits closed here: an import that answers but brings nothing in, a pool that cannot
+  be read back after it, a ledger run that is not a record, and "writes nothing" scoped to
+  the project. All fixed above, each with a test that goes red without it.
 - Not yet measured: whether an append into a gap leaves the JSON of the clips beside it
   byte-identical in Resolve's export. Phase 1's real before/after pair passes the new diff,
   but its target track started empty. If it does not hold, the diff fails CLOSED — a

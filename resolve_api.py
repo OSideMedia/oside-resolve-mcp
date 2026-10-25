@@ -1261,11 +1261,16 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                 restored = bool(media_pool.SetCurrentFolder(previous))
             except Exception:  # noqa: BLE001 — any failure to put it back is reported, never raised past
                 restored = False
-        found = items_by_path(media_pool, set(paths), prefer=folder)
-        report["imported"] = [p for p in missing if p in found]
         report["binRestored"] = restored
         bin_note = "" if restored else (" Your open bin could not be reselected — reselect it in the "
                                         "media pool.")
+        try:
+            found = items_by_path(media_pool, set(paths), prefer=folder)
+        except Exception as e:  # noqa: BLE001 — the bin's state is reported, not raised past
+            return finish("failed", toPlace=[_public(r) for r in verdict["toPlace"]], failure={
+                "reason": f"the media pool could not be read back after the import ({e}) — nothing was "
+                          f"laid.{bin_note}"})
+        report["imported"] = [p for p in missing if p in found]
         still = [p for p in missing if p not in found]
         if import_error is not None or still:
             what = f"the import failed ({import_error})" if import_error is not None else \

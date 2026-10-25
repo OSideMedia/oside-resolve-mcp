@@ -300,7 +300,8 @@ The full surface, with the behaviour each one guarantees.
    once and the bin exists — it never creates tracks or bins; judges every
    collision — with the track, with other rows, past the timeline's end, past
    the end of the file, a trim shorter than a frame — from **one read before
-   any write**, so a plan refused there writes nothing; imports what the pool
+   any write**, so a plan refused there writes nothing to the project (the
+   ledger beside the plan may record rows it found already laid); imports what the pool
    lacks (matched by `File Path`, never by clip name), puts your current bin
    back even when the import fails — a failed import is a `failed` outcome
    with `binRestored`, never an exception that hides the bin — and

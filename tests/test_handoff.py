@@ -3091,7 +3091,8 @@ def test_place_sfx_refuses_a_ledger_that_only_half_reads():
                             ({"schema": "oside-sfx-ledger/v1", "entries": [dict(good, placedAt="")]}, "entry 1"),
                             ({"schema": "oside-sfx-ledger/v1", "entries": [{k: v for k, v in good.items() if k != "runs"}]},
                              "entry 1"),
-                            ({"schema": "oside-sfx-ledger/v1", "entries": [good, dict(good, project=None)]}, "entry 2")):
+                            ({"schema": "oside-sfx-ledger/v1", "entries": [good, dict(good, project=None)]}, "entry 2"),
+                            ({"schema": "oside-sfx-ledger/v1", "entries": [dict(good, runs=[None])]}, "entry 1")):
             with open(plan + ".placed.json", "w") as f:
                 json.dump(doc, f)
             r = server.place_sfx(plan)
@@ -3199,11 +3200,13 @@ def test_place_sfx_says_so_when_it_refuses_after_importing():
 
 
 def test_place_sfx_puts_the_editors_bin_back_or_says_so():
-    """[Codex r1, r2] The bin restore was skipped by an exception and its
-    answer ignored. Four cells: the import raises (restored anyway, and said
-    so), the import raises AND the restore is refused (both said), the
-    restore is refused (reported, nothing laid), the open bin cannot be read
-    (refused before any import)."""
+    """[Codex r1, r2, r3] The bin restore was skipped by an exception and its
+    answer ignored. The cells: the import raises (restored anyway, and said
+    so); the import raises AND the restore is refused (both said); the import
+    answers but brings nothing in, with and without the restore (both said);
+    the pool cannot be read back after the import (failed, bin state kept);
+    the restore is refused (reported, nothing laid); the open bin cannot be
+    read (refused before any import)."""
     class Raises(FakeMediaPool):
         def ImportMedia(self, paths):
             raise RuntimeError("disk went away")
@@ -3216,6 +3219,20 @@ def test_place_sfx_puts_the_editors_bin_back_or_says_so():
 
     class RaisesStuck(Raises, Stuck):
         pass
+
+    class Skips(FakeMediaPool):          # answers normally, imports nothing
+        def ImportMedia(self, paths):
+            self.imports.extend(paths)
+            return []
+
+    class SkipsStuck(Skips, Stuck):
+        pass
+
+    class Blind(FakeMediaPool):          # imports, then the pool will not be walked
+        def ImportMedia(self, paths):
+            out = super().ImportMedia(paths)
+            self.GetRootFolder = lambda: (_ for _ in ()).throw(RuntimeError("pool went quiet"))
+            return out
 
     class Unread(FakeMediaPool):
         def GetCurrentFolder(self):
@@ -3233,6 +3250,22 @@ def test_place_sfx_puts_the_editors_bin_back_or_says_so():
         r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
         assert not r["ok"] and r["binRestored"] is False, r
         assert "disk went away" in r["failure"]["reason"] and "could not be reselected" in r["failure"]["reason"], r
+    finally:
+        w.restore()
+    for cls, back in ((Skips, True), (SkipsStuck, False)):
+        w = _sfx_world(SFX_FILES, pool_cls=cls)
+        try:
+            r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+            assert not r["ok"] and r["outcome"] == "failed" and "did not import" in r["failure"]["reason"], r
+            assert r["binRestored"] is back and ("could not be reselected" in r["failure"]["reason"]) is not back, r
+            assert w.pool.imports and _lane(w.tl) == []
+        finally:
+            w.restore()
+    w = _sfx_world(SFX_FILES, pool_cls=Blind)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and r["outcome"] == "failed" and "pool went quiet" in r["failure"]["reason"], r
+        assert r["binRestored"] is True and _lane(w.tl) == []
     finally:
         w.restore()
     w = _sfx_world(SFX_FILES, pool_cls=Stuck)
