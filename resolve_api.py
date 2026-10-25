@@ -1130,9 +1130,11 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
     """Lay a validated oside-sfx-plan/v1 (sfx.load_plan) onto its track.
 
     The order is the whole design:
-      1. refuse unless the plan's timeline is the CURRENT one (AppendToTimeline
-         only writes there, and this tool does not move the editor), the track
-         exists exactly once, and the bin exists;
+      1. refuse unless the plan's project is the OPEN one (every project made
+         from the template has a "YT" with the same tracks and bins, so nothing
+         after this check can tell them apart), its timeline is the CURRENT one
+         (AppendToTimeline only writes there, and this tool does not move the
+         editor), the track exists exactly once, and the bin exists;
       2. judge every collision from ONE read of the track, before any write —
          a refused plan writes nothing (anti-pattern 3);
       3. import what the pool lacks, as a plain list of paths (the documented
@@ -1151,8 +1153,9 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
     sfx.read_ledger) says was laid ANYWHERE before, when any of its rows is
     missing here. Anywhere, not just here: a project, timeline or track
     renamed since reads as somewhere else, and a ledger matched on names
-    would hand a deleted pass back. Laying one plan on a second project is
-    the explicit `resume=True`.
+    would hand a deleted pass back. Laying one plan file on a second project
+    takes both: its `project` pointed at that project (step 1 refuses any
+    other), then the explicit `resume=True`.
     Rows missing from a track an editor has worked on were probably deleted
     on purpose — re-laying a deliberate deletion is the change "do not touch
     anything else" forbids [2026-10-25: the editor removed 21 clips of a
@@ -1166,6 +1169,12 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
     save_project, then this plan again with dry_run=True — every row should
     come back `alreadyPlaced`."""
     import sfx
+    project_name = project.GetName()
+    if project_name != plan["project"]:
+        raise ResolveError(
+            f"The open project is {project_name!r}, not {plan['project']!r}. Open {plan['project']!r} in "
+            "Resolve first — place_sfx lays into the OPEN project and will not switch it."
+        )
     timeline = project.GetCurrentTimeline()
     current = timeline.GetName() if timeline is not None else None
     if current != plan["timeline"]:
@@ -1192,7 +1201,6 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
     paths = sorted({p["file"] for p in plan["placements"]})
     found = items_by_path(media_pool, set(paths), prefer=folder)
     missing = [p for p in paths if p not in found]
-    project_name = project.GetName()
     here = sfx.ledger_entry(history, project_name, current, plan["track"])
     laid_before = here["placedAt"] if here else None
     elsewhere = [{k: e[k] for k in ("project", "timeline", "track", "placedAt")}

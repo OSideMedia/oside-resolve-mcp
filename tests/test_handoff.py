@@ -902,7 +902,8 @@ def test_tool_annotations_prompt_and_capabilities():
     assert caps["manifest"] == "oside-davinci/v1"
     assert caps["features"] == ["placements", "cues", "dry_run", "verify_v2", "vo_track",
                                 "look", "text_tasks", "verify_v3", "post_save", "cdl_envelope",
-                                "cdl_readback", "verify_json", "vo_lanes", "sfx_plan", "snapshot_stamp"]
+                                "cdl_readback", "verify_json", "vo_lanes", "sfx_plan", "snapshot_stamp",
+                                "sfx_plan_project"]
     assert caps["sfxPlan"] == "oside-sfx-plan/v1"
     assert caps["version"] == server._version() and caps["version"] != "0.0.0"
     # resolve_status hands the block back even when Resolve is unreachable
@@ -2575,14 +2576,19 @@ def _sfx_world(files, pooled=(), start=0, end=6000, fps=60, lane=(), export_byte
 
 
 def _plan(w, rows, **over):
-    doc = {"schema": "oside-sfx-plan/v1", "timeline": "YT", "track": "SFX 3", "bin": "SFX",
+    doc = {"schema": "oside-sfx-plan/v1", "project": "DV COLOR MANG", "timeline": "YT", "track": "SFX 3",
+           "bin": "SFX",
            "placements": [{"file": w.paths[n], "sourceIn": a, "sourceOut": b, "record": r, "label": f"cue {i + 1}"}
                           for i, (n, a, b, r) in enumerate(rows)]}
     doc.update(over)
+    doc = {k: v for k, v in doc.items() if v is not _DROP}
     path = os.path.join(w.tmp, f"plan-{len(os.listdir(w.tmp))}.json")
     with open(path, "w") as f:
         json.dump(doc, f)
     return path
+
+
+_DROP = object()   # _plan(w, rows, key=_DROP) writes the plan without that key
 
 
 def _lane(tl, idx=3):
@@ -2601,6 +2607,10 @@ def test_sfx_plan_refuses_each_bad_row_with_a_sentence():
         assert len(sfx.load_plan(good)["placements"]) == 3
         bad = [
             ({"schema": "oside-sfx-plan/v0"}, "schema"),
+            ({"project": _DROP}, "names no 'project'"),
+            ({"project": ""}, "names no 'project'"),
+            ({"project": "  "}, "names no 'project'"),
+            ({"project": None}, "names no 'project'"),
             ({"track": ""}, "'track'"),
             ({"placements": []}, "no placements"),
             ({"placements": [{"file": "pop.wav", "sourceIn": 0, "sourceOut": 1, "record": 0}]}, "absolute"),
@@ -2819,6 +2829,49 @@ def test_place_sfx_refuses_the_wrong_timeline_track_or_bin():
         r = server.place_sfx(_plan(w, SFX_ROWS, bin="SOUNDS"))
         assert not r["ok"] and "No bin named 'SOUNDS'" in r["error"], r
         assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_a_plan_for_another_project():
+    """Every project made from the template has a "YT" with the same tracks
+    and bins, so the timeline, track and bin checks all pass on the wrong
+    project. The plan names its project; another open one is refused before
+    anything is read, imported or recorded — a dry run too, whose report
+    would otherwise describe the wrong edit."""
+    for dry in (False, True):
+        w = _sfx_world(SFX_FILES)
+        try:
+            plan = _plan(w, SFX_ROWS, project="DV COLOUR MANG")
+            r = server.place_sfx(plan, dry_run=dry)
+            assert not r["ok"] and "open project is 'DV COLOR MANG', not 'DV COLOUR MANG'" in r.get("error", ""), (dry, r)
+            assert _lane(w.tl) == [] and _lane(w.other) == [] and w.pool.imports == [], (dry, r)
+            assert not os.path.exists(sfx.ledger_path(plan)), dry
+        finally:
+            w.restore()
+
+
+def test_place_sfx_compares_the_project_and_timeline_exactly():
+    """[Codex r1 on 0.8.0] load_plan stripped the names the guard then
+    compared, so a plan for " DV COLOR MANG " passed on "DV COLOR MANG" — the
+    transform was part of the guard. Both names are compared as written, and
+    a project that really has the spaces accepts a plan that says so."""
+    for over, needle in (({"project": "DV COLOR MANG "}, "not 'DV COLOR MANG '"),
+                         ({"project": " DV COLOR MANG"}, "not ' DV COLOR MANG'"),
+                         ({"timeline": "YT "}, "current timeline is 'YT', not 'YT '")):
+        w = _sfx_world(SFX_FILES)
+        try:
+            assert sfx.load_plan(_plan(w, SFX_ROWS, **over))[next(iter(over))] == next(iter(over.values()))
+            r = server.place_sfx(_plan(w, SFX_ROWS, **over), dry_run=True)
+            assert not r["ok"] and needle in r.get("error", ""), (over, r)
+            assert _lane(w.tl) == [] and w.pool.imports == [], (over, r)
+        finally:
+            w.restore()
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        w.project._name = "DV COLOR MANG "
+        r = server.place_sfx(_plan(w, SFX_ROWS, project="DV COLOR MANG "))
+        assert r["ok"] and r["outcome"] == "placed" and r["project"] == "DV COLOR MANG ", r
     finally:
         w.restore()
 
@@ -3142,13 +3195,22 @@ def test_place_sfx_ledger_that_failed_to_write_is_written_by_the_next_run():
 def test_place_sfx_a_renamed_project_does_not_make_a_deleted_pass_new():
     """[Codex r2] The ledger matched on names, so renaming the project (or
     timeline, or track) made a pass the editor deleted read as never laid.
-    A plan laid anywhere is refused with rows missing here."""
+    A plan laid anywhere is refused with rows missing here. Since 0.8.0 the
+    plan's own project refuses the renamed one first; the plan is then
+    pointed at the new name, as an editor following that refusal would, and
+    the ledger is the only witness left."""
     w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
     try:
         plan = _plan(w, SFX_ROWS)
         assert server.place_sfx(plan)["outcome"] == "placed"
         w.project._name = "DV COLOR MANG v2"
         w.tl._tracks[("audio", 3)].clear()
+        stale = server.place_sfx(plan, dry_run=True)
+        assert not stale["ok"] and "not 'DV COLOR MANG'" in stale["error"], stale
+        with open(plan) as f:
+            doc = json.load(f)
+        with open(plan, "w") as f:
+            json.dump({**doc, "project": "DV COLOR MANG v2"}, f)
         dry = server.place_sfx(plan, dry_run=True)
         assert dry["laidBefore"] is None and [e["project"] for e in dry["laidElsewhere"]] == ["DV COLOR MANG"], dry
         r = server.place_sfx(plan)

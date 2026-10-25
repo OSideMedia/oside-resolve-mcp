@@ -161,6 +161,23 @@ MUTS = [
      "        if not name:\n            raise", ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
     ("snapshot written over a file that appeared mid-export", "server.py", "with open(path, \"x\", encoding=\"utf-8\")",
      "with open(path, \"w\", encoding=\"utf-8\")", ["test_snapshot_timeline_writes_a_new_file_and_never_overwrites"]),
+    ("the plan's project not compared", "resolve_api.py", "    if project_name != plan[\"project\"]:",
+     "    if False:",
+     ["test_place_sfx_refuses_a_plan_for_another_project",
+      "test_place_sfx_a_renamed_project_does_not_make_a_deleted_pass_new"]),
+    ("a plan read without a project", "sfx.py",
+     "    if not isinstance(plan.get(\"project\"), str) or not plan[\"project\"].strip():", "    if False:",
+     ["test_sfx_plan_refuses_each_bad_row_with_a_sentence"]),
+    ("the project trimmed before the guard", "sfx.py", "    return {\"project\": plan[\"project\"], ",
+     "    return {\"project\": plan[\"project\"].strip(), ",
+     ["test_place_sfx_compares_the_project_and_timeline_exactly"]),
+    ("the timeline trimmed before the guard", "sfx.py", "\"timeline\": plan[\"timeline\"], \"track\"",
+     "\"timeline\": plan[\"timeline\"].strip(), \"track\"",
+     ["test_place_sfx_compares_the_project_and_timeline_exactly"]),
+    ("a blank project accepted", "sfx.py",
+     "    if not isinstance(plan.get(\"project\"), str) or not plan[\"project\"].strip():",
+     "    if not isinstance(plan.get(\"project\"), str):",
+     ["test_sfx_plan_refuses_each_bad_row_with_a_sentence"]),
     # Not mutated: the metadata guard. Without it a stampless export still
     # refuses (assigning into None raises before any file opens), so removing
     # it changes the message, not the outcome; the test pins the message only.
@@ -172,7 +189,8 @@ WORK = os.path.join(tempfile.mkdtemp(prefix="redproof-"), "repo")
 
 def run():
     r = subprocess.run([PY, "tests/test_handoff.py"], cwd=WORK, capture_output=True, text=True)
-    return {m.group(1) for m in re.finditer(r"^FAIL  (\S+)", r.stdout, re.M)}, r.stdout.strip().splitlines()[-1]
+    return ({m.group(1) for m in re.finditer(r"^FAIL  (\S+)", r.stdout, re.M)}, r.stdout.strip().splitlines()[-1],
+            r.returncode)
 
 
 def fresh():
@@ -182,9 +200,12 @@ def fresh():
 
 
 fresh()
-failed, tail = run()
+failed, tail, rc = run()
 print("CONTROL (unmutated):", tail)
-assert not failed, failed
+# a suite that dies before its first case prints no FAIL line either: require its clean exit and a
+# tally in which every case passed
+tally = re.fullmatch(r"(\d+) passed, 0 unknown \(not passes\), 0 failed — of (\d+)", tail)
+assert rc == 0 and not failed and tally and int(tally[1]) > 0 and tally[1] == tally[2], (rc, failed, tail)
 bad = 0
 for name, f, old, new, expect in MUTS:
     fresh()
@@ -195,7 +216,7 @@ for name, f, old, new, expect in MUTS:
         bad += 1
         continue
     open(p, "w").write(s.replace(old, new))
-    failed, tail = run()
+    failed, tail, _ = run()
     missing = [t for t in expect if t not in failed]
     print(f"{'RED ' if not missing else 'MISS'} {name}: failed={sorted(failed)}" + (f" — NOT red: {missing}" if missing else ""))
     bad += bool(missing)

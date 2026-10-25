@@ -919,8 +919,10 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
     """Lay a spotted SFX pass onto ONE named audio track of an EXISTING timeline,
     from an oside-sfx-plan/v1 file, and prove nothing else moved.
 
-    The plan names the timeline (it must be the CURRENT one — this tool will not
-    switch your editor), an existing audio track, an existing bin, and rows of
+    The plan names the project (it must be the OPEN one — every project made
+    from the template has a "YT"), the timeline (it must be the CURRENT one —
+    this tool will not switch your editor), an existing audio track, an
+    existing bin, and rows of
     {file, sourceIn, sourceOut (seconds), record (timeline frame), label, kind}.
     Every collision is judged from one read BEFORE anything is written; a plan
     refused there writes nothing. Missing files then import into the bin, and
@@ -936,7 +938,8 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
     ledger says was laid anywhere before (a renamed project reads as elsewhere)
     with rows missing here, is refused unless resume=True — rows missing from
     a track the editor has worked on were probably deleted on purpose; resume
-    only to finish a run that stopped, or to lay one plan on a second project. Never saves — save_project, then run the plan
+    only to finish a run that stopped, or to lay one plan file on a second project once its
+    `project` names that one. Never saves — save_project, then run the plan
     again with dry_run=True to confirm every row survived the save."""
     try:
         plan = sfx.load_plan(plan_path)
