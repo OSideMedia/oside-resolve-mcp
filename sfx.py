@@ -53,6 +53,7 @@ def load_plan(path: str) -> dict:
 
     {
       "schema": "oside-sfx-plan/v1",
+      "project": "DV COLOR MANG",  the project, which must be the OPEN one (0.8.0)
       "timeline": "YT",            the timeline, which must be CURRENT in Resolve
       "track": "SFX 3",            an EXISTING audio track, by name, exactly one
       "bin": "SFX",                an EXISTING bin; missing files import here
@@ -68,7 +69,13 @@ def load_plan(path: str) -> dict:
     Source trims are SECONDS because the frame unit is the media-pool item's
     own rate, which Resolve assigns at import: a WAV can come in tagged 25 fps
     on a 60 fps project (measured 2026-10-25 on 21.1.1). A plan written in
-    frames would have to know that before the file was ever imported."""
+    frames would have to know that before the file was ever imported.
+
+    The project is required because nothing else in the plan tells two
+    projects apart: every project made from the template has a "YT" with the
+    same tracks and bins, so a plan spotted on one edit passes every other
+    check on another and lays its frames there. 0.7.x plans named none and
+    are refused with a sentence saying what to add."""
     try:
         with open(path, encoding="utf-8") as f:
             plan = json.load(f)
@@ -80,6 +87,9 @@ def load_plan(path: str) -> dict:
         raise PlanError("The plan must be a JSON object.")
     if plan.get("schema") != SFX_PLAN_FORMAT:
         raise PlanError(f"The plan's schema is {plan.get('schema')!r}; this tool reads {SFX_PLAN_FORMAT!r}.")
+    if not isinstance(plan.get("project"), str) or not plan["project"].strip():
+        raise PlanError("The plan names no 'project': the Resolve project it was spotted on, which place_sfx "
+                        "checks against the open one (since 0.8.0). Add it, or write the plan again.")
     for key in ("timeline", "track", "bin"):
         if not isinstance(plan.get(key), str) or not plan[key].strip():
             raise PlanError(f"The plan needs a non-empty {key!r} string.")
@@ -109,7 +119,7 @@ def load_plan(path: str) -> dict:
             "row": i + 1, "file": f, "sourceIn": s_in, "sourceOut": s_out, "record": rec,
             "label": str(r.get("label") or ""), "kind": str(r.get("kind") or ""),
         })
-    return {"timeline": plan["timeline"].strip(), "track": plan["track"].strip(),
+    return {"project": plan["project"].strip(), "timeline": plan["timeline"].strip(), "track": plan["track"].strip(),
             "bin": plan["bin"].strip(), "placements": out}
 
 

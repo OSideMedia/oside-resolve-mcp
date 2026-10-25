@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
@@ -294,7 +294,8 @@ The full surface, with the behaviour each one guarantees.
    `oside-sfx-plan/v1` file:
 
    ```json
-   {"schema": "oside-sfx-plan/v1", "timeline": "YT", "track": "SFX 3", "bin": "SFX",
+   {"schema": "oside-sfx-plan/v1", "project": "DV COLOR MANG", "timeline": "YT",
+    "track": "SFX 3", "bin": "SFX",
     "placements": [{"file": "/abs/path/check.wav", "sourceIn": 0, "sourceOut": 1.633,
                     "record": 609, "label": "part 1 — check", "kind": "CHECK"}]}
    ```
@@ -302,7 +303,10 @@ The full surface, with the behaviour each one guarantees.
    `record` is a timeline frame relative to the timeline's start; trims are
    **seconds**, because the frame unit is the pool item's own rate and Resolve
    picks that at import (a WAV can arrive tagged 25 fps on a 60 fps project).
-   The guarantees, in order: refuses unless the plan's timeline is the
+   The guarantees, in order: refuses unless the plan's project is the **open**
+   one (0.8.0 — every project made from the template has a `YT` with the same
+   tracks and bins, so nothing else in the plan tells two edits apart; a plan
+   that names no project is refused), the plan's timeline is the
    **current** one (it never switches your editor), the track exists exactly
    once and the bin exists — it never creates tracks or bins; judges every
    collision — with the track, with other rows, past the timeline's end, past
@@ -346,7 +350,7 @@ The full surface, with the behaviour each one guarantees.
 
 Plus `resolve_status` (with a `capabilities` block — `{"manifest":
 "oside-davinci/v1", "features": ["placements","cues","dry_run","verify_v2",
-"vo_track","look","text_tasks", …, "sfx_plan"], "sfxPlan": "oside-sfx-plan/v1", "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
+"vo_track","look","text_tasks", …, "sfx_plan", "snapshot_stamp", "sfx_plan_project"], "sfxPlan": "oside-sfx-plan/v1", "version"}` — returned even when Resolve is unreachable, so OSIDE can compare
 before it relies on a feature), `launch_resolve`, `list_templates`, and
 `export_template(kind)` (snapshot a live template project to `templates/`).
 One MCP prompt, `handoff`, carries the recipe below. Every tool declares MCP
@@ -458,6 +462,8 @@ appear in the tool's `error` field.
 | `manifest.look.schema 'X' is not oside-look/1` | the package carries a newer look block than this MCP reads | update oside-resolve-mcp, or re-export from a studio build that writes v1 |
 | `pipeline crashed before a report could be built: …` | an exception past the manifest load — the report still prints, with the Python error in `error` | read the error; if it names a manifest key, it is a shape this table does not know yet — file it |
 | `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |
+| `The open project is 'X', not 'Y'.` | `place_sfx` lays into the OPEN project only; the plan was spotted on another (or the project was renamed since) | open the plan's project in Resolve; if it was renamed, write the plan again from a fresh snapshot |
+| `The plan names no 'project' …` | a plan written for 0.7.x, which did not read one | add `"project"` (the Resolve project it was spotted on), or write the plan again |
 | `The current timeline is 'X', not 'Y'.` | `place_sfx` lays into the CURRENT timeline only, and will not switch your editor | open the plan's timeline in Resolve, then run the plan again |
 | `Expected exactly one audio track named 'X' …, found N.` | the plan names a track that is missing, or two tracks share the name | add or rename the track in Resolve — `place_sfx` never creates or renames tracks |
 | `No bin named 'X'. place_sfx imports into an EXISTING bin only.` | the plan's `bin` is not in the media pool (often a typo) | fix the plan, or create the bin in Resolve |

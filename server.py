@@ -919,8 +919,10 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
     """Lay a spotted SFX pass onto ONE named audio track of an EXISTING timeline,
     from an oside-sfx-plan/v1 file, and prove nothing else moved.
 
-    The plan names the timeline (it must be the CURRENT one — this tool will not
-    switch your editor), an existing audio track, an existing bin, and rows of
+    The plan names the project (it must be the OPEN one — every project made
+    from the template has a "YT"), the timeline (it must be the CURRENT one —
+    this tool will not switch your editor), an existing audio track, an
+    existing bin, and rows of
     {file, sourceIn, sourceOut (seconds), record (timeline frame), label, kind}.
     Every collision is judged from one read BEFORE anything is written; a plan
     refused there writes nothing. Missing files then import into the bin, and

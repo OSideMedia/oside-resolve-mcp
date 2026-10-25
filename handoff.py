@@ -58,7 +58,11 @@ FEATURES = ["placements", "cues", "dry_run", "verify_v2", "vo_track", "look", "t
             "sfx_plan",
             # 0.7.1 — snapshot_timeline stamps the export with the project and
             # timeline it came from: Resolve's OTIO leaves the timeline unnamed.
-            "snapshot_stamp"]
+            "snapshot_stamp",
+            # 0.8.0 — an oside-sfx-plan/v1 must name its `project`, and place_sfx
+            # refuses any other open project: every project made from the template
+            # has a "YT" with the same tracks and bins.
+            "sfx_plan_project"]
 
 VERIFY_FORMAT = "oside-verify/1"
 VERIFY_SIDECAR = "verify.json"

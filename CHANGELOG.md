@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.8.0 — 2026-10-25
+
+### Changed — a plan says which project it is for
+
+- **An `oside-sfx-plan/v1` must name its `project`, and `place_sfx` refuses any other
+  open project**, before it reads the timeline, the track, the bin or the pool, so a
+  refused plan imports nothing and records nothing, dry run or not. Every project made
+  from the template has a `YT` with the same tracks and bins, so 0.7.x passed every check
+  on the wrong project and laid the pass there; the only guard was the operator confirming
+  the open project by hand.
+- **Breaking for 0.7.x plans:** one with no `project` (or an empty one) is refused with a
+  sentence saying what to add. The schema stays `oside-sfx-plan/v1`: the format is a day
+  old and has one producer, oside-foley's `motion_sfx.py plan`, which writes the field.
+- A project renamed since the plan was written is now refused by the plan itself; the
+  ledger's "laid elsewhere" refusal still stands behind it for a plan pointed at the new
+  name, and its test now walks both.
+- Capability `sfx_plan_project`.
+
 ## 0.7.1 — 2026-10-25
 
 ### Changed — a snapshot says which edit it is
