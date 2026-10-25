@@ -922,23 +922,40 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
     The plan names the timeline (it must be the CURRENT one — this tool will not
     switch your editor), an existing audio track, an existing bin, and rows of
     {file, sourceIn, sourceOut (seconds), record (timeline frame), label, kind}.
-    Every collision is judged from one read BEFORE anything is written; a refused
-    plan writes nothing. Missing files import into the bin. Each clip is read
-    back after its append (frame, length, trim) and the first mismatch stops the
-    run. A before/after OTIO export then proves every other track is identical.
+    Every collision is judged from one read BEFORE anything is written; a plan
+    refused there writes nothing. Missing files then import into the bin, and
+    the plan is judged again at the rate the pool gave them — a refusal THERE
+    has imported (the report lists what). Each clip is read back after its
+    append (file, frame, length, trim) and the first mismatch stops the run. A
+    before/after OTIO export then proves every other track is identical.
 
-    Re-running a plan is a no-op: a clip already at its frame with its length
-    reads `alreadyPlaced`. A PARTLY placed plan is refused unless resume=True —
-    rows missing from a track the editor has worked on were probably deleted on
-    purpose; resume only to finish a run that stopped. Never saves —
-    save_project, then run the plan again with dry_run=True to confirm every
-    row survived the save."""
+    Re-running a plan is a no-op: a clip already at its frame with its file,
+    length and trim reads `alreadyPlaced`. Every run that lays a clip is
+    recorded beside the plan in `<plan>.placed.json`. A plan the track only
+    PARTLY holds, or one the ledger says was laid here before with rows now
+    missing, is refused unless resume=True — rows missing from a track the
+    editor has worked on were probably deleted on purpose; resume only to
+    finish a run that stopped. Never saves — save_project, then run the plan
+    again with dry_run=True to confirm every row survived the save."""
     try:
         plan = sfx.load_plan(plan_path)
+        history = sfx.read_ledger(plan_path)
         resolve = rapi.connect()
         _, project = _open_project(resolve)
-        report = rapi.place_sfx(resolve, project, plan, dry_run=dry_run, resume=resume)
+        report = rapi.place_sfx(resolve, project, plan, dry_run=dry_run, resume=resume, history=history)
         ok = report["outcome"] in ("placed", "nothing-to-do", "dry-run")
+        if report.get("placed"):
+            # what is on the track is the truth; the ledger is only how a later
+            # run knows a pass deleted whole was laid at all — a failed write is
+            # reported, never allowed to hide the run that happened
+            try:
+                sfx.record_run(plan_path, history, report,
+                               datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
+                report["ledger"] = sfx.ledger_path(plan_path)
+                report["ledgerWritten"] = True
+            except OSError as e:
+                report["ledgerWritten"] = False
+                report["ledgerError"] = str(e)
         return {"ok": ok, **report}
     except Exception as e:  # noqa: BLE001
         return _err(e)

@@ -137,10 +137,12 @@ class FakeTimeline:
         return self._start
 
     def GetEndFrame(self):
-        if self._end is not None:
-            return self._end
-        ends = [x.GetStart() + x.GetDuration() for lane in self._tracks.values() for x in lane]
-        return max(ends, default=self._start)
+        """The end of the last item on any track — never less than the `end`
+        the fixture set, but a clip laid past it LENGTHENS the timeline, as
+        Resolve's does. A fixed answer here could never fail
+        timelineEndUnchanged."""
+        ends = [x._s + x._d for lane in self._tracks.values() for x in lane]     # the fake's own state, not a read
+        return max(ends + ([self._end] if self._end is not None else []), default=self._start)
 
     def GetSetting(self, key):
         if key == "timelineFrameRate" and self._fps is not None:
@@ -152,7 +154,9 @@ class FakeTimeline:
         Resolve refuses it (no file, False). Writes the shape Resolve writes
         (measured 2026-10-25 on 21.1.1): video tracks then audio tracks, each a
         run of Gap.1 / Clip.2 children at the timeline rate. `export_bytes=0`
-        reproduces the True-over-an-empty-file lie of anti-pattern 9."""
+        reproduces the True-over-an-empty-file lie of anti-pattern 9. Like
+        Resolve's, every track runs to the timeline end: an empty track is ONE
+        Gap, and every other ends in a trailing Gap (measured 2026-10-25)."""
         if export_type is not _EXPORT_OTIO:
             return False
         if self._export_bytes == 0:
@@ -163,17 +167,29 @@ class FakeTimeline:
         def rt(v):
             return {"OTIO_SCHEMA": "RationalTime.1", "rate": rate, "value": float(v)}
 
+        end = self.GetEndFrame()
+
+        def gap(n):
+            return {"OTIO_SCHEMA": "Gap.1", "metadata": {}, "name": "",
+                    "source_range": {"OTIO_SCHEMA": "TimeRange.1", "duration": rt(n), "start_time": rt(0)},
+                    "effects": [], "markers": [], "enabled": True}
+
         def track(kind, idx):
             pos, kids = self._start, []
             for x in sorted(self._tracks[(kind, idx)], key=lambda x: x.GetStart()):
                 if x.GetStart() > pos:
-                    kids.append({"OTIO_SCHEMA": "Gap.1", "metadata": {}, "name": "",
-                                 "source_range": {"OTIO_SCHEMA": "TimeRange.1", "duration": rt(x.GetStart() - pos),
-                                                  "start_time": rt(0)}, "effects": [], "markers": [], "enabled": True})
+                    kids.append(gap(x.GetStart() - pos))
+                media = x.GetMediaPoolItem()
+                url = media.GetClipProperty("File Path") if media is not None else None
                 kids.append({"OTIO_SCHEMA": "Clip.2", "metadata": {}, "name": x.GetName(),
                              "source_range": {"OTIO_SCHEMA": "TimeRange.1", "duration": rt(x.GetDuration()),
-                                              "start_time": rt(x._left)}, "effects": [], "markers": [], "enabled": True})
+                                              "start_time": rt(x._left)}, "effects": [], "markers": [], "enabled": True,
+                             "media_references": {"DEFAULT_MEDIA": {"OTIO_SCHEMA": "ExternalReference.1",
+                                                                    "target_url": url}},
+                             "active_media_reference_key": "DEFAULT_MEDIA"})
                 pos = x.GetStart() + x.GetDuration()
+            if end > pos:
+                kids.append(gap(end - pos))
             meta = {"Resolve_OTIO": {"Audio Type": self.GetTrackSubType(kind, idx).title()}} if kind == "audio" else {}
             return {"OTIO_SCHEMA": "Track.1", "metadata": meta, "name": self.GetTrackName(kind, idx),
                     "source_range": None, "effects": [], "markers": [], "enabled": True,
@@ -2526,7 +2542,12 @@ def _sfx_world(files, pooled=(), start=0, end=6000, fps=60, lane=(), export_byte
         tl.SetTrackName("audio", i, n)
     tl._tracks[("audio", 2)] = [FakeItem("swoosh.wav", start + 100, 30)]
     tl._tracks[("audio", 3)] = [FakeItem(n, start + s, d, lo) for n, s, d, lo in lane]
-    other = FakeTimeline(name="YT Shorts", start=start)
+    # the other timeline has the same tracks by name: only the current-timeline
+    # check stands between a plan and the wrong edit
+    other = FakeTimeline(name="YT Shorts", start=start, v1=[FakeItem("short.mp4", start, end)], audio_tracks=3,
+                         fps=fps, end=start + end, tail_tracks=(3,))
+    for i, n in enumerate(track_names, start=2):
+        other.SetTrackName("audio", i, n)
     project._timelines.extend([tl, other])
     project._current = tl if current == "YT" else other
 
@@ -2545,9 +2566,10 @@ def _sfx_world(files, pooled=(), start=0, end=6000, fps=60, lane=(), export_byte
 
     def restore():
         rapi.connect = orig
+        os.chmod(tmp, 0o700)
         shutil.rmtree(tmp, ignore_errors=True)
-    return types.SimpleNamespace(project=project, tl=tl, pool=project.GetMediaPool(), bin=sfx_bin,
-                                 paths=paths, tmp=tmp, restore=restore)
+    return types.SimpleNamespace(project=project, tl=tl, other=other, pool=project.GetMediaPool(), bin=sfx_bin,
+                                 paths=paths, tmp=tmp, restore=restore, resolve=Resolve())
 
 
 def _plan(w, rows, **over):
@@ -2618,19 +2640,23 @@ def test_sfx_expected_lay_conforms_by_duration():
 
 
 def test_sfx_check_spans_judges_from_one_read():
-    rows = [{"row": 1, "name": "a.wav", "record": 100, "length": 10},
-            {"row": 2, "name": "b.wav", "record": 110, "length": 10},     # back to back: end is exclusive
-            {"row": 3, "name": "c.wav", "record": 200, "length": 5}]
+    def row(n, name, record, length):
+        return {"row": n, "name": name, "file": f"/lib/{name}", "record": record, "length": length,
+                "leftOffset": 0, "tolerance": 0}
+    rows = [row(1, "a.wav", 100, 10),
+            row(2, "b.wav", 110, 10),     # back to back: end is exclusive
+            row(3, "c.wav", 200, 5)]
     clear = sfx.check_spans(rows, [], 1000)
     assert not clear["collisions"] and [r["row"] for r in clear["toPlace"]] == [1, 2, 3]
     # identical clip already there: a no-op, not a collision
-    again = sfx.check_spans(rows, [{"name": "c.wav", "start": 200, "duration": 5}], 1000)
+    again = sfx.check_spans(rows, [{"name": "c.wav", "path": "/lib/c.wav", "start": 200, "duration": 5,
+                                    "leftOffset": 0}], 1000)
     assert [r["row"] for r in again["alreadyPlaced"]] == [3] and not again["collisions"]
     # same frame, different clip: a collision, and it names what is in the way
     hit = sfx.check_spans(rows, [{"name": "z.wav", "start": 115, "duration": 50}], 1000)
     assert [c["row"] for c in hit["collisions"]] == [2] and "'z.wav'" in hit["collisions"][0]["reason"]
     # rows that overlap EACH OTHER
-    inner = sfx.check_spans(rows + [{"row": 4, "name": "d.wav", "record": 105, "length": 2}], [], 1000)
+    inner = sfx.check_spans(rows + [row(4, "d.wav", 105, 2)], [], 1000)
     assert [c["row"] for c in inner["collisions"]] == [4] or {c["row"] for c in inner["collisions"]} == {2, 4}
     # running past the timeline end would lengthen the timeline
     late = sfx.check_spans(rows, [], 204)
@@ -2725,11 +2751,13 @@ def test_place_sfx_will_not_relay_what_an_editor_deleted():
     """The 2026-10-25 case: a pass was laid, the editor deleted the cues that
     did not work, and the same plan run again would have put them all back.
     A partly placed plan is refused (and flagged on the dry run); resume=True
-    is the explicit way to finish a run that stopped."""
+    is the explicit way to finish a run that stopped. The ledger is moved
+    aside here, so the track alone has to tell."""
     w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
     try:
         plan = _plan(w, SFX_ROWS)
         assert server.place_sfx(plan)["outcome"] == "placed"
+        os.remove(plan + ".placed.json")
         lane = w.tl._tracks[("audio", 3)]
         lane.remove(next(x for x in lane if x.GetStart() == 609))          # the editor's cut
         kept = _lane(w.tl)
@@ -2737,6 +2765,7 @@ def test_place_sfx_will_not_relay_what_an_editor_deleted():
         assert dry["ok"] and dry["partial"] is True and [t["record"] for t in dry["toPlace"]] == [609], dry
         r = server.place_sfx(plan)
         assert not r["ok"] and r["outcome"] == "refused" and "removed on purpose" in r["failure"]["reason"], r
+        assert "2 of 3 rows are already on the track" in r["failure"]["reason"], r
         assert _lane(w.tl) == kept
         done = server.place_sfx(plan, resume=True)
         assert done["ok"] and [p["record"] for p in done["placed"]] == [609], done
@@ -2779,7 +2808,8 @@ def test_place_sfx_refuses_the_wrong_timeline_track_or_bin():
         w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), **kw)
         try:
             r = server.place_sfx(_plan(w, SFX_ROWS))
-            assert not r["ok"] and needle in r["error"], (kw, r)
+            assert not r["ok"] and needle in r.get("error", ""), (kw, r)
+            assert _lane(w.other) == [] and _lane(w.tl) == [], (kw, r)
         finally:
             w.restore()
     w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
@@ -2828,23 +2858,15 @@ def test_place_sfx_stops_at_the_first_clip_that_lands_wrong():
 def test_place_sfx_catches_the_plain_track_tail_mode():
     """The measured 21.1 lie, end to end, on the measured cell (2026-09-08:
     asking frame 30 of a track held 0..75 landed at 75, 30 frames long). The
-    pre-read cannot see the occupant (the stand-in hides it from the first
-    read), the append lands at the TAIL truncated, and the read-back calls it
-    — never a placement."""
-    class Blind(FakeMediaPool):
-        pass
-    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Blind)
+    occupant arrives after every pre-write read (an editor working while the
+    tool runs), the append lands at the TAIL truncated, and the read-back calls
+    it — never a placement."""
+    class Late(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].append(FakeItem("hidden.wav", 0, 75))
+            return super().AppendToTimeline(items)
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Late)
     try:
-        hidden = FakeItem("hidden.wav", 0, 75)
-        w.tl._tracks[("audio", 3)].append(hidden)
-        real = w.tl.GetItemListInTrack
-        reads = {"n": 0}
-
-        def read(kind, idx):
-            reads["n"] += 1
-            lane = real(kind, idx)
-            return [x for x in lane if x is not hidden] if (kind, idx) == ("audio", 3) and reads["n"] <= 1 else lane
-        w.tl.GetItemListInTrack = read
         r = server.place_sfx(_plan(w, [("check.wav", 0, 82 / 60, 30)]))
         assert not r["ok"] and r["outcome"] == "failed", r
         assert r["placed"] == [] and ("check.wav", 75, 30) in [
@@ -2865,7 +2887,8 @@ def test_place_sfx_catches_a_clip_laid_with_the_wrong_trim():
     try:
         r = server.place_sfx(_plan(w, [("check.wav", 0.5, 1.0, 609)]))
         assert not r["ok"] and r["outcome"] == "failed", r
-        assert r["failure"]["landed"] == [{"name": "check.wav", "start": 609, "duration": 30, "leftOffset": 0}]
+        assert r["failure"]["landed"] == [{"name": "check.wav", "start": 609, "duration": 30, "leftOffset": 0,
+                                           "path": w.paths["check.wav"]}]
     finally:
         w.restore()
 
@@ -2908,6 +2931,314 @@ def test_place_sfx_refuses_on_an_empty_snapshot():
         r = server.place_sfx(_plan(w, SFX_ROWS))
         assert not r["ok"] and r["outcome"] == "refused" and "0 bytes" in r["failure"]["reason"], r
         assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_sfx_check_spans_will_not_vouch_for_a_different_sound():
+    """[Codex r1, 2026-10-25] `alreadyPlaced` once matched name, frame and
+    length only: a clip with the wrong trim or from another library read as
+    this row, and one item vouched for any number of rows."""
+    r = {"row": 1, "name": "c.wav", "file": "/lib/c.wav", "record": 200, "length": 5, "leftOffset": 7,
+         "tolerance": 0}
+    item = {"name": "c.wav", "path": "/lib/c.wav", "start": 200, "duration": 5, "leftOffset": 7}
+    assert [x["row"] for x in sfx.check_spans([r], [item], 1000)["alreadyPlaced"]] == [1]
+    for change, needle in (({"leftOffset": 0}, "different trim"), ({"path": "/other/c.wav"}, "overlaps"),
+                           ({"path": None}, "overlaps"), ({"leftOffset": None}, "different trim")):
+        v = sfx.check_spans([r], [dict(item, **change)], 1000)
+        assert not v["alreadyPlaced"] and [c["row"] for c in v["collisions"]] == [1], change
+        assert needle in v["collisions"][0]["reason"], (change, v["collisions"])
+    # within a conformed row's tolerance it IS the row — what the read-back accepted, a re-run accepts
+    soft = dict(r, tolerance=1)
+    assert sfx.check_spans([soft], [dict(item, duration=6, leftOffset=8)], 1000)["alreadyPlaced"]
+    assert not sfx.check_spans([soft], [dict(item, duration=7)], 1000)["alreadyPlaced"]
+    # one item vouches for ONE row
+    twice = sfx.check_spans([r, dict(r, row=2)], [item], 1000)
+    assert [x["row"] for x in twice["alreadyPlaced"]] == [1] and [c["row"] for c in twice["collisions"]] == [2]
+
+
+def test_sfx_a_trim_shorter_than_a_frame_is_refused_not_rounded_up():
+    assert sfx.expected_lay(0, 0, 60, 60)["length"] == 0
+    assert sfx.expected_lay(0, 1, 60, 24)["length"] == 0          # 1/60 s is 0.4 of a 24 fps frame
+    v = sfx.check_spans([{"row": 1, "name": "a", "file": "/a", "record": 10, "length": 0, "leftOffset": 0,
+                          "tolerance": 1}], [], 1000)
+    assert [c["row"] for c in v["collisions"]] == [1] and "shorter than one frame" in v["collisions"][0]["reason"]
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        r = server.place_sfx(_plan(w, [("pop.wav", 0.001, 0.002, 212)]))
+        assert r["outcome"] == "refused" and any("empty trim" in c["reason"] for c in r["collisions"]), r
+        assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_sfx_otio_diff_sees_a_changed_clip_on_the_target_track():
+    """[Codex r1] The target was compared as (name, start, length): a clip
+    already there whose trim, media or neighbour transition changed passed."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), lane=[("theirs.wav", 600, 40, 3)])
+    try:
+        def snap():
+            path = os.path.join(w.tmp, f"s{len(os.listdir(w.tmp))}.otio")
+            assert w.tl.Export(path, _EXPORT_OTIO, _EXPORT_NONE)
+            with open(path) as f:
+                return json.load(f)
+        before = snap()
+        assert sfx.otio_diff(before, snap(), "Audio", 3, [])["pass"]
+        w.tl._tracks[("audio", 3)][0]._left = 9                        # same name, frame, length — new trim
+        d = sfx.otio_diff(before, snap(), "Audio", 3, [])
+        row = {c["check"]: c for c in d["checks"]}["targetTrackIsBeforePlusPlaced"]
+        assert not d["pass"] and row["changedOrMissing"] == [(600, "theirs.wav")], row
+        w.tl._tracks[("audio", 3)][0]._left = 3
+        # a transition on the target that is gone afterwards
+        with_t = json.loads(json.dumps(before))
+        kids = sfx.find_track(with_t, "Audio", 3)["children"]
+        kids.insert(2, {"OTIO_SCHEMA": "Transition.1", "name": "Cross Fade", "in_offset": {"value": 5},
+                        "out_offset": {"value": 5}})
+        d = sfx.otio_diff(with_t, before, "Audio", 3, [])
+        assert not {c["check"]: c for c in d["checks"]}["targetTrackIsBeforePlusPlaced"]["pass"]
+        # and a transition that APPEARS is not a laid clip either
+        d = sfx.otio_diff(before, with_t, "Audio", 3, [])
+        assert {c["check"]: c for c in d["checks"]}["targetTrackIsBeforePlusPlaced"]["unexpected"]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_rerun_holds_on_a_conformed_lay():
+    """[Codex r1] A conformed row is accepted on placement within +/-1 frame;
+    the re-run used to demand an exact match, so a lay one frame long read as
+    a collision with itself."""
+    class Long(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            lane = self._project.GetCurrentTimeline()._tracks[("audio", 3)]
+            new = next(x for x in lane if x.GetStart() == items[0]["recordFrame"])
+            new._d += 1
+            return out
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Long)
+    try:
+        plan = _plan(w, [SFX_ROWS[2]])                                  # hit.wav: 25 fps on 60 → 273
+        r = server.place_sfx(plan)
+        assert r["ok"] and r["placed"][0]["laidLength"] == 274, r
+        again = server.place_sfx(plan)
+        assert again["ok"] and again["outcome"] == "nothing-to-do" and not again["collisions"], again
+    finally:
+        w.restore()
+
+
+def test_place_sfx_will_not_relay_a_pass_deleted_whole():
+    """[Codex r1] Delete EVERY clip a plan laid and nothing on the track says
+    it was ever run — the partial check passes and the whole pass comes back.
+    The ledger beside the plan remembers; resume=True or moving the ledger
+    aside are the two deliberate ways past it."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS)
+        first = server.place_sfx(plan)
+        assert first["outcome"] == "placed" and first["ledgerWritten"] is True, first
+        with open(plan + ".placed.json") as f:
+            ledger = json.load(f)
+        entry = ledger["entries"][0]
+        assert ledger["schema"] == "oside-sfx-ledger/v1" and (entry["project"], entry["timeline"], entry["track"]) == (
+            "DV COLOR MANG", "YT", "SFX 3")
+        assert [p["record"] for p in entry["runs"][0]["placed"]] == [212, 609, 1200]
+        w.tl._tracks[("audio", 3)].clear()                            # the editor's verdict on the pass
+        dry = server.place_sfx(plan, dry_run=True)
+        assert dry["ok"] and dry["laidBefore"] == entry["placedAt"] and dry["partial"] is False, dry
+        r = server.place_sfx(plan)
+        assert not r["ok"] and r["outcome"] == "refused" and "was laid on" in r["failure"]["reason"], r
+        assert _lane(w.tl) == []
+        done = server.place_sfx(plan, resume=True)
+        assert done["ok"] and len(done["placed"]) == 3, done
+        with open(plan + ".placed.json") as f:
+            assert len(json.load(f)["entries"][0]["runs"]) == 2
+        # the ledger is per project/timeline/track: a plan run elsewhere starts clean
+        assert sfx.ledger_entry(json.load(open(plan + ".placed.json")), "OTHER", "YT", "SFX 3") is None
+        w.tl._tracks[("audio", 3)].clear()
+        os.remove(plan + ".placed.json")                              # moved aside on purpose: a new plan
+        assert server.place_sfx(plan)["outcome"] == "placed"
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_on_a_ledger_it_cannot_read_and_reports_one_it_cannot_write():
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        plan = _plan(w, SFX_ROWS[:1])
+        with open(plan + ".placed.json", "w") as f:
+            f.write("{not json")
+        r = server.place_sfx(plan)
+        assert not r["ok"] and "does not read" in r["error"] and _lane(w.tl) == [], r
+        os.remove(plan + ".placed.json")
+        os.chmod(w.tmp, 0o500)                                        # the plan's folder will not take a file
+        r = server.place_sfx(plan)
+        os.chmod(w.tmp, 0o700)
+        assert r["ok"] and r["outcome"] == "placed" and r["ledgerWritten"] is False and r["ledgerError"], r
+    finally:
+        w.restore()
+
+
+def test_place_sfx_says_so_when_it_refuses_after_importing():
+    """[Codex r1] The docs said a refused plan writes nothing. A file not in
+    the pool cannot be judged exactly until it is imported — here its trim
+    runs past its end, which only the pooled item can tell — so a refusal
+    after the import HAS written to the bin, and must say so."""
+    w = _sfx_world(SFX_FILES)
+    try:
+        r = server.place_sfx(_plan(w, [("pop.wav", 0, 1.0, 212)]))      # pop is 13 frames
+        assert not r["ok"] and r["outcome"] == "refused", r
+        assert r["imported"] == [w.paths["pop.wav"]] and "AFTER importing 1 file" in r["failure"]["reason"], r
+        assert "past the clip's 13 frames" in r["collisions"][0]["reason"]
+        assert _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_puts_the_editors_bin_back_or_says_so():
+    """[Codex r1] The bin restore was skipped by an exception and its answer
+    ignored. Three cells: the import raises (restored anyway), the restore is
+    refused (reported, nothing laid), the open bin cannot be read (refused
+    before any import)."""
+    class Raises(FakeMediaPool):
+        def ImportMedia(self, paths):
+            raise RuntimeError("disk went away")
+
+    class Stuck(FakeMediaPool):
+        def SetCurrentFolder(self, folder):
+            if folder is self._root:
+                return False
+            return super().SetCurrentFolder(folder)
+
+    class Unread(FakeMediaPool):
+        def GetCurrentFolder(self):
+            return None
+    w = _sfx_world(SFX_FILES, pool_cls=Raises)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and "disk went away" in r["error"], r
+        assert w.pool.GetCurrentFolder() is w.pool.GetRootFolder() and _lane(w.tl) == []
+    finally:
+        w.restore()
+    w = _sfx_world(SFX_FILES, pool_cls=Stuck)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and r["outcome"] == "failed" and r["binRestored"] is False, r
+        assert "could not reselect" in r["failure"]["reason"] and r["imported"] and _lane(w.tl) == []
+    finally:
+        w.restore()
+    w = _sfx_world(SFX_FILES, pool_cls=Unread)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and r["outcome"] == "refused" and "which bin is open" in r["failure"]["reason"], r
+        assert w.pool.imports == [] and _lane(w.tl) == []
+    finally:
+        w.restore()
+
+
+def test_place_sfx_fails_closed_on_a_track_it_cannot_read():
+    """[Codex r1] A track that did not answer read as an EMPTY track, and an
+    item without a frame was skipped: both judge collisions blind."""
+    for broken in ("none", "item"):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), lane=[("theirs.wav", 600, 40, 0)])
+        try:
+            real = w.tl.GetItemListInTrack
+            if broken == "none":
+                w.tl.GetItemListInTrack = lambda kind, idx: None if (kind, idx) == ("audio", 3) else real(kind, idx)
+            else:
+                w.tl._tracks[("audio", 3)][0].GetStart = lambda: None
+            r = server.place_sfx(_plan(w, SFX_ROWS))
+            assert not r["ok"] and "refusing to judge collisions blind" in r["error"], (broken, r)
+            assert len(w.tl._tracks[("audio", 3)]) == 1 and w.pool.imports == []
+        finally:
+            w.restore()
+
+
+def test_place_sfx_read_back_needs_the_file_and_the_trim_it_can_read():
+    """[Codex r1] An unreadable left offset passed the read-back, and the file
+    was never checked: a namesake from another library certified the row."""
+    class NoOffset(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            out[0].GetLeftOffset = lambda *a: None
+            return out
+
+    class Namesake(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            decoy = FakeClip("check.wav", 98, fps=60, path="/other/library/check.wav")
+            return super().AppendToTimeline([dict(items[0], mediaPoolItem=decoy)])
+    for cls in (NoOffset, Namesake):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls)
+        try:
+            r = server.place_sfx(_plan(w, [SFX_ROWS[1]]))
+            assert not r["ok"] and r["outcome"] == "failed" and r["placed"] == [], (cls.__name__, r)
+            assert "landed somewhere other" in r["failure"]["reason"], (cls.__name__, r["failure"])
+        finally:
+            w.restore()
+
+
+def test_place_sfx_read_back_sees_a_neighbour_change_under_the_append():
+    class Nudge(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            theirs = next(x for x in self._project.GetCurrentTimeline()._tracks[("audio", 3)]
+                          if x.GetName() == "theirs.wav")
+            theirs._left += 2
+            return out
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Nudge, lane=[("theirs.wav", 3000, 40, 0)])
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        assert not r["ok"] and r["failure"]["reason"] == "an item already on the track changed under the append", r
+        assert not {c["check"]: c for c in r["diff"]["checks"]}["targetTrackIsBeforePlusPlaced"]["pass"]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_refuses_when_the_track_and_its_export_disagree():
+    """The item list judged the collisions; the export is what the diff will
+    compare against. An occupant only one of them shows means neither can be
+    trusted, so nothing is laid."""
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+    try:
+        hidden = FakeItem("hidden.wav", 0, 75)
+        w.tl._tracks[("audio", 3)].append(hidden)
+        real = w.tl.GetItemListInTrack
+        w.tl.GetItemListInTrack = lambda kind, idx: [x for x in real(kind, idx) if x is not hidden]
+        r = server.place_sfx(_plan(w, [("check.wav", 0, 82 / 60, 30)]))
+        assert not r["ok"] and r["outcome"] == "refused" and "disagree" in r["failure"]["reason"], r
+        assert real("audio", 3) == [hidden]
+    finally:
+        w.restore()
+
+
+def test_place_sfx_timeline_end_check_can_go_red():
+    """[Codex r1] The fake's end was fixed, so timelineEndUnchanged could never
+    fail. A write that also lays something past the end must trip it."""
+    class Stretch(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            tl = self._project.GetCurrentTimeline()
+            tl._tracks[("video", 1)].append(FakeItem("tail.mp4", tl._end, 50))
+            return out
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Stretch)
+    try:
+        r = server.place_sfx(_plan(w, SFX_ROWS[:1]))
+        row = {c["check"]: c for c in r["diff"]["checks"]}["timelineEndUnchanged"]
+        assert not r["ok"] and not row["pass"] and row["after"] == row["before"] + 50, r["diff"]
+    finally:
+        w.restore()
+
+
+def test_export_timeline_otio_refuses_a_zero_byte_file():
+    """[Codex r1] The redproof for this went red on wording alone; drive the
+    export function itself."""
+    w = _sfx_world(SFX_FILES, export_bytes=0)
+    try:
+        path = os.path.join(w.tmp, "empty.otio")
+        try:
+            rapi.export_timeline_otio(w.resolve, w.tl, path)
+        except rapi.ResolveError as e:
+            assert "0 bytes" in str(e), e
+        else:
+            raise AssertionError("a zero-byte export was accepted")
     finally:
         w.restore()
 

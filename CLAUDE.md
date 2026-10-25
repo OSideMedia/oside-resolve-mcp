@@ -174,7 +174,10 @@ of them. If one looks wrong, say so and leave it.**
   defences became a fixed tool. Scope is deliberately narrow: ONE existing
   audio track of the CURRENT timeline, existing bin, never creates tracks or
   bins, never extends the timeline, never saves, never deletes a stray it laid
-  (it reports it). Widening any of those reopens this decision.
+  (it reports it). Its one write outside Resolve is the plan's own ledger,
+  `<plan>.placed.json`, beside the plan — the memory that keeps a pass the
+  editor deleted whole from coming back. Widening any of those reopens this
+  decision.
 
 ## Open product calls
 
