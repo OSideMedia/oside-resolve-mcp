@@ -1827,15 +1827,55 @@ def test_colliding_pins_checkerboard_onto_a_second_lane():
 # MEMBERS are scanned — the guard is only as good as what it is allowed to see.
 # ---------------------------------------------------------------------------
 
+# An IPv4 octet, 0-255, no leading zero: "0004" in a build number is not one.
+_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+
 TEMPLATE_LEAK_PATTERNS = (
     (r"/Users/[A-Za-z0-9._-]+", "a macOS home path"),
     (r"/home/[A-Za-z0-9._-]+", "a Linux home path"),
     (r"/Volumes/[A-Za-z0-9 ._-]+", "a mounted volume"),
-    (r"\b[A-Za-z]:\\\\[A-Za-z0-9 ._-]+", "a Windows path"),
+    # one backslash or two (escaped), or a forward slash: C:\Users\x, C:\\Users\\x, C:/Users/x.
+    # Before 0.8.2 this demanded two LITERAL backslashes, so a real C:\Users\x passed (ow-557456).
+    (r"\b[A-Za-z]:(?:\\{1,2}|/)[A-Za-z0-9 ._-]+", "a Windows path"),
+    (r"\\\\[A-Za-z0-9._-]+\\[A-Za-z0-9 $._-]+", "a Windows network share"),
     (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "an email address"),
-    (r"\b[A-Za-z0-9-]+\.local\b", "a bonjour hostname"),
+    (r"(?i)\b[A-Za-z0-9-]+\.(?:local|lan|home|localdomain|internal|home\.arpa)\b", "a local network hostname"),
+    # the names macOS and Windows give a computer out of the box ("Peter's MacBook Pro",
+    # Peters-MacBook-Pro, DESKTOP-4F7KQ2M) — a custom name is caught by _this_machines_names()
+    (r"(?i)\b[A-Za-z0-9]+(?:['\u2019]s[ _-]?|-)(?:MacBook|iMac|Mac[ _-]?mini|Mac[ _-]?Studio|Mac[ _-]?Pro)\b",
+     "a Mac's computer name"),
+    (r"\b(?:DESKTOP|LAPTOP)-[A-Z0-9]{7}\b", "a Windows computer name"),
+    # A dotted quad that is not part of a longer dotted number. The real templates carry
+    # Waves plugin versions that ARE valid quads (<PluginVersion>16.7.33.189</PluginVersion>,
+    # measured 2026-10-31 in 000_TIMELINES' zlib layer), so a value right after a version
+    # element or attribute is not an address.
+    # ponytail: version elements are excused by name; a real address inside one would pass —
+    # parse the XML and excuse by element if that ever matters
+    (r"(?i)(?<!version>)(?<!version=\")(?<!version=')(?<![0-9.])(?:" + _OCTET + r"\.){3}" + _OCTET
+     + r"(?![0-9]|\.[0-9])", "an IP address"),
     (r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]", "a credential"),
 )
+
+
+def _this_machines_names():
+    """This computer's own name, short form (`studio-mac` of `studio-mac.local`):
+    a snapshot taken here carries THAT name, whatever it is. Four characters or
+    more, and never `localhost`, so a short name cannot fire on every word."""
+    import platform
+    import socket
+    out = set()
+    for full in (socket.gethostname(), platform.node()):
+        short = (full or "").split(".")[0]
+        if len(short) >= 4 and short.lower() != "localhost":
+            out.add(short)
+    return out
+
+
+def _leak_patterns():
+    """TEMPLATE_LEAK_PATTERNS plus this machine's own name, matched whole."""
+    return TEMPLATE_LEAK_PATTERNS + tuple(
+        (r"(?i)(?<![A-Za-z0-9-])" + re.escape(n) + r"(?![A-Za-z0-9-])", "this computer's name")
+        for n in sorted(_this_machines_names()))
 
 
 # ---------------------------------------------------------------------------
@@ -1849,12 +1889,21 @@ TEMPLATE_LEAK_PATTERNS = (
 # every hex run is decoded, every compressed layer inside it is opened at any
 # offset, and the text is read as UTF-8 AND UTF-16-LE (Resolve stores strings
 # both ways). A decoder that is missing is a RED, never a skip.
+#
+# Since 0.8.2 (ow-557456) the same holds for BASE64 runs and GZIP streams, and
+# every decoder runs on every layer, not only the one it was first found in: a
+# path in gzip in base64 in a hex blob is three layers in and still read.
 # ---------------------------------------------------------------------------
 
-def _inner_texts(member_bytes):
-    """Every text this member carries, one decode layer at a time: the member
-    itself, then each hex-encoded blob, then each zstd / zlib layer found inside
-    those blobs, each read as UTF-8 and as UTF-16-LE. Yields (layer, text)."""
+_MAX_DEPTH = 6        # layers inside a member; deeper than this is UNREADABLE, never skipped
+_MAX_LAYERS = 5000    # decoded layers per member; more than this is UNREADABLE, never skipped
+
+
+def _children(data):
+    """The layers that decode straight out of `data`: (name, bytes or None).
+    None means a layer that announced itself and would not open."""
+    import base64
+    import binascii
     import zlib
     try:
         import zstandard
@@ -1863,40 +1912,88 @@ def _inner_texts(member_bytes):
             "the template leak gate cannot open Resolve's zstd layer: install the dev extra "
             "(pip install -e '.[dev]' / uv sync --extra dev) — a missing decoder is a red, not a pass"
         ) from e
-    yield ("member", member_bytes.decode("utf-8", "ignore"))
-    for i, hexrun in enumerate(re.findall(rb"[0-9a-fA-F]{64,}", member_bytes)):
+    out = []
+    for i, run in enumerate(re.findall(rb"[0-9a-fA-F]{64,}", data)):
         try:
-            dec = bytes.fromhex(hexrun.decode("ascii"))
+            out.append(("hex#%d" % i, bytes.fromhex(run.decode("ascii"))))
         except ValueError:
             continue
-        layers = [("hex#%d" % i, dec)]
-        for mo in re.finditer(rb"\x28\xb5\x2f\xfd", dec):
-            try:
-                layers.append(("hex#%d/zstd@%d" % (i, mo.start()), zstandard.ZstdDecompressor().decompressobj().decompress(dec[mo.start():])))
-            except Exception as e:  # noqa: BLE001
-                layers.append(("hex#%d/zstd@%d" % (i, mo.start()), b"UNREADABLE zstd frame: " + str(e).encode()))
-        for mo in re.finditer(rb"\x78[\x01\x5e\x9c\xda]", dec):
-            try:
-                text = zlib.decompressobj().decompress(dec[mo.start():])
-            except Exception:  # noqa: BLE001 - not every 0x78 is a stream
+    # a run of the base64 alphabet long enough to hide a path; an all-hex run is the
+    # hex decoder's, and a run that will not decode is just a long word
+    for i, run in enumerate(re.findall(rb"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{16,}={0,2}", data)):
+        body = run.rstrip(b"=")
+        if re.fullmatch(rb"[0-9a-fA-F]+", body):
+            continue
+        body = body[:len(body) - (len(body) % 4 == 1)]
+        try:
+            out.append(("b64#%d" % i, base64.b64decode(body + b"=" * (-len(body) % 4), validate=True)))
+        except (binascii.Error, ValueError):
+            continue
+    for mo in re.finditer(rb"\x28\xb5\x2f\xfd", data):
+        try:
+            out.append(("zstd@%d" % mo.start(), zstandard.ZstdDecompressor().decompressobj().decompress(data[mo.start():])))
+        except Exception:  # noqa: BLE001
+            out.append(("zstd@%d" % mo.start(), None))
+    for mo in re.finditer(rb"\x78[\x01\x5e\x9c\xda]", data):
+        try:
+            text = zlib.decompressobj().decompress(data[mo.start():])
+        except Exception:  # noqa: BLE001 - not every 0x78 is a stream
+            continue
+        if len(text) > 40:
+            out.append(("zlib@%d" % mo.start(), text))
+    for mo in re.finditer(rb"\x1f\x8b\x08", data):
+        try:
+            out.append(("gzip@%d" % mo.start(), zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data[mo.start():])))
+        except Exception:  # noqa: BLE001 - three bytes can occur by chance in binary
+            continue
+    return out
+
+
+def _inner_texts(member_bytes):
+    """Every text this member carries, one decode layer at a time: the member
+    itself, then every hex, base64, zstd, zlib and gzip layer inside it, and
+    inside those, each read as UTF-8 and as UTF-16-LE at both byte alignments.
+    Yields (layer, text); a layer that will not open, or a member nested past
+    the scanner's reach, yields text starting UNREADABLE."""
+    import hashlib
+    seen = {hashlib.sha1(member_bytes).digest()}
+    stack = [("member", member_bytes, 0)]
+    layers = 0
+    while stack:
+        name, raw, depth = stack.pop()
+        yield (name, raw.decode("utf-8", "ignore"))
+        # UTF-16 at BOTH byte alignments: a string inside a binary record can start on
+        # an odd offset, and a decode from 0 then reads every character as garbage
+        yield (name + "/utf16", raw.decode("utf-16-le", "ignore"))
+        yield (name + "/utf16+1", raw[1:].decode("utf-16-le", "ignore"))
+        kids = _children(raw)
+        if kids and depth >= _MAX_DEPTH:
+            yield (name, "UNREADABLE: nested deeper than %d layers" % _MAX_DEPTH)
+            continue
+        for kid, data in reversed(kids):
+            sub = kid if name == "member" else name + "/" + kid
+            if data is None:
+                yield (sub, "UNREADABLE: the %s layer would not open" % kid.split("@")[0])
                 continue
-            if len(text) > 40:
-                layers.append(("hex#%d/zlib@%d" % (i, mo.start()), text))
-        for layer, raw in layers:
-            yield (layer, raw.decode("utf-8", "ignore"))
-            # UTF-16 at BOTH byte alignments: a string inside a binary record can start on
-            # an odd offset, and a decode from 0 then reads every character as garbage
-            yield (layer + "/utf16", raw.decode("utf-16-le", "ignore"))
-            yield (layer + "/utf16+1", raw[1:].decode("utf-16-le", "ignore"))
+            digest = hashlib.sha1(data).digest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            layers += 1
+            if layers > _MAX_LAYERS:
+                yield (sub, "UNREADABLE: more than %d decoded layers" % _MAX_LAYERS)
+                return
+            stack.append((sub, data, depth + 1))
 
 
-def _scan_drp(path):
+def _scan_drp(path, patterns=None):
     """Every leak in one .drp, as (member, kind, sample). Extracts first: the
     archive is the transform, and a scan of the compressed bytes sees nothing —
-    then decodes the hex blobs and the zstd/zlib layers inside them, which is
-    where the 2026-09-08 audit's "clean" templates held the operator's home
-    directory (R-1)."""
+    then decodes every layer inside each member (hex, base64, zstd, zlib, gzip),
+    which is where the 2026-09-08 audit's "clean" templates held the operator's
+    home directory (R-1). `patterns` defaults to _leak_patterns()."""
     import zipfile
+    patterns = _leak_patterns() if patterns is None else patterns
     hits = []
     if not zipfile.is_zipfile(path):
         # NOT a skip. An unreadable template is UNKNOWN, and unknown is never a
@@ -1917,7 +2014,7 @@ def _scan_drp(path):
                 if text.startswith("UNREADABLE"):
                     hits.append((member + " :: " + layer, "unreadable", text[:80]))
                     continue
-                for pattern, kind in TEMPLATE_LEAK_PATTERNS:
+                for pattern, kind in patterns:
                     m = re.search(pattern, text)
                     if m and (layer, kind) not in seen:
                         seen.add((layer, kind))
@@ -1998,6 +2095,165 @@ def test_no_template_publishes_a_path_an_email_or_a_hostname():
                      for f, hits in dirty.items() for m, kind, sample in hits)
     )
 
+
+
+def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
+    """[ow-557456] Every rule the template gate carries is shown a planted leak
+    it must catch, and the lookalikes the real templates hold must pass: they
+    carry Waves plugin versions that are valid dotted quads, so an address rule
+    that fired on them would block every export. Every decoder is shown a path
+    only it can reach. A rule added without a plant fails here.
+
+    Carries its own counterexample: the pre-0.8.2 Windows rule (two LITERAL
+    backslashes) is run on the same path and must miss it."""
+    import base64
+    import gzip
+    import socket
+    import zipfile
+    import zlib
+    import zstandard
+
+    old_windows = r"\b[A-Za-z]:\\\\[A-Za-z0-9 ._-]+"
+    real_windows = "C:\\Users\\someone\\Desktop\\cut.mov"
+    assert not re.search(old_windows, real_windows), "the counterexample is void: the old rule saw it"
+
+    plants = [
+        ("a macOS home path", "/Users/someone/Movies/cut.mov"),
+        ("a Linux home path", "/home/someone/renders/cut.mov"),
+        ("a mounted volume", "/Volumes/T7 PROJECTS/clip.mov"),
+        ("a Windows path", real_windows),
+        ("a Windows path", "C:\\\\Users\\\\someone\\\\cut.mov"),     # escaped, as JSON writes it
+        ("a Windows path", "D:/Projects/client/cut.mov"),
+        ("a Windows network share", "\\\\NAS01\\footage\\clip.mov"),
+        ("an email address", "client@agency.com"),
+        ("a local network hostname", "studio.local"),
+        ("a local network hostname", "render-box.lan"),
+        ("a local network hostname", "nas.home.arpa"),
+        ("a local network hostname", "edit01.internal"),
+        ("a Mac's computer name", "Peter's MacBook Pro"),
+        ("a Mac's computer name", "Ana\u2019s Mac mini"),
+        ("a Mac's computer name", "Peters-MacBook-Pro"),
+        ("a Mac's computer name", "Studio-iMac"),
+        ("a Windows computer name", "DESKTOP-4F7KQ2M"),
+        ("an IP address", "192.168.1.20"),
+        ("an IP address", "<Host>10.0.0.5</Host>"),
+        ("a credential", "api_key = abc123"),
+    ]
+    names = sorted(_this_machines_names())
+    if names:
+        plants += [("this computer's name", "<Computer>%s</Computer>" % n) for n in names]
+    else:
+        # a skip needs positive evidence: the name really is too short to match safely
+        short = socket.gethostname().split(".")[0]
+        assert len(short) < 4 or short.lower() == "localhost", "this machine's name was not picked up"
+    missing = {k for _p, k in TEMPLATE_LEAK_PATTERNS} - {k for k, _s in plants}
+    assert not missing, "a leak rule with no planted example: %r" % sorted(missing)
+
+    # the lookalikes: what the real templates carry (plugin versions, build
+    # numbers) and what reads like a rule's subject but is not
+    lookalikes = ["<PluginVersion>16.7.33.189</PluginVersion>", '<Plugin version="16.0.78.79"/>',
+                  "<Plugin Version='16.3.70.120'/>", "<Build>21.0.2.0004</Build>", "<V>1.16.7.33.189</V>",
+                  "<V>16.7.33.189.2</V>", "<N>300.1.2.3</N>", "<N>10.0.256.1</N>", "<Codec>H.264</Codec>",
+                  "DaVinci Resolve 21.1.2", "http://www.blackmagicdesign.com/x", "<Ch>L:R</Ch>",
+                  "Shot on MacBook Pro", "Mac Studio Display", "DESKTOP-SHOTS", "settings.locale",
+                  "Timeline.xml"]
+
+    with tempfile.TemporaryDirectory() as td:
+        planted = os.path.join(td, "PLANTS.drp")
+        with zipfile.ZipFile(planted, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, (_k, sample) in enumerate(plants):
+                z.writestr("p%02d.xml" % i, "<SM_Project><Note>%s</Note></SM_Project>" % sample)
+        by_member = {}
+        for m, kind, _s in _scan_drp(planted):
+            by_member.setdefault(m.split(" :: ")[0], set()).add(kind)
+        for i, (kind, sample) in enumerate(plants):
+            assert kind in by_member.get("p%02d.xml" % i, set()), \
+                "%s not caught in %r (caught: %r)" % (kind, sample, by_member.get("p%02d.xml" % i))
+
+        # the lookalikes pass, in plain XML AND where the real ones sit: UTF-16
+        # in a zstd frame in a hex blob, and in a zlib stream
+        clean = os.path.join(td, "LOOKALIKES.drp")
+        text = "".join("<X>%s</X>" % s for s in lookalikes)
+        frame = (b"\x00" * 44) + zstandard.ZstdCompressor().compress(text.encode("utf-16-le"))
+        with zipfile.ZipFile(clean, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("plain.xml", "<SM_Project>%s</SM_Project>" % text)
+            z.writestr("deep.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % frame.hex())
+            z.writestr("MpFolder.xml", "<SM_Folder><FieldsBlob>%s</FieldsBlob></SM_Folder>"
+                       % (b"\x00" * 4 + zlib.compress(text.encode("utf-8"))).hex())
+        assert _scan_drp(clean) == [], "a lookalike fired: %r" % (_scan_drp(clean),)
+
+        # every new decoder, each holding a path no older layer can show
+        home = "/Users/someone/Movies/cut.mov"
+        b64 = base64.b64encode(home.encode()).decode()
+        gz_in_hex = (b"\x00" * 4 + gzip.compress(home.encode("utf-16-le"))).hex()
+        nested = (b"\x00" * 8 + zstandard.ZstdCompressor().compress(
+            b"<b>" + base64.b64encode(gzip.compress(home.encode("utf-16-le"))) + b"</b>")).hex()
+        deep = os.path.join(td, "DECODERS.drp")
+        with zipfile.ZipFile(deep, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("b64.xml", "<SM_Project><Blob>%s</Blob></SM_Project>" % b64)
+            z.writestr("gzip.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % gz_in_hex)
+            z.writestr("nested.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % nested)
+            z.writestr("whole.gz", gzip.compress(("<SM_Project>%s</SM_Project>" % home).encode()))
+        homes = {}
+        for m, kind, _s in _scan_drp(deep):
+            if kind == "a macOS home path":
+                member, layer = m.split(" :: ")
+                homes.setdefault(member, set()).add(layer)
+        for member, via in (("b64.xml", "b64#"), ("gzip.xml", "/gzip@"), ("nested.xml", "/b64#0/gzip@"),
+                            ("whole.gz", "gzip@0")):
+            assert homes.get(member), "the scanner cannot see a path in %s: %r" % (member, homes)
+            # only the new decoder shows it: no layer without it in its name does
+            assert all(via in layer for layer in homes[member]), (member, homes[member])
+
+        # nested past the scanner's reach, or more layers than its budget: a red, never a pass
+        wrapped = home.encode()
+        for _ in range(_MAX_DEPTH + 1):
+            wrapped = base64.b64encode(wrapped)
+        reach = os.path.join(td, "REACH.drp")
+        with zipfile.ZipFile(reach, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("deep.xml", b"<B>" + wrapped + b"</B>")
+            z.writestr("wide.xml", b" ".join(base64.b64encode(b"%012d" % i) for i in range(_MAX_LAYERS + 1)))
+        kinds = {m.split(" :: ")[0]: (kind, s) for m, kind, s in _scan_drp(reach) if kind == "unreadable"}
+        assert "nested deeper" in kinds.get("deep.xml", ("", ""))[1], kinds
+        assert "decoded layers" in kinds.get("wide.xml", ("", ""))[1], kinds
+
+
+def test_the_lockfile_matches_the_project():
+    """[ow-557456, R-14] uv.lock makes every `uv sync` install the versions it
+    was resolved at, including the mcp<2 pin, but only while it agrees with
+    pyproject: a lock left behind by a version bump or a changed requirement
+    is stale, and `uv sync --locked` refuses it. This compares the lock's own
+    entry for this project (version, requirements, extras) with pyproject.
+    Red-proof: the lock as it sat untracked on main (root version 0.6.1) fails."""
+    try:
+        import tomllib
+    except ImportError:
+        raise Unknown("reading uv.lock needs tomllib (Python 3.11+); CI runs 3.12")
+    root = os.path.dirname(HERE)
+    with open(os.path.join(root, "pyproject.toml"), "rb") as fh:
+        project = tomllib.load(fh)["project"]
+    with open(os.path.join(root, "uv.lock"), "rb") as fh:
+        lock = tomllib.load(fh)
+    mine = [p for p in lock.get("package", []) if p.get("name") == project["name"]]
+    assert len(mine) == 1, "uv.lock has %d entries for %s" % (len(mine), project["name"])
+    entry = mine[0]
+    assert entry.get("version") == project["version"], \
+        "uv.lock is for %s %s, pyproject says %s — run `uv lock`" % (project["name"], entry.get("version"),
+                                                                   project["version"])
+
+    def req(text, extra=None):
+        m = re.fullmatch(r"\s*([A-Za-z0-9._-]+)\s*([<>=!~][^;]*)?", text)
+        assert m, "a requirement this check cannot read: %r" % text
+        spec = frozenset(s.strip() for s in (m.group(2) or "").split(",") if s.strip())
+        return (m.group(1).lower(), spec, None if extra is None else "extra == '%s'" % extra)
+    wanted = {req(d) for d in project.get("dependencies", [])}
+    for extra, deps in project.get("optional-dependencies", {}).items():
+        wanted |= {req(d, extra) for d in deps}
+    meta = entry.get("metadata", {})
+    locked = {(r["name"].lower(), frozenset(s.strip() for s in r.get("specifier", "").split(",") if s.strip()),
+               r.get("marker")) for r in meta.get("requires-dist", [])}
+    assert locked == wanted, "uv.lock resolved %r, pyproject asks for %r — run `uv lock`" % (locked, wanted)
+    assert sorted(meta.get("provides-extras", [])) == sorted(project.get("optional-dependencies", {})), meta
 
 
 def test_the_readme_version_badge_matches_the_shipped_version():

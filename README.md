@@ -95,6 +95,9 @@ cd oside-resolve-mcp
 python3 -m venv .venv && .venv/bin/python -m pip install -e .
 ```
 
+Or with [uv](https://docs.astral.sh/uv/), which installs exactly the versions
+pinned in `uv.lock`: `uv sync --locked`.
+
 Register it with your MCP client — for Claude Code, in `.mcp.json`:
 
 ```json

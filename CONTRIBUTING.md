@@ -54,7 +54,7 @@ Two related rules the existing tests follow:
 ## Running the suite
 
 ```bash
-python -m venv .venv && .venv/bin/python -m pip install -e .
+python -m venv .venv && .venv/bin/python -m pip install -e '.[dev]'   # or: uv sync --locked --extra dev
 .venv/bin/python tests/test_handoff.py          # the whole suite, no pytest needed
 CI=1 .venv/bin/python tests/test_handoff.py     # exactly what CI runs
 ```
@@ -68,8 +68,13 @@ accepted — the live walks happen by hand, and their findings land in
 
 `templates/*.drp` are Resolve project snapshots and are **published bytes**.
 `export_template` overwrites them from a live Resolve project, so a gate scans
-them for filesystem paths, email addresses and hostnames before they can ship.
-If you re-snapshot, read the diff.
+them before they can ship for filesystem paths (macOS, Linux, Windows and
+network shares), email addresses, local hostnames, IP addresses and computer
+names, including the name of the machine running the tests. It reads every
+layer Resolve hides text in: the zip, hex blobs, base64, zstd, zlib and gzip,
+nested, as UTF-8 and UTF-16. Each rule is proven against a planted leak and
+against the lookalikes the real templates carry (plugin version numbers are
+valid dotted quads). If you re-snapshot, read the diff.
 
 ## Style
 
