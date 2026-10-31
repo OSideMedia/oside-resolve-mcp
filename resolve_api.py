@@ -1371,24 +1371,22 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                 new.append(it)
         # the new item is the row only if sfx.same_clip says so: right file, frame, length, trim
         mine = next((it for it in new if sfx.same_clip(it, r)), None)
-        # `new` also holds items already there that an editor moved or trimmed
-        # while the append ran (or a neighbour the append nudged) — not
-        # something this run laid [Codex r1, r2 on 0.8.1]. An item counts as
-        # one of those only when it pairs off with an item that left its place,
-        # by the same name and source file; and when that file could be this
-        # row's (the row's path, or unreadable), only as a pure MOVE — same
-        # length and trim — because a stray of the row's file laid as an editor
-        # deletes a clip of it reads exactly like a trim. Every item that does
-        # not pair off was laid (a count that went up leaves one unpaired).
-        # ponytail: identity is name + file (+ length + trim), so an append that
-        # lands an exact copy of a same-file clip deleted in the same instant
-        # reads as that clip moving; a per-item id would close it, and
-        # GetUniqueId's stability across reads is unmeasured.
+        # `new` also holds items already there that an editor moved while the
+        # append ran — not something this run laid [Codex r1 on 0.8.1]. Only a
+        # pure MOVE pairs off: an item that left its place and reappears with
+        # the same name, file, length and trim. Everything else in `new` counts
+        # as laid, a trim included [Codex r2, r3]: a clip laid as an editor
+        # deletes one reads exactly like that clip trimmed, and the two mistakes
+        # are not equal. Recording a run that laid nothing costs a refused plain
+        # retry, and the failure below says to pass resume=True; missing a run
+        # that laid something lets a re-run put back a clip the editor deleted.
+        # ponytail: an append that lands an exact copy of a clip deleted in the
+        # same instant reads as that clip moving; a per-item id would close it,
+        # and GetUniqueId's stability across reads is unmeasured.
         gone, laid = list(pool), []
         for it in new:
-            maybe_row = it["path"] is None or it["path"] == r["file"]
-            twin = next((g for g in gone if g[0] == it["name"] and g[4] == it["path"]
-                         and (not maybe_row or (g[2], g[3]) == (it["duration"], it["leftOffset"]))), None)
+            twin = next((g for g in gone if (g[0], g[2], g[3], g[4]) ==
+                         (it["name"], it["duration"], it["leftOffset"], it["path"])), None)
             if twin is None:
                 laid.append(it)
             else:
@@ -1404,6 +1402,10 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                        "reason": "nothing new on the track" if not new else
                                  "the clip landed somewhere other than its frame, length or trim"
                                  if not pool else "an item already on the track changed under the append"}
+            if pool and laid and mine is None:
+                failure["reason"] += ("; this run counts as having laid a clip, because one it laid cannot be "
+                                      "told from that change. If none of its clips is on the track, finish the "
+                                      "plan with resume=True")
             break
         before = after
 
