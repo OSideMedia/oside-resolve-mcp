@@ -3489,7 +3489,9 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
     back after it (answering None, or raising) — nothing was recorded, and once
     the editor deleted that clip an ordinary re-run laid it again. Each case is
     now recorded and the plain re-run refuses. A drop that put nothing on the
-    track still records nothing."""
+    track still records nothing, and so does one during which an editor moved
+    or trimmed a clip already there [Codex r1, r2 on 0.8.1] — each paired off
+    against a case that differs only in what landed."""
     class Nudge(FakeMediaPool):
         def AppendToTimeline(self, items):
             out = super().AppendToTimeline(items)
@@ -3504,13 +3506,28 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
             return super().AppendToTimeline(items)
 
     class Namesake(FakeMediaPool):      # Resolve lays another library's file of the same name
+        decoy_path = "/other/library/check.wav"
+
         def AppendToTimeline(self, items):
-            decoy = FakeClip("check.wav", 98, fps=60, path="/other/library/check.wav")
+            decoy = FakeClip("check.wav", 98, fps=60, path=self.decoy_path)
             return super().AppendToTimeline([dict(items[0], mediaPoolItem=decoy)])
 
     class StrayAsOneGoes(FakeMediaPool):   # a frame late, while an editor deletes the clip there: counts balance
         def AppendToTimeline(self, items):
             self._project.GetCurrentTimeline()._tracks[("audio", 3)].pop(0)
+            return super().AppendToTimeline([dict(items[0], recordFrame=items[0]["recordFrame"] + 1)])
+
+    class NamesakeAsOneGoes(Namesake):  # [Codex r2 on 0.8.1] the namesake lands as an editor deletes the clip there
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].pop(0)
+            return super().AppendToTimeline(items)
+
+    class PathlessAsOneGoes(NamesakeAsOneGoes):    # the same, and the laid clip's file cannot be read
+        decoy_path = None
+
+    class CopyAsItsTwinMoves(FakeMediaPool):       # a frame late, as an editor moves a clip of the same sound
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 2000
             return super().AppendToTimeline([dict(items[0], recordFrame=items[0]["recordFrame"] + 1)])
 
     def unreadable(answer):
@@ -3530,15 +3547,38 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
     def raises():
         raise RuntimeError("the track went away")
 
-    # the nudged clip landed exactly as planned, so it is also `placed`
-    cells = [("nudged", Nudge, [("theirs.wav", 3000, 40, 0)], "changed under the append", [1]),
-             ("stray", Late, [], "landed somewhere other", []),
-             ("namesake", Namesake, [], "landed somewhere other", []),
-             ("stray as one goes", StrayAsOneGoes, [("theirs.wav", 3000, 40, 0)], "changed under the append", []),
-             ("unread", unreadable(lambda: None), [], "could not be read back", []),
-             ("raises", unreadable(raises), [], "the track went away", [])]
-    for name, cls, lane, why, placed in cells:
+    def own_file(w, path):
+        """The first item already on the track gets a readable source file:
+        "row" = this row's own file (a twin of the sound being laid)."""
+        if path:
+            first = w.tl._tracks[("audio", 3)][0]
+            first._media = FakeClip(first._n, 98, fps=60, path=w.paths["check.wav"] if path == "row" else path)
+
+    # the nudged clip landed exactly as planned, so it is also `placed`. The
+    # last element gives the clip already there a source file: an item of this
+    # row's file that left its place is the case a truncated stray looks like.
+    cells = [("nudged", Nudge, [("theirs.wav", 3000, 40, 0)], "changed under the append", [1], None),
+             ("stray", Late, [], "landed somewhere other", [], None),
+             ("namesake", Namesake, [], "landed somewhere other", [], None),
+             ("stray as one goes", StrayAsOneGoes, [("theirs.wav", 3000, 40, 0)], "changed under the append", [],
+              None),
+             ("namesake as one goes", NamesakeAsOneGoes, [("theirs.wav", 3000, 40, 0)],
+              "changed under the append", [], None),
+             ("namesake as its twin goes", NamesakeAsOneGoes, [("check.wav", 3000, 82, 0)],
+              "changed under the append", [], "row"),
+             ("stray as its twin goes", StrayAsOneGoes, [("check.wav", 3000, 82, 5)], "changed under the append",
+              [], "row"),
+             ("unreadable stray as one goes", PathlessAsOneGoes, [("theirs.wav", 3000, 82, 0)],
+              "changed under the append", [], None),
+             ("unreadable stray as its twin goes", PathlessAsOneGoes, [("check.wav", 3000, 82, 5)],
+              "changed under the append", [], None),
+             ("copy as its twin moves", CopyAsItsTwinMoves, [("check.wav", 3000, 82, 0)],
+              "changed under the append", [], "row"),
+             ("unread", unreadable(lambda: None), [], "could not be read back", [], None),
+             ("raises", unreadable(raises), [], "the track went away", [], None)]
+    for name, cls, lane, why, placed, twin in cells:
         w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
+        own_file(w, twin)
         try:
             plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
             r = server.place_sfx(plan)
@@ -3568,14 +3608,25 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
         def AppendToTimeline(self, items):
             self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 0
             return [_RemoteObject()]
-    for cls, lane, why in ((Deaf, [], "nothing new on the track"),
-                           (DeafWhileItMoves, [("theirs.wav", 3000, 75, 0)], "changed under the append")):
+
+    class DeafWhileItIsTrimmed(FakeMediaPool):     # an editor trims another sound's clip as nothing lands
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._d -= 10
+            return [_RemoteObject()]
+    # [Codex r2 on 0.8.1] the clip that moves is one of this row's own file:
+    # still a move, still nothing laid
+    for cls, lane, why, twin in ((Deaf, [], "nothing new on the track", None),
+                                 (DeafWhileItMoves, [("theirs.wav", 3000, 75, 0)], "changed under the append", None),
+                                 (DeafWhileItMoves, [("check.wav", 3000, 82, 0)], "changed under the append", "row"),
+                                 (DeafWhileItIsTrimmed, [("theirs.wav", 3000, 75, 0)], "changed under the append",
+                                  "/library/theirs.wav")):
         w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
+        own_file(w, twin)
         try:
             plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
             r = server.place_sfx(plan)
             assert why in r["failure"]["reason"] and r["wroteToTrack"] is False and "ledgerWritten" not in r, \
-                (cls.__name__, r)
+                (cls.__name__, twin, r)
             assert not os.path.exists(plan + ".placed.json")
             w.tl._tracks[("audio", 3)][:] = [FakeItem(n, s, d, lo) for n, s, d, lo in lane]   # put back
             w.pool.__class__ = FakeMediaPool                                                    # Resolve behaves

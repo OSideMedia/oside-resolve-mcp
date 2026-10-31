@@ -1371,12 +1371,29 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                 new.append(it)
         # the new item is the row only if sfx.same_clip says so: right file, frame, length, trim
         mine = next((it for it in new if sfx.same_clip(it, r)), None)
-        # `new` also holds an item already there that MOVED (a neighbour the
-        # append nudged, an editor at work) — not something this run laid
-        # [Codex r1 on 0.8.1]. Laid: the track gained an item, or an item of
-        # this row's file appeared (a stray of it, even if counts balance).
-        wrote = wrote or mine is not None or len(after) > len(before) or \
-            any(it.get("path") == r["file"] for it in new)
+        # `new` also holds items already there that an editor moved or trimmed
+        # while the append ran (or a neighbour the append nudged) — not
+        # something this run laid [Codex r1, r2 on 0.8.1]. An item counts as
+        # one of those only when it pairs off with an item that left its place,
+        # by the same name and source file; and when that file could be this
+        # row's (the row's path, or unreadable), only as a pure MOVE — same
+        # length and trim — because a stray of the row's file laid as an editor
+        # deletes a clip of it reads exactly like a trim. Every item that does
+        # not pair off was laid (a count that went up leaves one unpaired).
+        # ponytail: identity is name + file (+ length + trim), so an append that
+        # lands an exact copy of a same-file clip deleted in the same instant
+        # reads as that clip moving; a per-item id would close it, and
+        # GetUniqueId's stability across reads is unmeasured.
+        gone, laid = list(pool), []
+        for it in new:
+            maybe_row = it["path"] is None or it["path"] == r["file"]
+            twin = next((g for g in gone if g[0] == it["name"] and g[4] == it["path"]
+                         and (not maybe_row or (g[2], g[3]) == (it["duration"], it["leftOffset"]))), None)
+            if twin is None:
+                laid.append(it)
+            else:
+                gone.remove(twin)
+        wrote = wrote or mine is not None or bool(laid)
         if mine is not None:
             # it landed right even if its append also moved something: it is on the track as planned
             placed.append({**_public(r), "placedAt": mine["start"], "laidLength": mine["duration"],
