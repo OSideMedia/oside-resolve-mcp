@@ -3407,6 +3407,156 @@ def test_place_sfx_read_back_sees_a_neighbour_change_under_the_append():
         w.restore()
 
 
+def test_place_sfx_stops_before_a_row_the_clip_before_ran_into():
+    """[ow-39df46] A conformed clip is accepted one frame long (sfx.expected_lay's
+    tolerance), but every row's collisions were judged before the first write.
+    So the row right behind such a clip was still appended onto the frame the
+    clip now holds, and on a plain track Resolve lays that at the track TAIL
+    (anti-pattern 2). Each row is judged against the track as last read before
+    its append: the run stops there, says which clip ran into it, and keeps the
+    clip that did land on the report and the ledger."""
+    appends = []
+
+    class LongHit(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            appends.append(items[0]["recordFrame"])
+            out = super().AppendToTimeline(items)
+            for x in self._project.GetCurrentTimeline()._tracks[("audio", 3)]:
+                if x.GetName() == "hit.wav" and x.GetStart() == items[0]["recordFrame"]:
+                    x._d += 1                  # 274 frames: inside the +/-1 a conformed lay is allowed
+            return out
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=LongHit)
+    try:
+        # hit.wav (25 fps on 60) is planned 1200..1473 and pop.wav starts on 1473: back to back, no collision
+        plan = _plan(w, [SFX_ROWS[2], ("pop.wav", 0, 13 / 60, 1473)])
+        assert server.place_sfx(plan, dry_run=True)["collisions"] == []
+        r = server.place_sfx(plan)
+        assert not r["ok"] and r["outcome"] == "failed", r
+        assert appends == [1200], appends                                    # pop.wav was never appended
+        assert _lane(w.tl) == [("hit.wav", 1200, 274, 12)], _lane(w.tl)      # and nothing landed at the tail
+        assert [(p["row"], p["laidLength"]) for p in r["placed"]] == [(1, 274)], r["placed"]
+        f = r["failure"]
+        assert f["row"] == 2 and f["landed"] == [] and "'hit.wav'" in f["reason"] and "1200..1474" in f["reason"], f
+        assert r["ledgerWritten"] is True
+    finally:
+        w.restore()
+
+
+def test_place_sfx_an_export_that_raises_keeps_the_report():
+    """[ow-39df46] Both snapshot handlers caught only ResolveError. A disk
+    error from the export (or anything else Export raises) went past them to
+    the server's generic error, which threw away the report of the clips
+    already laid and skipped the ledger. Before any write it is a refusal;
+    after the clips went in, they stay on the report and are recorded — and
+    so when the after-export reads but cannot be compared."""
+    real_snap = rapi.snapshot_otio
+    for which in (1, 2, "compare"):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+        try:
+            real, calls = w.tl.Export, {"n": 0}
+
+            def export(path, *a):
+                calls["n"] += 1
+                if calls["n"] == which:
+                    raise OSError("export I/O failure")
+                return real(path, *a)
+            w.tl.Export = export
+            if which == "compare":     # the second export parses, but as nothing a timeline diff can read
+                rapi.snapshot_otio = lambda res, tl: real_snap(res, tl) if calls["n"] == 0 else {
+                    "tracks": {"children": [42]}}
+            plan = _plan(w, SFX_ROWS)
+            r = server.place_sfx(plan)
+            reason = r.get("failure", {}).get("reason", "")
+            assert not r.get("ok") and ("export I/O failure" in reason or which == "compare"), (which, r)
+            if which == 1:
+                assert r["outcome"] == "refused" and "no before-snapshot" in reason, r
+                assert _lane(w.tl) == [] and not os.path.exists(plan + ".placed.json"), r
+            else:
+                assert r["outcome"] == "failed", r
+                assert ("comparison could not run" if which == "compare" else "after-snapshot failed") in reason, r
+                assert [p["record"] for p in r["placed"]] == [212, 609, 1200] and len(_lane(w.tl)) == 3, r
+                assert r["ledgerWritten"] is True, r
+        finally:
+            rapi.snapshot_otio = real_snap
+            w.restore()
+
+
+def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
+    """[ow-39df46] The ledger was written only for rows in `placed`, and a row
+    went there only when its whole check passed. So when the run's FIRST append
+    put a clip on the track and the check then failed — the right clip with a
+    neighbour nudged under it, a stray at the tail, a track that would not read
+    back after it (answering None, or raising) — nothing was recorded, and once
+    the editor deleted that clip an ordinary re-run laid it again. Each case is
+    now recorded and the plain re-run refuses. A drop that put nothing on the
+    track still records nothing."""
+    class Nudge(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            for x in self._project.GetCurrentTimeline()._tracks[("audio", 3)]:
+                if x.GetName() == "theirs.wav":
+                    x._left += 2
+            return out
+
+    class Late(FakeMediaPool):          # an occupant arrives mid-run, so the clip lands at the tail
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].append(FakeItem("hidden.wav", 0, 75))
+            return super().AppendToTimeline(items)
+
+    def unreadable(answer):
+        class Unread(FakeMediaPool):    # the clip lands; the read right after it does not answer
+            def AppendToTimeline(self, items):
+                out = super().AppendToTimeline(items)
+                tl = self._project.GetCurrentTimeline()
+                real = tl.GetItemListInTrack
+
+                def once(kind, idx):
+                    tl.GetItemListInTrack = real
+                    return answer()
+                tl.GetItemListInTrack = once
+                return out
+        return Unread
+
+    def raises():
+        raise RuntimeError("the track went away")
+
+    # the nudged clip landed exactly as planned, so it is also `placed`
+    cells = [("nudged", Nudge, [("theirs.wav", 3000, 40, 0)], "changed under the append", [1]),
+             ("stray", Late, [], "landed somewhere other", []),
+             ("unread", unreadable(lambda: None), [], "could not be read back", []),
+             ("raises", unreadable(raises), [], "the track went away", [])]
+    for name, cls, lane, why, placed in cells:
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
+        try:
+            plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
+            r = server.place_sfx(plan)
+            assert not r.get("ok") and r.get("outcome") == "failed", (name, r)
+            assert why in r["failure"]["reason"] and r.get("ledgerWritten") is True, (name, r)
+            assert [p["row"] for p in r["placed"]] == placed, (name, r["placed"])
+            with open(plan + ".placed.json") as f:
+                run = json.load(f)["entries"][0]["runs"][0]
+            assert run["outcome"] == "failed" and why in run["failure"]["reason"], (name, run)
+            # the editor deletes what this run put on the track and leaves the rest as it was
+            w.tl._tracks[("audio", 3)][:] = [FakeItem(n, s, d, lo) for n, s, d, lo in lane]
+            again = server.place_sfx(plan)
+            assert again["outcome"] == "refused" and "was laid here on" in again["failure"]["reason"], (name, again)
+            assert _lane(w.tl) == list(lane), (name, _lane(w.tl))
+        finally:
+            w.restore()
+
+    class Deaf(FakeMediaPool):          # nothing lands: there is nothing to remember
+        def AppendToTimeline(self, items):
+            return [_RemoteObject()]
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Deaf)
+    try:
+        plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
+        r = server.place_sfx(plan)
+        assert r["failure"]["reason"] == "nothing new on the track" and "ledgerWritten" not in r, r
+        assert not os.path.exists(plan + ".placed.json")
+    finally:
+        w.restore()
+
+
 def test_place_sfx_refuses_when_the_track_and_its_export_disagree():
     """The item list judged the collisions; the export is what the diff will
     compare against. An occupant only one of them shows means neither can be

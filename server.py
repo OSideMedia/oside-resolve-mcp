@@ -932,9 +932,10 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
     before/after OTIO export then proves every other track is identical.
 
     Re-running a plan is a no-op: a clip already at its frame with its file,
-    length and trim reads `alreadyPlaced`. Every run that lays a clip — or
-    finds the plan's rows already here unrecorded — is recorded beside the plan
-    in `<plan>.placed.json`. A plan the track only PARTLY holds, or one the
+    length and trim reads `alreadyPlaced`. Every run that puts anything on the
+    track — a clip that passed its check or one that did not — or finds the
+    plan's rows already here unrecorded is recorded beside the plan in
+    `<plan>.placed.json`. A plan the track only PARTLY holds, or one the
     ledger says was laid anywhere before (a renamed project reads as elsewhere)
     with rows missing here, is refused unless resume=True — rows missing from
     a track the editor has worked on were probably deleted on purpose; resume
@@ -949,12 +950,14 @@ def place_sfx(plan_path: str, dry_run: bool = False, resume: bool = False) -> di
         report = rapi.place_sfx(resolve, project, plan, dry_run=dry_run, resume=resume, history=history)
         ok = report["outcome"] in ("placed", "nothing-to-do", "dry-run")
         # The track is the truth; the ledger is only how a later run knows a
-        # pass deleted WHOLE was laid at all. Recorded: a run that laid clips,
-        # and a run that found the plan already here with no record of it here
-        # (a ledger that failed to write last time is written now). A failed
-        # write is reported, never allowed to hide the run that happened.
+        # pass deleted WHOLE was laid at all. Recorded: a run that put anything
+        # on the track (a clip that failed its check is still there, and so is
+        # one the track would not read back after — `wroteToTrack`), and a run
+        # that found the plan already here with no record of it here (a ledger
+        # that failed to write last time is written now). A failed write is
+        # reported, never allowed to hide the run that happened.
         here = sfx.ledger_entry(history, report.get("project"), report.get("timeline"), report.get("track"))
-        if not dry_run and (report.get("placed") or (report.get("alreadyPlaced") and here is None)):
+        if not dry_run and (report.get("wroteToTrack") or (report.get("alreadyPlaced") and here is None)):
             try:
                 sfx.record_run(plan_path, history, report,
                                datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## 0.8.1 — 2026-10-31
+
+### Fixed — `place_sfx` after the first write (ow-39df46)
+
+Three flaws an automatic second reviewer found on 2026-10-25, each confirmed against the
+code and each now held by a test that fails on 0.8.0:
+
+- **The next spot taken.** A conformed clip (a file the pool tags at another rate) is
+  accepted a frame long, but every row was judged against the track only once, before the
+  first write. So the row right behind such a clip was still appended onto the frame that
+  clip now held, and on a plain track Resolve lays it at the track's TAIL (anti-pattern 2).
+  Each row is now judged against the track as last read before its append; the run stops
+  there, names the clip that ran into it, and keeps that clip on the report and the ledger.
+- **A disk error on a snapshot.** Both snapshot handlers caught only `ResolveError`, so an
+  `OSError` (or anything else `Timeline.Export` raises) went past them to the server's
+  generic error. After clips had landed that threw away the report of them and skipped the
+  ledger. Any error is now caught: before the first write it is a refusal, after it a
+  `failed` outcome that keeps `placed` and is recorded. The before/after comparison is held
+  the same way, and so is a read-back after an append that raises something other than
+  `ResolveError`.
+- **A clip that landed but failed its check was not recorded.** The ledger was written
+  only for rows in `placed`, and a row went there only when its whole check passed. When a
+  run's first append put a clip on the track and the check then failed (the right clip with
+  a neighbour moved under it, a stray at the tail, a track that would not read back after
+  it), nothing was recorded, and once the editor deleted that clip an ordinary re-run laid
+  it again. The report now carries `wroteToTrack`, the server records every run that put
+  anything on the track (a failed read-back counts, since the clip may be there), and the
+  ledger's run keeps its `failure` (row, reason, what landed). A right clip whose append
+  also moved a neighbour is now in `placed`, since it is on the track as planned; the run
+  still fails on the moved neighbour. A drop that put nothing on the track still records
+  nothing.
+- `tests/redproof_place_sfx.py`: ten new mutations, one per guard above; 61 of 61 go red.
+
 ## 0.8.0 — 2026-10-25
 
 ### Changed — a plan says which project it is for
