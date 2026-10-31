@@ -3490,9 +3490,10 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
     the editor deleted that clip an ordinary re-run laid it again. Each case is
     now recorded and the plain re-run refuses. A drop that put nothing on the
     track still records nothing, and so does one during which an editor only
-    moved a clip already there [Codex r1, r2 on 0.8.1]. Any other change under
-    the append (a trim) is recorded by decision [Codex r3], and the failure
-    says how to finish: resume=True, which every cell then proves works."""
+    moved a clip already there, proved by its readable file and trim [Codex r1,
+    r2, r4 on 0.8.1]. Any other change under the append (a trim, a move that
+    cannot be proved) is recorded by decision [Codex r3], and the failure says
+    how to finish: resume=True, which every cell then proves works."""
     class Nudge(FakeMediaPool):
         def AppendToTimeline(self, items):
             out = super().AppendToTimeline(items)
@@ -3525,6 +3526,20 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
 
     class PathlessAsOneGoes(NamesakeAsOneGoes):    # the same, and the laid clip's file cannot be read
         decoy_path = None
+
+    class Deaf(FakeMediaPool):          # nothing lands: there is nothing to remember
+        def AppendToTimeline(self, items):
+            return [_RemoteObject()]
+
+    class DeafWhileItMoves(FakeMediaPool):
+        """[Codex r1 on 0.8.1] Nothing lands, but an editor moves the clip
+        already on the track while the append runs. A moved item is not one
+        this run laid: counting it would record the plan, and a plain retry
+        after the editor puts it back would be refused. Only a move proved by a
+        readable file and trim counts as one [Codex r4]."""
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 0
+            return [_RemoteObject()]
 
     class TrimmedAsNothingLands(FakeMediaPool):
         """[Codex r3 on 0.8.1] Nothing lands while an editor trims a clip of
@@ -3559,10 +3574,13 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
 
     def own_file(w, path):
         """The first item already on the track gets a readable source file:
-        "row" = this row's own file (a twin of the sound being laid)."""
+        "row" = this row's own file (a twin of the sound being laid), and
+        "row, trim unread" the same with a left offset that will not read."""
         if path:
             first = w.tl._tracks[("audio", 3)][0]
-            first._media = FakeClip(first._n, 98, fps=60, path=w.paths["check.wav"] if path == "row" else path)
+            first._media = FakeClip(first._n, 98, fps=60, path=w.paths["check.wav"] if path.startswith("row") else path)
+            if path.endswith("trim unread"):     # the API read fails; the export still has the trim
+                first.GetLeftOffset = lambda subframe_precision=False: None
 
     # the nudged clip landed exactly as planned, so it is also `placed`. The
     # last element gives the clip already there a source file: an item of this
@@ -3580,6 +3598,15 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
               [], "row"),
              ("unreadable stray as one goes", PathlessAsOneGoes, [("theirs.wav", 3000, 82, 0)],
               "changed under the append", [], None),
+             ("unreadable stray as its unreadable twin goes", PathlessAsOneGoes, [("check.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], None),
+             ("stray as a renamed twin goes", StrayAsOneGoes, [("theirs.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], "row"),
+             # [Codex r4] a move whose file or trim cannot be read is not proved a move
+             ("pathless clip moves", DeafWhileItMoves, [("theirs.wav", 3000, 75, 0)],
+              "finish the plan with resume=True", [], None),
+             ("clip with an unread trim moves", DeafWhileItMoves, [("check.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], "row, trim unread"),
              ("namesake as its namesake goes", NamesakeAsOneGoes, [("check.wav", 3000, 40, 5)],
               "finish the plan with resume=True", [], "/other/library/check.wav"),
              ("trimmed as nothing lands", TrimmedAsNothingLands, [("check.wav", 3000, 82, 0)],
@@ -3612,23 +3639,9 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
         finally:
             w.restore()
 
-    class Deaf(FakeMediaPool):          # nothing lands: there is nothing to remember
-        def AppendToTimeline(self, items):
-            return [_RemoteObject()]
-
-    class DeafWhileItMoves(FakeMediaPool):
-        """[Codex r1 on 0.8.1] Nothing lands, but an editor moves the clip
-        already on the track while the append runs. A moved item is not one
-        this run laid: counting it would record the plan, and a plain retry
-        after the editor puts it back would be refused."""
-        def AppendToTimeline(self, items):
-            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 0
-            return [_RemoteObject()]
-
     # [Codex r2 on 0.8.1] the clip that moves is one of this row's own file:
     # still a move, still nothing laid
     for cls, lane, why, twin in ((Deaf, [], "nothing new on the track", None),
-                                 (DeafWhileItMoves, [("theirs.wav", 3000, 75, 0)], "changed under the append", None),
                                  (DeafWhileItMoves, [("check.wav", 3000, 82, 0)], "changed under the append", "row")):
         w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
         own_file(w, twin)

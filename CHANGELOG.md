@@ -35,7 +35,8 @@ code and each now held by a test that fails on 0.8.0:
   nothing, and so does an item already on the track that an editor only moved during the
   append (Codex r1, r2: counting it would have refused a plain retry after the editor put
   it back). A move is an item that left its place and reappears with the same name, file,
-  length and trim. Any other change under the append counts as a clip laid, a trim
+  length and trim, the file and trim both readable (an unreadable one proves nothing, Codex
+  r4). Any other change under the append counts as a clip laid, a trim
   included, by decision (Codex r3): a clip laid as an editor deletes one reads exactly like
   that clip trimmed, and missing a laid clip lets a re-run put back what the editor
   deleted, while recording a run that laid nothing only refuses a plain retry. That
@@ -44,7 +45,7 @@ code and each now held by a test that fails on 0.8.0:
   is marked in the code.
   The README's advice on `failure.landed` now says how to sort it: the row laid right
   (keep), a moved neighbour (put back), a stray (remove).
-- `tests/redproof_place_sfx.py`: seventeen new mutations, one per guard above; 68 of 68 go red.
+- `tests/redproof_place_sfx.py`: nineteen new mutations, one per guard above; 70 of 70 go red.
 
 ## 0.8.0 — 2026-10-25
 

@@ -1385,8 +1385,11 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
         # and GetUniqueId's stability across reads is unmeasured.
         gone, laid = list(pool), []
         for it in new:
-            twin = next((g for g in gone if (g[0], g[2], g[3], g[4]) ==
-                         (it["name"], it["duration"], it["leftOffset"], it["path"])), None)
+            twin = None
+            # unreadable evidence certifies nothing: None == None is not the same file or trim [Codex r4]
+            if it["path"] is not None and it["leftOffset"] is not None:
+                twin = next((g for g in gone if (g[0], g[2], g[3], g[4]) ==
+                             (it["name"], it["duration"], it["leftOffset"], it["path"])), None)
             if twin is None:
                 laid.append(it)
             else:
