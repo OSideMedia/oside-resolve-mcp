@@ -3503,6 +3503,16 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
             self._project.GetCurrentTimeline()._tracks[("audio", 3)].append(FakeItem("hidden.wav", 0, 75))
             return super().AppendToTimeline(items)
 
+    class Namesake(FakeMediaPool):      # Resolve lays another library's file of the same name
+        def AppendToTimeline(self, items):
+            decoy = FakeClip("check.wav", 98, fps=60, path="/other/library/check.wav")
+            return super().AppendToTimeline([dict(items[0], mediaPoolItem=decoy)])
+
+    class StrayAsOneGoes(FakeMediaPool):   # a frame late, while an editor deletes the clip there: counts balance
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].pop(0)
+            return super().AppendToTimeline([dict(items[0], recordFrame=items[0]["recordFrame"] + 1)])
+
     def unreadable(answer):
         class Unread(FakeMediaPool):    # the clip lands; the read right after it does not answer
             def AppendToTimeline(self, items):
@@ -3523,6 +3533,8 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
     # the nudged clip landed exactly as planned, so it is also `placed`
     cells = [("nudged", Nudge, [("theirs.wav", 3000, 40, 0)], "changed under the append", [1]),
              ("stray", Late, [], "landed somewhere other", []),
+             ("namesake", Namesake, [], "landed somewhere other", []),
+             ("stray as one goes", StrayAsOneGoes, [("theirs.wav", 3000, 40, 0)], "changed under the append", []),
              ("unread", unreadable(lambda: None), [], "could not be read back", []),
              ("raises", unreadable(raises), [], "the track went away", [])]
     for name, cls, lane, why, placed in cells:
@@ -3547,14 +3559,30 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
     class Deaf(FakeMediaPool):          # nothing lands: there is nothing to remember
         def AppendToTimeline(self, items):
             return [_RemoteObject()]
-    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=Deaf)
-    try:
-        plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
-        r = server.place_sfx(plan)
-        assert r["failure"]["reason"] == "nothing new on the track" and "ledgerWritten" not in r, r
-        assert not os.path.exists(plan + ".placed.json")
-    finally:
-        w.restore()
+
+    class DeafWhileItMoves(FakeMediaPool):
+        """[Codex r1 on 0.8.1] Nothing lands, but an editor moves the clip
+        already on the track while the append runs. A moved item is not one
+        this run laid: counting it would record the plan, and a plain retry
+        after the editor puts it back would be refused."""
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 0
+            return [_RemoteObject()]
+    for cls, lane, why in ((Deaf, [], "nothing new on the track"),
+                           (DeafWhileItMoves, [("theirs.wav", 3000, 75, 0)], "changed under the append")):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
+        try:
+            plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
+            r = server.place_sfx(plan)
+            assert why in r["failure"]["reason"] and r["wroteToTrack"] is False and "ledgerWritten" not in r, \
+                (cls.__name__, r)
+            assert not os.path.exists(plan + ".placed.json")
+            w.tl._tracks[("audio", 3)][:] = [FakeItem(n, s, d, lo) for n, s, d, lo in lane]   # put back
+            w.pool.__class__ = FakeMediaPool                                                    # Resolve behaves
+            again = server.place_sfx(plan)
+            assert again["outcome"] == "placed", (cls.__name__, again)
+        finally:
+            w.restore()
 
 
 def test_place_sfx_refuses_when_the_track_and_its_export_disagree():

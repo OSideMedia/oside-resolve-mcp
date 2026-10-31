@@ -32,8 +32,11 @@ code and each now held by a test that fails on 0.8.0:
   ledger's run keeps its `failure` (row, reason, what landed). A right clip whose append
   also moved a neighbour is now in `placed`, since it is on the track as planned; the run
   still fails on the moved neighbour. A drop that put nothing on the track still records
-  nothing.
-- `tests/redproof_place_sfx.py`: ten new mutations, one per guard above; 61 of 61 go red.
+  nothing, and so does an item already on the track that merely moved during the append
+  (Codex r1: counting it would have refused a plain retry after the editor put it back).
+  The README's advice on `failure.landed` now says how to sort it: the row laid right
+  (keep), a moved neighbour (put back), a stray (remove).
+- `tests/redproof_place_sfx.py`: thirteen new mutations, one per guard above; 64 of 64 go red.
 
 ## 0.8.0 — 2026-10-25
 
