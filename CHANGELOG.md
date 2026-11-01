@@ -13,31 +13,39 @@ home paths and email addresses, and missed the rest:
   `C:\Users\someone` passed. It now takes one or two, or a forward slash, and network
   shares (`\\server\share`) get their own rule.
 - **New rules:** local network hostnames (`.lan`, `.home`, `.internal`, `.localdomain`,
-  `.home.arpa` beside `.local`), IP addresses (IPv4 and IPv6), the names macOS and Windows give a computer
-  out of the box (`Someone's MacBook Pro`, `DESKTOP-XXXXXXX`), and the name of the machine
-  running the test.
+  `.home.arpa` beside `.local`), IP addresses (IPv4 and IPv6), the names macOS and Windows
+  give a computer out of the box (`Someone's MacBook Pro`, `DESKTOP-XXXXXXX`, lowercased
+  too), and the name of the machine running the test. A machine name that is a plain word
+  is matched only as a whole value, so a machine called `Resolve` does not block the
+  templates. The credential rule also reads an XML element holding a value
+  (`<Password>…</Password>`), not only an assignment.
 - **The real templates carry Waves plugin versions that are valid dotted quads**, so the
-  address rule excuses a value right after a version element or attribute and never reads
-  a quad out of a longer dotted number. Without either guard the gate blocks the real
-  templates. The IPv6 rule wants a digit and a clean edge on each side, so a timecode,
-  `Blur1::Add` or `Cafe::Bead` is not an address.
+  address rule judges the field a quad sits in: a version element or attribute
+  (`PluginVersion`, `version="…"`, whitespace allowed) excuses it, `conversion` does not,
+  and a quad inside a longer dotted number is never read. Without that the gate blocks the
+  real templates. The IPv6 rule takes the compressed forms with two groups or more and
+  wants a decimal digit or three groups, so `fdab:cafe::beef` and `2001:db8::` are caught,
+  while a timecode, `Blur1::Add` or `Cafe::Bead` is not an address.
 - **Every decoder now runs on every layer.** base64 and gzip join hex, zstd and zlib,
-  nested up to six layers. Past that depth, or past 5000 layers, the member reads
-  UNREADABLE, never clean.
+  nested up to six layers. The text decoders read each layer's UTF-16 views too, and every
+  text is also read XML-unescaped. Short runs are decoded (base64 from eight characters,
+  hex from twelve), and a zlib stream that reaches its end is kept however short. Past six
+  layers, or past 5000, the member reads UNREADABLE, never clean.
 
-A new test plants a leak for every rule (a rule with no plant fails), checks the
-lookalikes pass in plain XML and inside Resolve's own compressed layers, shows each decoder
-a path only it can reach, and runs the old Windows rule on the same path, where it must
-miss. Main's scanner missed every new plant; fifteen mutations of the new one each turn a
-test red.
+A new test plants a leak for every rule. A rule with no plant of its own fails, checked
+rule by rule rather than by label. The test checks the lookalikes pass in plain XML and
+inside Resolve's own compressed layers, shows each decoder a path only it can reach, and
+runs the old Windows rule on the same path, where it must miss. Main's scanner missed
+every new plant, and each guard here was reverted alone: every revert turns a test red.
 
 ### Added — `uv.lock` (audit 2026-09-12 R-14)
 
 Installs now resolve the same package versions every time: `uv sync --locked`. The
 lockfile was checked by hand before it was committed and is refreshed here only for the
 project's own version. `test_the_lockfile_matches_the_project` holds its entry to
-`pyproject.toml` (version, requirements including the `mcp<2` pin, extras); it caught the
-0.8.1 bump the first time main moved under it.
+`pyproject.toml`: the version, the Python requirement, every requirement with its extras,
+specifier (the `mcp<2` pin) and marker, the dependency edges the lock installs, and the
+extras it provides. It caught the 0.8.1 bump the first time main moved under it.
 
 ## 0.8.1 — 2026-10-31
 
