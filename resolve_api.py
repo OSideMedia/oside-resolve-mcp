@@ -1143,7 +1143,9 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
       4. snapshot the timeline (OTIO), then append ONE clip at a time and
          re-read the track after each: the new item must sit at its frame with
          its length and its trim. The first mismatch STOPS the run — no retry,
-         no delete; the stray is reported so the editor can remove it;
+         no delete; the stray is reported so the editor can remove it. Each
+         row is judged again against that read before its append, since a
+         conformed clip accepted a frame long can reach into the next one;
       5. snapshot again and prove every other track is byte-identical, the
          target holds exactly what it held plus what was laid, and the
          timeline end did not move.
@@ -1302,7 +1304,7 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
 
     try:
         before_doc = snapshot_otio(resolve, timeline)
-    except ResolveError as e:
+    except Exception as e:  # noqa: BLE001 — a disk error is as much "no snapshot" as Resolve's own refusal
         return finish("refused", toPlace=[_public(r) for r in verdict["toPlace"]],
                       failure={"reason": f"no before-snapshot, so nothing was laid: {e}"})
     # Two readings of the same track must agree before either is trusted: the
@@ -1317,13 +1319,33 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
             "reason": "the track's item list and its export disagree, so neither can be trusted — nothing "
                       f"was laid (read {len(read)} item(s), export shows "
                       f"{'no such track' if seen is None else len(seen)})"})
-    placed, failure = [], None
+    # `wrote`: did this run put anything on the track? A clip that failed its
+    # check is still ON the track, and an editor who deletes it means it, so
+    # the ledger must remember it as much as a clean placement. A read-back
+    # that failed after an append cannot say, and unknown counts as written.
+    placed, failure, wrote = [], None, False
     before = lane
 
     def key(it):
         return (it["name"], it["start"], it["duration"], it["leftOffset"], it["path"])
 
     for r in verdict["toPlace"]:
+        # Every row was judged against the track before the first write, but a
+        # conformed clip is accepted a frame long (sfx.expected_lay), so the
+        # clip just laid can reach into this row. `before` is the track as last
+        # read, and differs from the judged one only by clips this run laid.
+        # An append onto a held frame lands at the track's TAIL on a plain
+        # track (anti-pattern 2), so the run stops before it.
+        ends = r["record"] + r["length"]
+        held = [it for it in before if it["start"] < ends and r["record"] < it["start"] + it["duration"]]
+        if held:
+            it = held[0]
+            failure = {**_public(r), "landed": [],
+                       "reason": f"{it['name']!r} now holds {it['start']}..{it['start'] + it['duration']}, into "
+                                 f"this row's {r['record']}..{ends}: the clip laid before it ran long. Nothing "
+                                 "was appended for this row, because on a held frame Resolve lays the clip at "
+                                 "the track's tail."}
+            break
         try:
             media_pool.AppendToTimeline([{
                 "mediaPoolItem": r["item"], "startFrame": r["startFrame"], "endFrame": r["endFrame"],
@@ -1333,38 +1355,85 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
             report.setdefault("appendErrors", []).append({"row": r["row"], "error": str(e)})
         try:
             after = _read_lane(timeline, idx, start)
-        except ResolveError as e:
-            failure = {**_public(r), "landed": [], "reason": f"the track could not be read back: {e}"}
+        except Exception as e:  # noqa: BLE001 — the append may have landed: reported and recorded, never raised past
+            wrote = True
+            failure = {**_public(r), "landed": None,
+                       "reason": f"the track could not be read back after the append, so the clip may be on it "
+                                 f"unchecked: {e}"}
             break
         pool = [key(it) for it in before]
-        new = []
+        new, blind = [], False
         for it in after:
             k = key(it)
             if k in pool:
                 pool.remove(k)
+                # an item that reads unchanged is the same clip only by what was
+                # read: with its file or trim unread, it may be a different
+                # sound this run laid where an editor deleted one [Codex r5]
+                blind = blind or it["path"] is None or it["leftOffset"] is None
             else:
                 new.append(it)
         # the new item is the row only if sfx.same_clip says so: right file, frame, length, trim
-        good = len(after) == len(before) + 1 and len(new) == 1 and not pool and sfx.same_clip(new[0], r)
+        mine = next((it for it in new if sfx.same_clip(it, r)), None)
+        # `new` also holds items already there that an editor moved while the
+        # append ran — not something this run laid [Codex r1 on 0.8.1]. Only a
+        # pure MOVE pairs off: an item that left its place and reappears with
+        # the same name, file, length and trim. Everything else in `new` counts
+        # as laid, a trim included [Codex r2, r3]: a clip laid as an editor
+        # deletes one reads exactly like that clip trimmed, and the two mistakes
+        # are not equal. Recording a run that laid nothing costs a refused plain
+        # retry, and the failure below says to pass resume=True; missing a run
+        # that laid something lets a re-run put back a clip the editor deleted.
+        # ponytail: an append that lands an exact copy of a clip deleted in the
+        # same instant (its file and trim read) reads as that clip staying put
+        # or moving; a per-item id would close it, and GetUniqueId's stability
+        # across reads is unmeasured.
+        gone, laid = list(pool), []
+        for it in new:
+            twin = None
+            # unreadable evidence certifies nothing: None == None is not the same file or trim [Codex r4]
+            if it["path"] is not None and it["leftOffset"] is not None:
+                twin = next((g for g in gone if (g[0], g[2], g[3], g[4]) ==
+                             (it["name"], it["duration"], it["leftOffset"], it["path"])), None)
+            if twin is None:
+                laid.append(it)
+            else:
+                gone.remove(twin)
+        wrote = wrote or mine is not None or bool(laid) or blind
+        if mine is not None:
+            # it landed right even if its append also moved something: it is on the track as planned
+            placed.append({**_public(r), "placedAt": mine["start"], "laidLength": mine["duration"],
+                           "laidLeftOffset": mine["leftOffset"]})
+        good = len(after) == len(before) + 1 and len(new) == 1 and not pool and mine is not None
         if not good:
             failure = {**_public(r), "landed": new,
                        "reason": "nothing new on the track" if not new else
                                  "the clip landed somewhere other than its frame, length or trim"
                                  if not pool else "an item already on the track changed under the append"}
+            if mine is None and ((pool and laid) or blind):
+                cause = ("one it laid cannot be told from that change" if pool and laid else
+                         "an item on the track whose file or trim could not be read may be one it laid")
+                failure["reason"] += (f"; this run counts as having laid a clip, because {cause}. If none of "
+                                      "its clips is on the track, finish the plan with resume=True")
             break
-        placed.append({**_public(r), "placedAt": new[0]["start"], "laidLength": new[0]["duration"],
-                       "laidLeftOffset": new[0]["leftOffset"]})
         before = after
 
-    report["placed"] = placed
+    # From here on clips may be on the track: no error may take this report,
+    # or the ledger write the server makes from it, down with it.
+    report.update(placed=placed, wroteToTrack=wrote)
     try:
         after_doc = snapshot_otio(resolve, timeline)
-    except ResolveError as e:
+    except Exception as e:  # noqa: BLE001 — a disk error included: the report of what landed must survive
         return finish("failed", failure=failure or {
             "reason": f"laid {len(placed)} clip(s) but the after-snapshot failed, so nothing is proven: {e}"})
-    diff = sfx.otio_diff(before_doc, after_doc, "Audio", idx,
-                         [(p["name"], p["placedAt"], p["laidLength"]) for p in placed])
-    end_after = int(timeline.GetEndFrame())
+    try:
+        diff = sfx.otio_diff(before_doc, after_doc, "Audio", idx,
+                             [(p["name"], p["placedAt"], p["laidLength"]) for p in placed])
+        end_after = int(timeline.GetEndFrame())
+    except Exception as e:  # noqa: BLE001 — as above
+        return finish("failed", failure=failure or {
+            "reason": f"laid {len(placed)} clip(s) but the before/after comparison could not run, so nothing "
+                      f"is proven: {e}"})
     diff["checks"].append({"check": "timelineEndUnchanged", "pass": end_after == end_frame,
                            "before": end_frame - start, "after": end_after - start})
     diff["pass"] = all(c["pass"] for c in diff["checks"])

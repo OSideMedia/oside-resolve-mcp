@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.8.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
@@ -325,14 +325,20 @@ The full surface, with the behaviour each one guarantees.
    agree; then appends **one clip at a time and re-reads the track** after
    each — the new item must be the right file at its frame with its length and
    its trim, every item already there must be unchanged, and the first
-   mismatch stops the run (no retry, no delete: the stray is reported); then
+   mismatch stops the run (no retry, no delete: the stray is reported). Each
+   row is also judged against that last read before its own append: a
+   conformed clip is accepted a frame long, so it can reach into the next
+   row, and the run stops there rather than let Resolve drop the next clip at
+   the track's tail; then
    exports again and proves **every other track is identical**, every clip and
    transition the target had is still there unchanged with nothing new beside
    what was laid, and the timeline end did not move (`diff.checks`). A track or
    item that does not answer is an error, never an empty lane. A clip already
    at its frame with its file, length and trim reads `alreadyPlaced`, so a
-   re-run is a no-op. Every run that lays a clip — or finds the plan on the
-   track with no record of it there — is recorded beside the plan in
+   re-run is a no-op. Every run that puts anything on the track — a clip that
+   passed its check, one that did not, or one the track would not read back
+   after — or finds the plan on the track with no record of it there — is
+   recorded beside the plan in
    **`<plan>.placed.json`** (project, timeline, track, when). A **partly**
    placed plan is refused unless `resume=True`, and so is a plan that ledger
    says was laid **anywhere** with rows now missing here — which catches a
@@ -482,10 +488,11 @@ appear in the tool's `error` field.
 | `outcome: failed` — `the media pool could not be read back after the import` | the import ran but the pool would not answer after it; `imported` is `null` (unknown, not none) | look in the plan's bin for what came in, then re-run — files already there are reused |
 | `could not read which bin is open` / `could not reselect the bin you had open` | the media pool would not report, or would not restore, your current bin — nothing was laid | reselect your bin in the media pool and re-run |
 | `… did not answer with its items` / `did not report its name, start or length` / `the track's item list and its export disagree` | before any append: a read of the target track could not be trusted, so collisions cannot be judged — nothing was laid | close any modal in Resolve and re-run; if it persists, `snapshot_timeline` and look at the track |
-| `outcome: failed` — `the track could not be read back: …` | the same unreadable track, but AFTER an append — `placed` lists what was laid before it | check that row in Resolve, then re-run with `resume=True`; laid rows read `alreadyPlaced` |
-| `outcome: failed` with `failure.landed` | Resolve laid a clip somewhere other than its frame, length or trim (or not at all); the run stopped there | remove the item `landed` names in Resolve, then re-run — re-run with `resume=True` — the rows already laid read `alreadyPlaced` |
-| `no before-snapshot, so nothing was laid: Timeline.Export (OTIO) answered … and wrote 0 bytes` | no before-snapshot to judge with | check the disk has room and no modal is open in Resolve; retry |
-| `laid N clip(s) but the after-snapshot failed, so nothing is proven` | the clips ARE on the track, but the after-export failed, so nothing proves the other tracks are untouched | check the other tracks by eye or with `snapshot_timeline`; the laid rows read `alreadyPlaced` on a re-run |
+| `outcome: failed` — `the track could not be read back after the append, so the clip may be on it unchecked: …` | the same unreadable track, but AFTER an append — `placed` lists what was laid before it, `failure.landed` is `null` (unknown), and the run is recorded in the ledger in case the clip is there | check that row in Resolve, then re-run with `resume=True`; laid rows read `alreadyPlaced` |
+| `outcome: failed` with `failure.landed` | Resolve laid a clip somewhere other than its frame, length or trim (or not at all), or the append changed an item already on the track; the run stopped there. `landed` lists every item that differs from the read before that append. A clip this run put on the track is recorded in the ledger, so deleting it does not make the plan new. An item already there that stayed put or only moved (same name, file, length and trim) is not counted, but only when its file and trim both read. Any other change under the append is counted, and so is an item whose file or trim did not read, because a clip laid as an editor deletes one looks the same; the reason then ends `finish the plan with resume=True`. The one case this cannot see: a clip laid as an exact copy of one deleted in the same instant, its file and trim read, looks like that clip staying put or moving | sort `landed` before touching anything: a clip also listed in `placed` is the row, laid right — keep it; an item that was on the track before (a neighbour the append moved) goes back where it was; anything else is a stray to remove. Then re-run with `resume=True` — the rows already laid read `alreadyPlaced` |
+| `outcome: failed` — `'X' now holds a..b, into this row's c..d: the clip laid before it ran long` | a conformed clip landed a frame longer than planned (accepted, within its tolerance) and now covers the next row's first frame; that row was NOT appended, because Resolve would have laid it at the track's tail | move that row a frame later in the plan (or trim the clip before it), then re-run with `resume=True` |
+| `no before-snapshot, so nothing was laid: …` | no before-snapshot to judge with: the export wrote 0 bytes, or failed outright (a disk error included) | check the disk has room and no modal is open in Resolve; retry |
+| `laid N clip(s) but the after-snapshot failed, so nothing is proven` / `… the before/after comparison could not run …` | the clips ARE on the track, but the after-export failed (a disk error included) or could not be compared, so nothing proves the other tracks are untouched; the report keeps `placed` and the ledger records them | check the other tracks by eye or with `snapshot_timeline`; the laid rows read `alreadyPlaced` on a re-run |
 | `Manifest not found` / `Not an oside-davinci/v1 manifest` | wrong path, or not a package this server understands | point at the package's `manifest.json`; compare `resolve_status().capabilities.manifest` |
 
 ## Contributing
