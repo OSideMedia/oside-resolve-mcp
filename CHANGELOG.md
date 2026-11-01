@@ -13,13 +13,14 @@ home paths and email addresses, and missed the rest:
   `C:\Users\someone` passed. It now takes one or two, or a forward slash, and network
   shares (`\\server\share`) get their own rule.
 - **New rules:** local network hostnames (`.lan`, `.home`, `.internal`, `.localdomain`,
-  `.home.arpa` beside `.local`), IP addresses, the names macOS and Windows give a computer
+  `.home.arpa` beside `.local`), IP addresses (IPv4 and IPv6), the names macOS and Windows give a computer
   out of the box (`Someone's MacBook Pro`, `DESKTOP-XXXXXXX`), and the name of the machine
   running the test.
 - **The real templates carry Waves plugin versions that are valid dotted quads**, so the
   address rule excuses a value right after a version element or attribute and never reads
   a quad out of a longer dotted number. Without either guard the gate blocks the real
-  templates.
+  templates. The IPv6 rule wants a digit and a clean edge on each side, so a timecode,
+  `Blur1::Add` or `Cafe::Bead` is not an address.
 - **Every decoder now runs on every layer.** base64 and gzip join hex, zstd and zlib,
   nested up to six layers. Past that depth, or past 5000 layers, the member reads
   UNREADABLE, never clean.

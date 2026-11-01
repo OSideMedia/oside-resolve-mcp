@@ -1829,6 +1829,14 @@ def test_colliding_pins_checkerboard_onto_a_second_lane():
 
 # An IPv4 octet, 0-255, no leading zero: "0004" in a build number is not one.
 _OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+# An IPv6 address: all eight groups, or one "::" with a group on each side. A timecode
+# (four groups, no "::") is not one. It holds at least one digit ("Cafe::Bead" is two
+# words), starts after anything but a letter, digit or colon ("Blur1::Add" is a name),
+# and ends before one ("2::3rd" is not an address). The loopback "::1" and a bare prefix
+# ("fe80::") name no machine and are left out.
+_H6 = r"[0-9A-Fa-f]{1,4}"
+_IPV6 = (r"(?<![0-9A-Za-z:])(?=[0-9A-Fa-f:]*[0-9])(?:(?:" + _H6 + r":){7}" + _H6
+         + r"|(?:" + _H6 + r":){1,6}(?::" + _H6 + r"){1,6})(?![0-9A-Za-z:])")
 
 TEMPLATE_LEAK_PATTERNS = (
     (r"/Users/[A-Za-z0-9._-]+", "a macOS home path"),
@@ -1853,6 +1861,7 @@ TEMPLATE_LEAK_PATTERNS = (
     # parse the XML and excuse by element if that ever matters
     (r"(?i)(?<!version>)(?<!version=\")(?<!version=')(?<![0-9.])(?:" + _OCTET + r"\.){3}" + _OCTET
      + r"(?![0-9]|\.[0-9])", "an IP address"),
+    (_IPV6, "an IPv6 address"),
     (r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]", "a credential"),
 )
 
@@ -2137,6 +2146,9 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         ("a Windows computer name", "DESKTOP-4F7KQ2M"),
         ("an IP address", "192.168.1.20"),
         ("an IP address", "<Host>10.0.0.5</Host>"),
+        ("an IPv6 address", "fe80::1c2a:3b4d:5e6f:7a8b"),
+        ("an IPv6 address", "<Host>2001:db8:85a3::8a2e:370:7334</Host>"),
+        ("an IPv6 address", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
         ("a credential", "api_key = abc123"),
     ]
     names = sorted(_this_machines_names())
@@ -2156,7 +2168,8 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
                   "<V>16.7.33.189.2</V>", "<N>300.1.2.3</N>", "<N>10.0.256.1</N>", "<Codec>H.264</Codec>",
                   "DaVinci Resolve 21.1.2", "http://www.blackmagicdesign.com/x", "<Ch>L:R</Ch>",
                   "Shot on MacBook Pro", "Mac Studio Display", "DESKTOP-SHOTS", "settings.locale",
-                  "Timeline.xml"]
+                  "Timeline.xml", "<TC>01:00:00:00</TC>", "<TC>00:59:58:12</TC>", "std::vector",
+                  "Cafe::Bead", "Blur1::Add", "<Note>take 2::3rd pass</Note>", "::1", "fe80::"]
 
     with tempfile.TemporaryDirectory() as td:
         planted = os.path.join(td, "PLANTS.drp")
