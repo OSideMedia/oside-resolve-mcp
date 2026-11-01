@@ -1426,11 +1426,12 @@ def test_gate_fails_when_a_shot_marker_names_the_wrong_picture():
 
 def test_a_marker_names_its_shot_whatever_the_take_outcome_says():
     """[audit 2026-09-12 R-9] The marker name carries any outcome but approved
-    ("shot 2 · PENDING TAKE"), and the naming row strips that suffix before it
-    compares. The stripper took capitals, `_` and `-` only, so an outcome with a
-    space or a digit ("needs work", "take 2") left the suffix on and a CORRECT
-    build failed "shot markers name their own shot". The outcome is the
-    studio's word, not a vocabulary this repo owns, so any text is one. Shot
+    ("shot 2 · PENDING TAKE"), and the naming row accepts the shot's name with
+    or without that suffix. It recognised capitals, `_` and `-` only, so an
+    outcome with a space or a digit ("needs work", "take 2") went unrecognised
+    and a CORRECT build failed "shot markers name their own shot". The outcome
+    is the studio's word, not a vocabulary this repo owns, so any text without
+    a "·" is one. Shot
     numbers are free text too, so the shot's own name comes from the manifest:
     "2 · alt" is a shot number, not the start of a suffix [Codex 2026-10-31].
 

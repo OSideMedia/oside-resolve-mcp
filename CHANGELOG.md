@@ -26,9 +26,10 @@ Each fix carries a test that fails on the code before it:
   recognised the outcome suffix only when it was capitals, `_` or `-`, so
   `shot 2 · NEEDS WORK TAKE` failed the naming row on a correct build. A marker now names
   its shot when it is the shot's name from the manifest, or that name and one
-  ` · <outcome> TAKE`, whatever the outcome says: it is the studio's word, not a list this
-  repo owns. The shot's name is never guessed from the marker, because shot numbers are
-  free text too: `shot 2 · alt · PENDING TAKE` names shot `2 · alt`, not shot `2`.
+  ` · <outcome> TAKE`. Any outcome text without a `·` in it counts: the outcome is the
+  studio's word, not a list this repo owns, and the studio writes none with a `·`. The
+  shot's name is never guessed from the marker, because shot numbers are free text too:
+  `shot 2 · alt · PENDING TAKE` names shot `2 · alt`, not shot `2`.
 - **The UNKNOWN-is-not-a-pass test runs the runner (R-3).** It searched its own file for
   the right words. The runner is now `run(tests)`, returning its tally, and the test hands
   it a pass, an UNKNOWN and a failure and checks each is counted on its own. The printed
