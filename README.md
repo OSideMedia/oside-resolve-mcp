@@ -35,9 +35,9 @@ on that timeline moved.
   A build that went wrong is reported as `FAIL`, not as success.
 - **Lays a spotted SFX pass** onto one existing audio track of the timeline you
   are editing (`place_sfx`, the second recipe). Every collision is judged before
-  the first write, every clip is re-read after it lands, and an export before and
-  after proves no other track moved. A ledger beside the plan stops a pass you
-  deleted from coming back on a re-run.
+  the first clip is laid, every clip is re-read after it lands, and an export
+  before and after proves no other track moved. A ledger beside the plan stops a
+  pass you deleted from coming back on a re-run.
 
 It **never deletes, never overwrites, and never renders.** An existing project
 or timeline name is a hard refusal.
@@ -450,7 +450,9 @@ Claude: resolve_status()                          ← preconditions + capabiliti
   saves, and never deletes a clip it laid wrong: a clip Resolve put somewhere
   else (its tail included) is left there and reported. The one file it keeps
   outside Resolve is the plan's ledger, `<plan>.placed.json`, beside the plan;
-  the before and after exports are temporary files, removed once compared.
+  the before and after exports go to a temporary folder (`oside-sfx-*`) that is
+  removed as soon as they are read, on a best-effort basis: a removal that fails
+  is not reported.
 - stdio transport only; nothing listens on the network.
 
 ## Known errors
