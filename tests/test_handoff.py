@@ -1827,15 +1827,154 @@ def test_colliding_pins_checkerboard_onto_a_second_lane():
 # MEMBERS are scanned — the guard is only as good as what it is allowed to see.
 # ---------------------------------------------------------------------------
 
+import re  # noqa: E402  (the rules below compile at import)
+
+# An IPv4 octet, 0-255, no leading zero: "0004" in a build number is not one.
+_OCTET =r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+# A dotted quad that is not part of a longer dotted number.
+_QUAD = re.compile(r"(?<![0-9.])(?:" + _OCTET + r"\.){3}" + _OCTET + r"(?![0-9]|\.[0-9])")
+# The field a value sits in: an element, attributes allowed (<PluginVersion id="3">
+# 16.7.33.189), or a name="value" pair (<Plugin Version = "16.7.33.189"/>), with
+# whitespace where XML allows it. These are 993a5ca's two readings with two changes,
+# each a review's finding: a ">" ends the tag only outside quotes [Codex 2026-10-31:
+# <PluginVersion host="x>192.168.1.20"/> scanned clean], and no fixed window, which cut
+# a long tag's name off or cut `conversion="` down to `version="` [Codex 2026-10-31].
+# Every stricter reading tried since flagged a version 993a5ca excused: in text, in
+# CDATA, in XML-looking CDATA [Codex 2026-10-31, x3].
+_ELEMENT_BEFORE = re.compile(r"<([A-Za-z_][\w.:-]*)(?:\s(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?>\s*$")
+_ATTRIBUTE_BEFORE = re.compile(r"(?:^|[\s>\[])([A-Za-z_][\w.:-]*)\s*=\s*[\"']\s*$")
+
+
+def _is_version_field(name):
+    """A field NAMED for a version: `version`, `Version`, `PluginVersion`,
+    `plugin_version`. `conversion` and `Conversion` end in the same letters and
+    are not one; a suffix match excused an address in either [Codex 2026-10-31]."""
+    return name.lower() == "version" or bool(re.search(r"[a-z0-9]Version$|[_.:-][Vv]ersion$", name))
+
+
+def _ipv4(text):
+    """The first dotted quad in `text` that is not a version field's value, or
+    None. The real templates carry Waves plugin versions that ARE valid quads
+    (<PluginVersion>16.7.33.189</PluginVersion>, measured 2026-10-31 in
+    000_TIMELINES' zlib layer), so each quad is judged by the field it sits in.
+    A regex cannot say that: Python's lookbehind is fixed-width, and the
+    whitespace XML allows around `>` and `=` is not. The field is read from the
+    last "<" before the quad, however far back: a fixed window cut a long tag's
+    name off and called a version an address [Codex 2026-10-31].
+
+    It reads XML STRUCTURE, so `_scan_drp` gives it escaped text only
+    (`reads_markup`): unescaping turns an attribute's &quot; into a quote that
+    ends nothing, and a version beside it read as an address [Codex 2026-10-31]."""
+    # ponytail: version fields are excused by name; a real address inside one would
+    # pass, and so would one right after a `version="` inside another attribute's
+    # quotes (993a5ca let both through). Parse the XML and excuse by element if that
+    # ever matters
+    for m in _QUAD.finditer(text):
+        lt = text.rfind("<", 0, m.start())
+        field = ((lt >= 0 and _ELEMENT_BEFORE.match(text, lt, m.start()))
+                 or _ATTRIBUTE_BEFORE.search(text[max(lt, 0):m.start()]))
+        if not (field and _is_version_field(field.group(1))):
+            return m.group(0)
+    return None
+
+
+# ponytail: escaped text only, so an address written with entity-escaped dots
+# (192&#46;168&#46;1&#46;20) passes; no XML writer escapes those
+_ipv4.reads_markup = True
+
+
+# An IPv6 address: all eight groups, or one "::" with groups on one side or both, two
+# groups at least, so the loopback "::1" and a bare prefix ("fe80::") are left out: they
+# name no machine. A timecode (four groups, no "::") is not one. It starts after anything
+# but a letter, digit or colon ("Blur1::Add" is a name) and ends before one ("2::3rd" is
+# not an address). Two hex WORDS joined by "::" ("Cafe::Bead", a scope in a script) are
+# not one either, so it holds a decimal digit or three groups: `fdab:cafe::beef` is
+# caught, and so is `2001:db8::` [Codex 2026-10-31: both passed when a digit was
+# required and "::" needed a group on each side].
+# ponytail: a two-group address with no decimal digit (abcd::ef) passes; judge the
+# candidate by the field it sits in if a real one ever turns up
+_H6 = r"[0-9A-Fa-f]{1,4}"
+_IPV6 = (r"(?<![0-9A-Za-z:])"
+         r"(?=[0-9A-Fa-f:]*[0-9]|(?:" + _H6 + r":+){2}" + _H6 + r")"
+         r"(?:(?:" + _H6 + r":){7}" + _H6                      # all eight groups
+         + r"|(?:" + _H6 + r":){1,6}(?::" + _H6 + r"){1,6}"     # groups both sides of "::"
+         + r"|(?:" + _H6 + r":){2,7}:"                          # "::" last: 2001:db8::
+         + r"|::(?:" + _H6 + r":){1,6}" + _H6 + r")"           # "::" first: ::ffff:c0a8:114
+         + r"(?![0-9A-Za-z:])")
+
 TEMPLATE_LEAK_PATTERNS = (
     (r"/Users/[A-Za-z0-9._-]+", "a macOS home path"),
     (r"/home/[A-Za-z0-9._-]+", "a Linux home path"),
     (r"/Volumes/[A-Za-z0-9 ._-]+", "a mounted volume"),
-    (r"\b[A-Za-z]:\\\\[A-Za-z0-9 ._-]+", "a Windows path"),
+    # one backslash or two (escaped), or a forward slash: C:\Users\x, C:\\Users\\x, C:/Users/x.
+    # Before 0.8.2 this demanded two LITERAL backslashes, so a real C:\Users\x passed (ow-557456).
+    (r"\b[A-Za-z]:(?:\\{1,2}|/)[A-Za-z0-9 ._-]+", "a Windows path"),
+    (r"\\\\[A-Za-z0-9._-]+\\[A-Za-z0-9 $._-]+", "a Windows network share"),
     (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "an email address"),
-    (r"\b[A-Za-z0-9-]+\.local\b", "a bonjour hostname"),
-    (r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]", "a credential"),
+    (r"(?i)\b[A-Za-z0-9-]+\.(?:local|lan|home|localdomain|internal|home\.arpa)\b", "a local network hostname"),
+    # the names macOS and Windows give a computer out of the box ("Peter's MacBook Pro",
+    # Peters-MacBook-Pro, DESKTOP-4F7KQ2M) — a custom name is caught by _this_machines_names()
+    (r"(?i)\b[A-Za-z0-9]+(?:['\u2019]s[ _-]?|-)(?:MacBook|iMac|Mac[ _-]?mini|Mac[ _-]?Studio|Mac[ _-]?Pro)\b",
+     "a Mac's computer name"),
+    # as Windows writes it (DESKTOP-4F7KQ2M), or lowercased the way a resolver writes
+    # it (desktop-4f7kq2m), then with a digit in it, so "Desktop-Display" is not one
+    (r"\b(?:(?:DESKTOP|LAPTOP)-[A-Z0-9]{7}|(?i:desktop|laptop)-(?=[A-Za-z]*[0-9])[A-Za-z0-9]{7})\b",
+     "a Windows computer name"),
+    (_ipv4, "an IP address"),
+    (_IPV6, "an IPv6 address"),
+    # as an assignment (api_key = …, password: …) or as an XML element NAMED for one,
+    # holding a value (<Password>…</Password>, attributes allowed). An empty or
+    # self-closing element holds nothing, and a keyword that is only an attribute's
+    # value (<Text name="Secret">) is a title [Codex 2026-10-31: both fired]
+    # ponytail: the keyword stands alone, so a compound name (<ProxyPassword>) passes;
+    # widen it if a template ever carries one
+    (r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]"
+     r"|<(?:password|passwd|secret|api[_-]?key|access[_-]?token)(?:\s[^<>]*)?(?<!/)>\s*[^<\s]",
+     "a credential"),
 )
+
+
+def _rule_search(rule, text):
+    """The first match of one leak rule in `text`, or None. A rule is a regex,
+    or a function for what a regex cannot say (`_ipv4` judges the field a quad
+    sits in)."""
+    if callable(rule):
+        return rule(text)
+    m = re.search(rule, text)
+    return m.group(0) if m else None
+
+
+def _this_machines_names():
+    """This computer's own name, short form (`studio-mac` of `studio-mac.local`):
+    a snapshot taken here carries THAT name, whatever it is. Four characters or
+    more, and never `localhost`, so a short name cannot fire on every word."""
+    import platform
+    import socket
+    out = set()
+    for full in (socket.gethostname(), platform.node()):
+        short = (full or "").split(".")[0]
+        if len(short) >= 4 and short.lower() != "localhost":
+            out.add(short)
+    return out
+
+
+def _leak_patterns(names=None):
+    """TEMPLATE_LEAK_PATTERNS plus this machine's own name (or `names`). A name
+    with a digit, hyphen or underscore in it is distinctive and is matched as a
+    whole word anywhere. A plain word ("Resolve", "Timeline") is also ordinary
+    project text, so it is matched only as a whole VALUE: between tags, quotes
+    or `=`, or the control bytes of a binary record, whitespace around it allowed
+    [Codex 2026-10-31: a machine named Resolve blocked both real templates; then
+    `<Computer> Resolve </Computer>` passed]."""
+    rules = []
+    for n in sorted(_this_machines_names() if names is None else names):
+        if re.fullmatch(r"[A-Za-z]+", n):
+            rule = (r"(?i)(?:^|(?<=[>\"'=\x00-\x1f]))\s*" + re.escape(n)
+                    + r"(?=\s*(?:$|[<\"'\x00-\x1f]))")
+        else:
+            rule = r"(?i)(?<![A-Za-z0-9-])" + re.escape(n) + r"(?![A-Za-z0-9-])"
+        rules.append((rule, "this computer's name"))
+    return TEMPLATE_LEAK_PATTERNS + tuple(rules)
 
 
 # ---------------------------------------------------------------------------
@@ -1849,12 +1988,46 @@ TEMPLATE_LEAK_PATTERNS = (
 # every hex run is decoded, every compressed layer inside it is opened at any
 # offset, and the text is read as UTF-8 AND UTF-16-LE (Resolve stores strings
 # both ways). A decoder that is missing is a RED, never a skip.
+#
+# Since 0.8.2 (ow-557456) the same holds for BASE64 runs and GZIP streams, and
+# every decoder runs on every layer, not only the one it was first found in: a
+# path in gzip in base64 in a hex blob is three layers in and still read. Each
+# layer is read in every view (UTF-8, UTF-16 at both alignments, each also
+# XML-unescaped: Peter&apos;s MacBook Pro), and the text decoders (hex, base64)
+# read every view too. The reach has edges, each named where it is set: the run
+# floors, the depth and layer limits, and the short-layer rule.
 # ---------------------------------------------------------------------------
 
-def _inner_texts(member_bytes):
-    """Every text this member carries, one decode layer at a time: the member
-    itself, then each hex-encoded blob, then each zstd / zlib layer found inside
-    those blobs, each read as UTF-8 and as UTF-16-LE. Yields (layer, text)."""
+# Past either limit a member reads UNREADABLE, never clean. A layer shorter than
+# _MIN_NESTED is the exception: it is still read past the depth limit (it cannot
+# hide a further layer) and is not counted against the layer limit.
+_MAX_DEPTH = 6        # layers inside a member
+_MAX_LAYERS = 5000    # decoded layers per member, _MIN_NESTED bytes or longer
+# The shortest leak a rule matches is four bytes: a Windows path ("C:/a"), an IPv6
+# address ("1::2"), a machine name. Hex of four bytes is eight characters, and so is
+# base64 counted WITH its padding ("QzovYQ=="), so a run of eight can hold one and a
+# longer floor lets a short leak through without a word [Codex 2026-10-31, twice:
+# "/home/a" passed a sixteen-character floor, then "C:/a" passed twelve hex digits and
+# eight base64 characters not counting "=="]. The plants test encodes every plant
+# alone in both, so a rule with a shorter leak, or a higher floor, goes red.
+# ponytail: UNPADDED base64 of four or five bytes (six or seven characters) passes; a
+# six-character floor would decode every six-letter word, so raise it only on a find
+_MIN_B64 = 8
+_MIN_HEX = 8
+# A decoded layer shorter than the shortest encoded leak (eight characters of base64)
+# cannot hold another one. It is read, but not opened further and not counted against
+# _MAX_LAYERS: the short words of a member decode to a few bytes of noise each.
+_MIN_NESTED = 8
+
+
+def _children(data, text_only=False):
+    """The layers that decode straight out of `data`: (name, bytes or None).
+    None means a layer that announced itself and would not open. `text_only`
+    runs the decoders that read text (hex, base64) and skips the ones that
+    look for a binary stream's header, for a UTF-16 view, whose bytes are not
+    the record's own."""
+    import base64
+    import binascii
     import zlib
     try:
         import zstandard
@@ -1863,40 +2036,131 @@ def _inner_texts(member_bytes):
             "the template leak gate cannot open Resolve's zstd layer: install the dev extra "
             "(pip install -e '.[dev]' / uv sync --extra dev) — a missing decoder is a red, not a pass"
         ) from e
-    yield ("member", member_bytes.decode("utf-8", "ignore"))
-    for i, hexrun in enumerate(re.findall(rb"[0-9a-fA-F]{64,}", member_bytes)):
+    out = []
+    for i, run in enumerate(re.findall(rb"[0-9a-fA-F]{%d,}" % _MIN_HEX, data)):
         try:
-            dec = bytes.fromhex(hexrun.decode("ascii"))
+            out.append(("hex#%d" % i, bytes.fromhex(run.decode("ascii"))))
         except ValueError:
             continue
-        layers = [("hex#%d" % i, dec)]
-        for mo in re.finditer(rb"\x28\xb5\x2f\xfd", dec):
-            try:
-                layers.append(("hex#%d/zstd@%d" % (i, mo.start()), zstandard.ZstdDecompressor().decompressobj().decompress(dec[mo.start():])))
-            except Exception as e:  # noqa: BLE001
-                layers.append(("hex#%d/zstd@%d" % (i, mo.start()), b"UNREADABLE zstd frame: " + str(e).encode()))
-        for mo in re.finditer(rb"\x78[\x01\x5e\x9c\xda]", dec):
-            try:
-                text = zlib.decompressobj().decompress(dec[mo.start():])
-            except Exception:  # noqa: BLE001 - not every 0x78 is a stream
+    # a run of the base64 alphabet long enough to hide a leak, padding counted; an
+    # all-hex run is the hex decoder's, and a run that will not decode is just a word
+    b64_run = rb"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{%d,}={0,2}|[A-Za-z0-9+/]{%d}==|[A-Za-z0-9+/]{%d}=)" % (
+        _MIN_B64, _MIN_B64 - 2, _MIN_B64 - 1)
+    for i, run in enumerate(re.findall(b64_run, data)):
+        body = run.rstrip(b"=")
+        if re.fullmatch(rb"[0-9a-fA-F]+", body):
+            continue
+        body = body[:len(body) - (len(body) % 4 == 1)]
+        try:
+            out.append(("b64#%d" % i, base64.b64decode(body + b"=" * (-len(body) % 4), validate=True)))
+        except (binascii.Error, ValueError):
+            continue
+    if text_only:
+        return out
+    for mo in re.finditer(rb"\x28\xb5\x2f\xfd", data):
+        try:
+            out.append(("zstd@%d" % mo.start(), zstandard.ZstdDecompressor().decompressobj().decompress(data[mo.start():])))
+        except Exception:  # noqa: BLE001
+            out.append(("zstd@%d" % mo.start(), None))
+    for mo in re.finditer(rb"\x78[\x01\x5e\x9c\xda]", data):
+        d = zlib.decompressobj()
+        try:
+            text = d.decompress(data[mo.start():])
+        except Exception:  # noqa: BLE001 - not every 0x78 is a stream
+            continue
+        # A stream that reaches its end, checksum read, is real however short. An
+        # unfinished one is kept only when long, as before: two chance bytes rarely
+        # decode that far. Length alone let "/Users/alice" through [Codex 2026-10-31].
+        if d.eof or len(text) > 40:
+            out.append(("zlib@%d" % mo.start(), text))
+    for mo in re.finditer(rb"\x1f\x8b\x08", data):
+        try:
+            out.append(("gzip@%d" % mo.start(), zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data[mo.start():])))
+        except Exception:  # noqa: BLE001 - three bytes can occur by chance in binary
+            continue
+    return out
+
+
+def _views(raw):
+    """Every way one layer's bytes read as text, as (suffix, text): UTF-8, and
+    UTF-16-LE at BOTH byte alignments (a string inside a binary record can start
+    on an odd offset, and a decode from 0 then reads every character as
+    garbage), each of them also XML-unescaped where that changes it: XML
+    escaping is a transform too, and `Peter&apos;s MacBook Pro` is that name
+    [Codex 2026-10-31]. The first is the raw bytes' own reading."""
+    import html
+    out = []
+    for suffix, text in (("", raw.decode("utf-8", "ignore")),
+                         ("/utf16", raw.decode("utf-16-le", "ignore")),
+                         ("/utf16+1", raw[1:].decode("utf-16-le", "ignore"))):
+        out.append((suffix, text))
+        if "&" in text:
+            plain = html.unescape(text)
+            if plain != text:
+                out.append((suffix + "/unescaped", plain))
+    return out
+
+
+def _inner_texts(member_bytes):
+    """Every text this member carries, one decode layer at a time: the member
+    itself, then every hex, base64, zstd, zlib and gzip layer inside it, and
+    inside those, each in every view `_views` reads; the hex and base64
+    decoders read every view as well, so a layer in a view is opened like any
+    other. Yields (layer, text); a layer that will not open, or a member nested
+    past the scanner's reach, yields text starting UNREADABLE. A run shorter
+    than the floors (_MIN_B64, _MIN_HEX) is not decoded, and a decoded layer
+    shorter than _MIN_NESTED is read but neither opened further nor counted
+    against the reach limits."""
+    import hashlib
+    seen = {hashlib.sha1(member_bytes).digest()}
+    stack = [("member", member_bytes, 0)]
+    layers = 0
+    while stack:
+        name, raw, depth = stack.pop()
+        views = _views(raw)
+        for suffix, text in views:
+            yield (name + suffix, text)
+        if len(raw) < _MIN_NESTED:
+            continue  # read above; too short to hold another encoded leak
+        kids = _children(raw)
+        # The text decoders read every other view too. A base64 or hex run stored as
+        # UTF-16 has a NUL between its characters, so it is no run in the raw bytes
+        # [Codex 2026-10-31: a path in base64 in UTF-16 scanned clean], and an
+        # entity breaks one in escaped XML [Codex 2026-10-31, again:
+        # <B>&#76;2hvbWUvYWxpY2U=</B> scanned clean].
+        for suffix, text in views[1:]:
+            kids += [(suffix.lstrip("/") + "/" + k, d)
+                     for k, d in _children(text.encode("utf-8", "ignore"), text_only=True)]
+        if depth >= _MAX_DEPTH:
+            # a layer too short to nest is still read; anything longer is past reach
+            if any(d is None or len(d) >= _MIN_NESTED for _k, d in kids):
+                yield (name, "UNREADABLE: nested deeper than %d layers" % _MAX_DEPTH)
+            kids = [(k, d) for k, d in kids if d is not None and len(d) < _MIN_NESTED]
+        for kid, data in reversed(kids):
+            sub = kid if name == "member" else name + "/" + kid
+            if data is None:
+                yield (sub, "UNREADABLE: the %s layer would not open" % kid.split("/")[-1].split("@")[0])
                 continue
-            if len(text) > 40:
-                layers.append(("hex#%d/zlib@%d" % (i, mo.start()), text))
-        for layer, raw in layers:
-            yield (layer, raw.decode("utf-8", "ignore"))
-            # UTF-16 at BOTH byte alignments: a string inside a binary record can start on
-            # an odd offset, and a decode from 0 then reads every character as garbage
-            yield (layer + "/utf16", raw.decode("utf-16-le", "ignore"))
-            yield (layer + "/utf16+1", raw[1:].decode("utf-16-le", "ignore"))
+            digest = hashlib.sha1(data).digest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            if len(data) >= _MIN_NESTED:
+                layers += 1
+                if layers > _MAX_LAYERS:
+                    yield (sub, "UNREADABLE: more than %d decoded layers" % _MAX_LAYERS)
+                    return
+            stack.append((sub, data, depth + 1))
 
 
-def _scan_drp(path):
+def _scan_drp(path, patterns=None):
     """Every leak in one .drp, as (member, kind, sample). Extracts first: the
     archive is the transform, and a scan of the compressed bytes sees nothing —
-    then decodes the hex blobs and the zstd/zlib layers inside them, which is
-    where the 2026-09-08 audit's "clean" templates held the operator's home
-    directory (R-1)."""
+    then decodes every layer inside each member (hex, base64, zstd, zlib, gzip),
+    which is where the 2026-09-08 audit's "clean" templates held the operator's
+    home directory (R-1). `patterns` defaults to _leak_patterns()."""
     import zipfile
+    patterns = _leak_patterns() if patterns is None else patterns
     hits = []
     if not zipfile.is_zipfile(path):
         # NOT a skip. An unreadable template is UNKNOWN, and unknown is never a
@@ -1917,11 +2181,17 @@ def _scan_drp(path):
                 if text.startswith("UNREADABLE"):
                     hits.append((member + " :: " + layer, "unreadable", text[:80]))
                     continue
-                for pattern, kind in TEMPLATE_LEAK_PATTERNS:
-                    m = re.search(pattern, text)
-                    if m and (layer, kind) not in seen:
-                        seen.add((layer, kind))
-                        hits.append((member + " :: " + layer, kind, m.group(0)[:80]))
+                # one report per layer and kind: a hit in a text and in its
+                # unescaped view is one leak
+                unescaped = layer.endswith("/unescaped")
+                key = layer[:-len("/unescaped")] if unescaped else layer
+                for rule, kind in patterns:
+                    if unescaped and getattr(rule, "reads_markup", False):
+                        continue  # it judges XML structure, which unescaping breaks (_ipv4)
+                    found = _rule_search(rule, text)
+                    if found is not None and (key, kind) not in seen:
+                        seen.add((key, kind))
+                        hits.append((member + " :: " + layer, kind, found[:80]))
     return hits
 
 
@@ -1976,7 +2246,7 @@ def test_no_template_publishes_a_path_an_email_or_a_hostname():
         # exactly how two templates carrying the operator's home directory were called clean
         with zipfile.ZipFile(planted) as z:
             flat = "".join(z.read(n).decode("utf-8", "ignore") for n in z.namelist())
-        assert not any(re.search(p, flat) for p, _k in TEMPLATE_LEAK_PATTERNS), "the fixture leaks in plain XML — the deep control is void"
+        assert not any(_rule_search(p, flat) is not None for p, _k in TEMPLATE_LEAK_PATTERNS), "the fixture leaks in plain XML — the deep control is void"
 
     # THE SUBJECT SET, NAMED AND NON-EMPTY. An empty templates/ dir would make
     # every assertion below vacuously true, so the set is asserted first and
@@ -1998,6 +2268,333 @@ def test_no_template_publishes_a_path_an_email_or_a_hostname():
                      for f, hits in dirty.items() for m, kind, sample in hits)
     )
 
+
+
+def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
+    """[ow-557456] Every rule the template gate carries is shown a planted leak
+    it must catch, and the lookalikes the real templates hold must pass: they
+    carry Waves plugin versions that are valid dotted quads, so an address rule
+    that fired on them would block every export. Every decoder is shown a path
+    only it can reach. A rule added without a plant fails here.
+
+    Carries its own counterexample: the pre-0.8.2 Windows rule (two LITERAL
+    backslashes) is run on the same path and must miss it."""
+    import base64
+    import gzip
+    import socket
+    import zipfile
+    import zlib
+    import zstandard
+
+    old_windows = r"\b[A-Za-z]:\\\\[A-Za-z0-9 ._-]+"
+    real_windows = "C:\\Users\\someone\\Desktop\\cut.mov"
+    assert not re.search(old_windows, real_windows), "the counterexample is void: the old rule saw it"
+
+    plants = [
+        ("a macOS home path", "/Users/someone/Movies/cut.mov"),
+        ("a Linux home path", "/home/someone/renders/cut.mov"),
+        ("a mounted volume", "/Volumes/T7 PROJECTS/clip.mov"),
+        ("a Windows path", real_windows),
+        ("a Windows path", "C:\\\\Users\\\\someone\\\\cut.mov"),     # escaped, as JSON writes it
+        ("a Windows path", "D:/Projects/client/cut.mov"),
+        ("a Windows path", "C:/a"),                                    # the shortest a rule matches
+        ("a Windows network share", "\\\\NAS01\\footage\\clip.mov"),
+        ("a Windows network share", "\\\\a\\b"),
+        ("an email address", "client@agency.com"),
+        ("an email address", "a@b.co"),
+        ("a local network hostname", "a.lan"),
+        ("a local network hostname", "studio.local"),
+        ("a local network hostname", "render-box.lan"),
+        ("a local network hostname", "nas.home.arpa"),
+        ("a local network hostname", "edit01.internal"),
+        ("a Mac's computer name", "Peter's MacBook Pro"),
+        ("a Mac's computer name", "Ana\u2019s Mac mini"),
+        ("a Mac's computer name", "Peters-MacBook-Pro"),
+        ("a Mac's computer name", "Studio-iMac"),
+        ("a Mac's computer name", '<Computer name="Peter&apos;s MacBook Pro"/>'),   # XML-escaped
+        ("a Windows computer name", "DESKTOP-4F7KQ2M"),
+        ("a Windows computer name", "<Computer>desktop-4f7kq2m</Computer>"),        # lowercased
+        ("an IP address", "192.168.1.20"),
+        ("an IP address", "<Host>10.0.0.5</Host>"),
+        ("an IP address", '<Host conversion="192.168.1.20"/>'),     # ends in "version", is not one
+        ("an IP address", "<Conversion>192.168.1.20</Conversion>"),
+        ("an IP address", '<PluginVersion host="x>192.168.1.20"/>'),  # a ">" inside quotes ends no tag
+        ("an IP address", 'conversion="' + " " * 191 + '192.168.1.20"'),  # a window cut it to version="
+        ("an IP address", "1.2.3.4"),
+        ("an IPv6 address", "1::2"),
+        ("an IPv6 address", "fe80::1c2a:3b4d:5e6f:7a8b"),
+        ("an IPv6 address", "<Host>2001:db8:85a3::8a2e:370:7334</Host>"),
+        ("an IPv6 address", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
+        ("an IPv6 address", "<Host>fdab:cafe::beef</Host>"),       # no decimal digit
+        ("an IPv6 address", "<Host>2001:db8::</Host>"),            # "::" last
+        ("an IPv6 address", "<Host>::ffff:c0a8:114</Host>"),       # "::" first
+        ("a credential", "api_key = abc123"),
+        ("a credential", "<Password>supersecret123</Password>"),
+        ("a credential", '<Password encrypted="1">x9f</Password>'),
+    ]
+    names = sorted(_this_machines_names())
+    if names:
+        plants += [("this computer's name", "<Computer>%s</Computer>" % n) for n in names]
+    else:
+        # a skip needs positive evidence: the name really is too short to match safely
+        short = socket.gethostname().split(".")[0]
+        assert len(short) < 4 or short.lower() == "localhost", "this machine's name was not picked up"
+    missing = {k for _p, k in TEMPLATE_LEAK_PATTERNS} - {k for k, _s in plants}
+    assert not missing, "a leak rule with no planted example: %r" % sorted(missing)
+    # and every RULE catches a plant of its own: a second rule filed under an existing
+    # label would otherwise ride the first one's plant [Codex 2026-10-31]
+    for rule, kind in TEMPLATE_LEAK_PATTERNS:
+        assert any(_rule_search(rule, s) is not None for k, s in plants if k == kind), \
+            "a leak rule with no planted example of its own: %r (%s)" % (rule, kind)
+
+    # the lookalikes: what the real templates carry (plugin versions, build
+    # numbers) and what reads like a rule's subject but is not
+    lookalikes = ["<PluginVersion>16.7.33.189</PluginVersion>", '<Plugin version="16.0.78.79"/>',
+                  "<Plugin Version='16.3.70.120'/>", "<PluginVersion> 16.7.33.189</PluginVersion>",
+                  '<Plugin Version = "16.7.33.189"/>', '<PluginVersion id="3">16.7.33.189</PluginVersion>',
+                  "<plugin_version>16.7.33.189</plugin_version>",
+                  "<Build>21.0.2.0004</Build>", "<V>1.16.7.33.189</V>",
+                  "<V>16.7.33.189.2</V>", "<N>300.1.2.3</N>", "<N>10.0.256.1</N>", "<Codec>H.264</Codec>",
+                  "DaVinci Resolve 21.1.2", "http://www.blackmagicdesign.com/x", "<Ch>L:R</Ch>",
+                  "Shot on MacBook Pro", "Mac Studio Display", "DESKTOP-SHOTS", "Desktop-Display",
+                  "desktop-version", "settings.locale",
+                  "Timeline.xml", "<TC>01:00:00:00</TC>", "<TC>00:59:58:12</TC>", "std::vector",
+                  "Cafe::Bead", "Blur1::Add", "<Note>take 2::3rd pass</Note>", "::1", "fe80::",
+                  "<Password/>", "<Password></Password>", "<PasswordHint>x</PasswordHint>",
+                  '<Text name="Secret">Ordinary title</Text>', "<Settings><Password/>default</Settings>",
+                  "<Settings><Password />default</Settings>",
+                  '<PluginVersion note="a>b">16.7.33.189</PluginVersion>',
+                  # an escaped quote in another attribute, and a long tag before the
+                  # version, each called a version an address [Codex 2026-10-31]
+                  '<Plugin note="a&quot;b" version="16.7.33.189"/>',
+                  '<PluginVersion note="a&quot;b">16.7.33.189</PluginVersion>',
+                  '<Plugin note="' + "a" * 210 + '" version="16.7.33.189"/>',
+                  '<PluginVersion note="' + "a" * 210 + '">16.7.33.189</PluginVersion>',
+                  # a version written into text, after a tag and in CDATA [Codex 2026-10-31]
+                  'Plugin version="16.7.33.189"', '<![CDATA[Plugin version="16.7.33.189"]]>',
+                  'version="16.7.33.189"', '<![CDATA[version="16.7.33.189"]]>',
+                  # XML-looking text in CDATA and in a comment is not an open tag
+                  "<![CDATA[<Plugin note='Plugin version=\"16.7.33.189\"'/>]]>",
+                  "<!-- <Plugin note='Plugin version=\"16.7.33.189\"'/> -->",
+                  "<![CDATA[<PluginVersion draft>16.7.33.189]]>",
+                  "Look &amp; Feel", "R&amp;D"]
+    for bare in ('Plugin version="16.7.33.189"', 'version="16.7.33.189"'):
+        assert _ipv4(bare) is None, "a version in text with no markup at all: %r" % bare
+
+    with tempfile.TemporaryDirectory() as td:
+        planted = os.path.join(td, "PLANTS.drp")
+        with zipfile.ZipFile(planted, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, (_k, sample) in enumerate(plants):
+                z.writestr("p%02d.xml" % i, "<SM_Project><Note>%s</Note></SM_Project>" % sample)
+        by_member = {}
+        for m, kind, _s in _scan_drp(planted):
+            by_member.setdefault(m.split(" :: ")[0], set()).add(kind)
+        for i, (kind, sample) in enumerate(plants):
+            assert kind in by_member.get("p%02d.xml" % i, set()), \
+                "%s not caught in %r (caught: %r)" % (kind, sample, by_member.get("p%02d.xml" % i))
+
+        # every plant, hex- and base64-encoded ALONE, is caught in the decoded layer:
+        # the run floors answer to the shortest plant, and the plants hold leaks as
+        # short as any rule matches, four bytes (C:/a, 1::2) [Codex 2026-10-31]
+        encoded = os.path.join(td, "ENCODED.drp")
+        with zipfile.ZipFile(encoded, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, (_k, sample) in enumerate(plants):
+                z.writestr("hex%02d.xml" % i, "<B>%s</B>" % sample.encode().hex())
+                z.writestr("b64%02d.xml" % i, "<B>%s</B>" % base64.b64encode(sample.encode()).decode())
+        decoded = {}
+        for m, kind, _s in _scan_drp(encoded):
+            member, layer = m.split(" :: ")
+            if member[:3] + "#" in layer:   # the hit is in the layer that decoder opened
+                decoded.setdefault(member, set()).add(kind)
+        for i, (kind, sample) in enumerate(plants):
+            for enc in ("hex", "b64"):
+                assert kind in decoded.get("%s%02d.xml" % (enc, i), set()), \
+                    "%s not caught in %r encoded as %s alone (caught: %r)" % (
+                        kind, sample, enc, decoded.get("%s%02d.xml" % (enc, i)))
+
+        # the lookalikes pass, in plain XML AND where the real ones sit: UTF-16
+        # in a zstd frame in a hex blob, and in a zlib stream
+        clean = os.path.join(td, "LOOKALIKES.drp")
+        text = "".join("<X>%s</X>" % s for s in lookalikes)
+        frame = (b"\x00" * 44) + zstandard.ZstdCompressor().compress(text.encode("utf-16-le"))
+        with zipfile.ZipFile(clean, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("plain.xml", "<SM_Project>%s</SM_Project>" % text)
+            z.writestr("deep.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % frame.hex())
+            z.writestr("MpFolder.xml", "<SM_Folder><FieldsBlob>%s</FieldsBlob></SM_Folder>"
+                       % (b"\x00" * 4 + zlib.compress(text.encode("utf-8"))).hex())
+        assert _scan_drp(clean) == [], "a lookalike fired: %r" % (_scan_drp(clean),)
+
+        # every new decoder, each holding a path no older layer can show
+        home = "/Users/someone/Movies/cut.mov"
+        b64 = base64.b64encode(home.encode()).decode()
+        gz_in_hex = (b"\x00" * 4 + gzip.compress(home.encode("utf-16-le"))).hex()
+        nested = (b"\x00" * 8 + zstandard.ZstdCompressor().compress(
+            b"<b>" + base64.b64encode(gzip.compress(home.encode("utf-16-le"))) + b"</b>")).hex()
+        # [Codex 2026-10-31] a leak too short for the old floors, and base64 that
+        # Resolve-style UTF-16 hides from a decoder reading the raw bytes
+        short_home = "/home/a"
+        utf16_b64 = ("<B>%s</B>" % b64).encode("utf-16-le")
+        short_zlib = (bytes(44) + zlib.compress(b"/Users/alice")).hex()
+        utf16_b64_deep = ((b"\x00" * 44) + zstandard.ZstdCompressor().compress(utf16_b64)).hex()
+        # an entity inside a run: the run exists only in the unescaped view
+        escaped_b64 = "&#%d;%s" % (ord(b64[0]), b64[1:])
+        deep = os.path.join(td, "DECODERS.drp")
+        with zipfile.ZipFile(deep, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("b64.xml", "<SM_Project><Blob>%s</Blob></SM_Project>" % b64)
+            z.writestr("gzip.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % gz_in_hex)
+            z.writestr("nested.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % nested)
+            z.writestr("whole.gz", gzip.compress(("<SM_Project>%s</SM_Project>" % home).encode()))
+            z.writestr("short_b64.xml", "<B>%s</B>" % base64.b64encode(short_home.encode()).decode())
+            z.writestr("short_hex.xml", "<FieldsBlob>%s</FieldsBlob>" % short_home.encode().hex())
+            z.writestr("short_zlib.xml", "<FieldsBlob>%s</FieldsBlob>" % short_zlib)
+            z.writestr("utf16_b64.xml", utf16_b64)
+            z.writestr("utf16_b64_deep.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % utf16_b64_deep)
+            z.writestr("escaped_b64.xml", "<B>%s</B>" % escaped_b64)
+        homes = {}
+        for m, kind, _s in _scan_drp(deep):
+            if kind in ("a macOS home path", "a Linux home path"):
+                member, layer = m.split(" :: ")
+                homes.setdefault(member, set()).add(layer)
+        for member, via in (("b64.xml", "b64#"), ("gzip.xml", "/gzip@"), ("nested.xml", "/b64#0/gzip@"),
+                            ("whole.gz", "gzip@0"), ("short_b64.xml", "b64#0"), ("short_hex.xml", "hex#0"),
+                            ("short_zlib.xml", "/zlib@44"), ("utf16_b64.xml", "utf16/b64#0"),
+                            ("utf16_b64_deep.xml", "/zstd@44/utf16/b64#0"),
+                            ("escaped_b64.xml", "unescaped/b64#0")):
+            assert homes.get(member), "the scanner cannot see a path in %s: %r" % (member, homes)
+            # only the new decoder shows it: no layer without it in its name does
+            assert all(via in layer for layer in homes[member]), (member, homes[member])
+
+        # a machine named like ordinary project text is matched as a whole value and
+        # never as a word inside the real templates; a distinctive name is matched
+        # anywhere [Codex 2026-10-31: a machine named Resolve blocked both]
+        word_names = _leak_patterns(names={"Resolve", "Timeline"})[len(TEMPLATE_LEAK_PATTERNS):]
+        odd_name = _leak_patterns(names={"edit-bay-07"})[len(TEMPLATE_LEAK_PATTERNS):]
+        named = os.path.join(td, "NAMES.drp")
+        with zipfile.ZipFile(named, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("value.xml", "<Computer>Resolve</Computer>")
+            z.writestr("attr.xml", '<Host name="Timeline"/>')
+            z.writestr("padded.xml", "<Computer>\n  Resolve\n</Computer>")   # pretty-printed
+            z.writestr("padded_attr.xml", '<Host name="Resolve "/>')
+            z.writestr("prose.xml", "<Note>rendered on edit-bay-07 tonight</Note>")
+            z.writestr("words.xml", "<App>DaVinci Resolve 21.1.2</App><Name>Timeline 1</Name>")
+        hit_in = lambda pats: {m.split(" :: ")[0] for m, _k, _s in _scan_drp(named, patterns=pats)}  # noqa: E731
+        assert hit_in(word_names) == {"value.xml", "attr.xml", "padded.xml", "padded_attr.xml"}, hit_in(word_names)
+        assert hit_in(odd_name) == {"prose.xml"}, hit_in(odd_name)
+        for p in sorted(glob.glob(os.path.join(os.path.dirname(HERE), "templates", "*.drp"))):
+            assert _scan_drp(p, patterns=word_names) == [], (p, _scan_drp(p, patterns=word_names))
+
+        # nested past the scanner's reach, or more layers than its budget: a red, never a pass
+        wrapped = home.encode()
+        for _ in range(_MAX_DEPTH + 1):
+            wrapped = base64.b64encode(wrapped)
+        reach = os.path.join(td, "REACH.drp")
+        with zipfile.ZipFile(reach, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("deep.xml", b"<B>" + wrapped + b"</B>")
+            z.writestr("wide.xml", b" ".join(base64.b64encode(b"%012d" % i) for i in range(_MAX_LAYERS + 1)))
+            # at the edge of reach, a word too short to hold another layer is read, not
+            # called unreadable, and the leak beside it is caught
+            edge = b"<N>/home/a</N><T>Timeline</T>"
+            for _ in range(_MAX_DEPTH):
+                edge = base64.b64encode(edge)
+            z.writestr("edge.xml", b"<B>" + edge + b"</B>")
+            # a leak too short to hide another layer, one layer PAST the depth limit, is
+            # still read: only a layer that could nest further is beyond reach [Codex
+            # 2026-10-31: edge.xml's path also shows in its parent, so it could not tell]
+            short_leaf = b"/home/a"
+            for _ in range(_MAX_DEPTH + 1):
+                short_leaf = base64.b64encode(short_leaf)
+            z.writestr("short_leaf.xml", b"<B>" + short_leaf + b"</B>")
+            # thousands of short words decode to a few bytes of noise each; they are
+            # read, and do not spend the layer budget meant for real nesting
+            z.writestr("words.xml", b" ".join(b"Wd%06d" % i for i in range(_MAX_LAYERS + 1000)))
+        hits = _scan_drp(reach)
+        kinds = {m.split(" :: ")[0]: (kind, s) for m, kind, s in hits if kind == "unreadable"}
+        assert "nested deeper" in kinds.get("deep.xml", ("", ""))[1], kinds
+        assert "decoded layers" in kinds.get("wide.xml", ("", ""))[1], kinds
+        assert "edge.xml" not in kinds and "words.xml" not in kinds and "short_leaf.xml" not in kinds, kinds
+        assert any(m.startswith("edge.xml") and k == "a Linux home path" for m, k, _s in hits), hits
+        assert any(m.startswith("short_leaf.xml") and k == "a Linux home path" for m, k, _s in hits), hits
+
+
+def test_the_lockfile_matches_the_project():
+    """[ow-557456, R-14] uv.lock makes every `uv sync` install the versions it
+    was resolved at, including the mcp<2 pin, but only while it agrees with
+    pyproject: a lock left behind by a version bump or a changed requirement
+    is stale, and `uv sync --locked` refuses it. This compares the lock's own
+    entry for this project with pyproject: version, Python requirement, each
+    requirement (extras, specifier, marker), the dependency edges by name, the
+    extras. A stale lock is the subject; a hand-edited one is not (see below).
+    Red-proof: the lock as it sat untracked on main (root version 0.6.1) fails."""
+    try:
+        import tomllib
+    except ImportError:
+        raise Unknown("reading uv.lock needs tomllib (Python 3.11+); CI runs 3.12")
+    root = os.path.dirname(HERE)
+    with open(os.path.join(root, "pyproject.toml"), "rb") as fh:
+        project = tomllib.load(fh)["project"]
+    with open(os.path.join(root, "uv.lock"), "rb") as fh:
+        lock = tomllib.load(fh)
+    mine = [p for p in lock.get("package", []) if p.get("name") == project["name"]]
+    assert len(mine) == 1, "uv.lock has %d entries for %s" % (len(mine), project["name"])
+    entry = mine[0]
+    assert entry.get("version") == project["version"], \
+        "uv.lock is for %s %s, pyproject says %s — run `uv lock`" % (project["name"], entry.get("version"),
+                                                                   project["version"])
+
+    squash = lambda s: re.sub(r"\s+", "", s or "")  # noqa: E731
+    assert squash(lock.get("requires-python")) == squash(project.get("requires-python")), \
+        "uv.lock was resolved for Python %r, pyproject asks for %r — run `uv lock`" % (
+            lock.get("requires-python"), project.get("requires-python"))
+
+    def norm(name):  # PEP 503, the form uv writes a name in
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    def marker(text):
+        # whitespace and quote style only. uv writes a requirement's own marker first
+        # and its extra after it ("sys_platform == 'darwin' and extra == 'vision'",
+        # read 2026-10-31 in oside-blender-mcp's lock).
+        # ponytail: markers are compared as written; a marker uv rewrites (its handling
+        # of python_version is unmeasured here) reads as drift on a fresh lock. Compare
+        # with packaging.markers if this project ever carries one.
+        return re.sub(r"\s+", " ", text.replace('"', "'")).strip() if text else None
+
+    def spec(text):
+        return frozenset(squash(s) for s in (text or "").split(",") if s.strip())
+
+    def req(text, extra=None):
+        m = re.fullmatch(r"\s*([A-Za-z0-9._-]+)\s*(?:\[([^\]]*)\])?\s*([<>=!~][^;]*)?(?:;\s*(.*))?", text)
+        assert m, "a requirement this check cannot read: %r" % text
+        extras = frozenset(norm(e) for e in (m.group(2) or "").split(",") if e.strip())
+        own = (m.group(4) or "").strip()
+        tag = "extra == '%s'" % extra if extra else ""
+        return (norm(m.group(1).strip()), extras, spec(m.group(3)), marker(" and ".join(x for x in (own, tag) if x)))
+    base = [req(d) for d in project.get("dependencies", [])]
+    by_extra = {x: [req(d, x) for d in deps] for x, deps in project.get("optional-dependencies", {}).items()}
+    wanted = set(base).union(*by_extra.values())
+    meta = entry.get("metadata", {})
+    # a requirement's extras: `extras` in requires-dist (no lock on this machine
+    # carries one to read), `extra` on a dependency edge (read in this lock) — both
+    # spellings are read
+    locked = {(norm(r["name"]), frozenset(norm(e) for e in r.get("extras", r.get("extra", []))),
+               spec(r.get("specifier")), marker(r.get("marker"))) for r in meta.get("requires-dist", [])}
+    assert locked == wanted, "uv.lock resolved %r, pyproject asks for %r — run `uv lock`" % (locked, wanted)
+    assert sorted(meta.get("provides-extras", [])) == sorted(project.get("optional-dependencies", {})), meta
+    # and the resolved graph has an edge for each requirement: requires-dist is only
+    # what the lock was ASKED, `dependencies` is what it installs [Codex 2026-10-31:
+    # deleting the mcp edge passed]
+    # ponytail: edges are compared by NAME. An edge's marker and extras are the
+    # resolver's output, not a copy of requires-dist (oside-blender-mcp's lock forks
+    # numpy on python_full_version, a marker its requires-dist never states), so a
+    # hand-edited edge marker or extra passes here — and passes `uv lock --check` too
+    # (uv 0.12.5, measured 2026-10-31). The lock is uv's to write: re-run `uv lock`,
+    # never hand-edit it; compare edges only by re-resolving
+    edges = {norm(d["name"]) for d in entry.get("dependencies", [])}
+    assert edges == {r[0] for r in base}, "uv.lock installs %r for %s, pyproject asks for %r — run `uv lock`" % (
+        sorted(edges), project["name"], sorted({r[0] for r in base}))
+    for x, reqs in by_extra.items():
+        got = {norm(d["name"]) for d in entry.get("optional-dependencies", {}).get(x, [])}
+        assert got == {r[0] for r in reqs}, "uv.lock installs %r for [%s], pyproject asks for %r" % (
+            sorted(got), x, sorted({r[0] for r in reqs}))
 
 
 def test_the_readme_version_badge_matches_the_shipped_version():
