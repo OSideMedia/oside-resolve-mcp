@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- README: four diagrams, each beside the claim it shows: how a package becomes
+  a checked project, what lands on the timeline (markers and pinned takes on
+  their shot's first frame), the acceptance gate passing and failing, and the
+  SFX pass leaving every other track as it was.
 - README: the overview and the guardrails now cover the second recipe
   (`place_sfx`), which they had left out since 0.7.0. The self-test section names
   the 21.1 tail mode the fake reproduces, and the `place_sfx` mutation harness.

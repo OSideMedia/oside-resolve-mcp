@@ -14,6 +14,8 @@ each shot, narration laid on its own audio lanes at the right frames, an
 optional colour balance on every clip — and an **acceptance gate** that reports
 `PASS` or `FAIL` per check rather than assuming any of it worked.
 
+![Three steps. 1 Export: the board's clips, a narration file and manifest.json go into a folder. 2 Build: the clips land in shot order on a timeline, a marker over each. 3 Check: every check is ticked and the gate reads PASS.](docs/images/how-it-works.jpg)
+
 Once you are editing, it does one more job: it lays a spotted **sound-effects
 pass** onto a track of the timeline you already have, and proves nothing else
 on that timeline moved.
@@ -28,16 +30,22 @@ on that timeline moved.
 - **Places narration on its own lanes** — board-wide takes on `VO`, takes pinned
   to a shot on `VO PINS`, at that shot's exact frame. Never on A1, which holds
   the clips' own audio.
+
+  ![A timeline: five clips on V1, a numbered marker on each clip's first frame, each clip's own sound on A1, one long narration on VO from the start, and two takes on VO PINS that start exactly on the first frames of clips 2 and 4.](docs/images/timeline.jpg)
 - **Applies a starting colour balance** (ASC CDL on node 1) when the package
   carries a look — a matched starting point for the colourist, never a grade.
 - **Verifies the result and can fail.** Clip order, stray clips, every pinned
   take on its frame at zero tolerance, a marker per shot naming its own shot.
   A build that went wrong is reported as `FAIL`, not as success.
+
+  ![Two verify_import reports. In one, all four checks are ticked (clips in shot order, no stray clips, VO on its frame, each marker names its shot) and it reads PASS. In the other, VO on its frame has failed, so the whole report reads FAIL.](docs/images/gate.jpg)
 - **Lays a spotted SFX pass** onto one existing audio track of the timeline you
   are editing (`place_sfx`, the second recipe). Every collision is judged before
   the first clip is laid, every clip is re-read after it lands, and an export
   before and after proves no other track moved. A ledger beside the plan stops a
   pass you deleted from coming back on a re-run.
+
+  ![A plan of four sound effects, each dropped straight down onto its own spot on the SFX track. The four other tracks are left as they were, and an export of the timeline before the pass matches one after it.](docs/images/sfx-pass.jpg)
 
 It **never deletes, never overwrites, and never renders.** An existing project
 or timeline name is a hard refusal.
