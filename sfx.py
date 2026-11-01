@@ -353,8 +353,9 @@ def read_ledger(plan_path: str) -> dict | None:
     """The plan's ledger, or None when it was never laid through this tool.
 
     {"schema": "oside-sfx-ledger/v1", "plan": "/abs/plan.json",
-     "entries": [{"project", "timeline", "track", "placedAt": first time any
-                  row was laid, "runs": [{"at", "outcome", "placed": [...]}]}]}
+     "entries": [{"project", "timeline", "track", "placedAt": first time the
+                  plan put anything on this track, "runs": [{"at", "outcome",
+                  "placed": [...], "found": [...], "failure"?: {...}}]}]}
 
     A ledger that exists but does not read is an error, not an empty memory:
     read as "never laid", it would hand a pass the editor deleted whole back
@@ -393,9 +394,11 @@ def ledger_entry(doc: dict | None, project: str, timeline: str, track: str) -> d
 
 def record_run(plan_path: str, doc: dict | None, report: dict, at: str) -> dict:
     """The ledger with this run appended, written over the old one atomically.
-    The server records a run that laid a clip, and a run that found the plan's
-    rows already on the track with no record of them here — the second is how
-    a ledger that could not be written last time gets written now."""
+    The server records a run that put anything on the track, and a run that
+    found the plan's rows already on the track with no record of them here —
+    the second is how a ledger that could not be written last time gets
+    written now. A run that stopped keeps its failure: which row, why, and
+    what landed (None when the track could not be read back to say)."""
     doc = doc or {"schema": SFX_LEDGER_FORMAT, "plan": os.path.abspath(os.path.expanduser(plan_path)),
                   "entries": []}
     entry = ledger_entry(doc, report["project"], report["timeline"], report["track"])
@@ -403,11 +406,15 @@ def record_run(plan_path: str, doc: dict | None, report: dict, at: str) -> dict:
         entry = {"project": report["project"], "timeline": report["timeline"], "track": report["track"],
                  "placedAt": at, "runs": []}
         doc["entries"].append(entry)
-    entry["runs"].append({"at": at, "outcome": report["outcome"],
-                          "placed": [{"row": p["row"], "label": p["label"], "record": p["placedAt"],
-                                      "length": p["laidLength"]} for p in report.get("placed") or []],
-                          "found": [{"row": p["row"], "label": p["label"], "record": p["record"]}
-                                    for p in report.get("alreadyPlaced") or []]})
+    run = {"at": at, "outcome": report["outcome"],
+           "placed": [{"row": p["row"], "label": p["label"], "record": p["placedAt"],
+                       "length": p["laidLength"]} for p in report.get("placed") or []],
+           "found": [{"row": p["row"], "label": p["label"], "record": p["record"]}
+                     for p in report.get("alreadyPlaced") or []]}
+    failure = report.get("failure")
+    if isinstance(failure, dict):
+        run["failure"] = {k: failure[k] for k in ("row", "label", "reason", "landed") if k in failure}
+    entry["runs"].append(run)
     path = ledger_path(plan_path)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
