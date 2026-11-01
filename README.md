@@ -444,10 +444,13 @@ Claude: resolve_status()                          ← preconditions + capabiliti
 - Manifest entries may not be absolute, may not resolve outside the package, and
   may not share a clip name (Resolve matches clips by basename alone).
 - `place_sfx` lays into the open project's current timeline only, on one
-  existing track, from one existing bin. It never creates tracks or bins, never
-  extends the timeline, never saves, and never deletes a clip it laid wrong (it
-  reports it). Its one write outside Resolve is the plan's ledger,
-  `<plan>.placed.json`, beside the plan.
+  existing track. Files the pool lacks are imported into the plan's existing
+  bin; files already in the pool are used where they are. It never creates
+  tracks or bins, refuses a row that would run past the timeline's end, never
+  saves, and never deletes a clip it laid wrong: a clip Resolve put somewhere
+  else (its tail included) is left there and reported. The one file it keeps
+  outside Resolve is the plan's ledger, `<plan>.placed.json`, beside the plan;
+  the before and after exports are temporary files, removed once compared.
 - stdio transport only; nothing listens on the network.
 
 ## Known errors
