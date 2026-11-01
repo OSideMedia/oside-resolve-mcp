@@ -1841,6 +1841,12 @@ _QUAD = re.compile(r"(?<![0-9.])(?:" + _OCTET + r"\.){3}" + _OCTET + r"(?![0-9]|
 _ATTRS = r"(?:\s+[A-Za-z_][\w.:-]*\s*=\s*(?:\"[^\"]*\"|'[^']*'))*"
 _ELEMENT_BEFORE = re.compile(r"<([A-Za-z_][\w.:-]*)" + _ATTRS + r"\s*>\s*$")
 _ATTRIBUTE_BEFORE = re.compile(r"<[A-Za-z_][\w.:-]*" + _ATTRS + r"\s+([A-Za-z_][\w.:-]*)\s*=\s*[\"']\s*$")
+# A tag still open where the quad starts, inside an attribute's quotes or not.
+_IN_TAG = re.compile(r"<[A-Za-z_][\w.:-]*" + _ATTRS + r"(?:\s+[A-Za-z_][\w.:-]*\s*=\s*(?:\"[^\"]*|'[^']*))?\s*")
+# Outside a tag, a version written into text (<Note>Plugin version="16.7.33.189"</Note>,
+# CDATA, no markup at all) is still a version: a tag-only reading flagged it as an
+# address [Codex 2026-10-31, against 993a5ca].
+_TEXT_ASSIGNMENT = re.compile(r"(?:^|[\s>\[])([A-Za-z_][\w.:-]*)\s*=\s*[\"']\s*$")
 
 
 def _is_version_field(name):
@@ -1858,8 +1864,10 @@ def _ipv4(text):
     A regex cannot say that: Python's lookbehind is fixed-width, and the
     whitespace XML allows around `>` and `=` is not. The field is read from the
     last "<" before the quad, however far back: a fixed window cut a long tag's
-    name off and called a version an address [Codex 2026-10-31]. Outside a tag
-    no field excuses a quad.
+    name off and called a version an address [Codex 2026-10-31]. Inside a tag
+    that is still open, only the tag's own attribute counts, so a `version="`
+    inside another attribute's quotes excuses nothing. Outside one, the text
+    since that "<" may name the field (`version="16.7.33.189"`).
 
     It reads XML STRUCTURE, so `_scan_drp` gives it escaped text only
     (`reads_markup`): unescaping turns an attribute's &quot; into a quote that
@@ -1870,13 +1878,15 @@ def _ipv4(text):
         lt = text.rfind("<", 0, m.start())
         field = lt >= 0 and (_ELEMENT_BEFORE.match(text, lt, m.start())
                              or _ATTRIBUTE_BEFORE.match(text, lt, m.start()))
+        if not field and not (lt >= 0 and _IN_TAG.fullmatch(text, lt, m.start())):
+            field = _TEXT_ASSIGNMENT.search(text[max(lt, 0):m.start()])
         if not (field and _is_version_field(field.group(1))):
             return m.group(0)
     return None
 
 
-# ponytail: escaped text only, so an address written with entity-escaped digits or
-# dots (&#49;92.168.1.20) passes; no XML writer escapes those
+# ponytail: escaped text only, so an address written with entity-escaped dots
+# (192&#46;168&#46;1&#46;20) passes; no XML writer escapes those
 _ipv4.reads_markup = True
 
 
@@ -2316,6 +2326,7 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         ("an IP address", '<Host conversion="192.168.1.20"/>'),     # ends in "version", is not one
         ("an IP address", "<Conversion>192.168.1.20</Conversion>"),
         ("an IP address", '<PluginVersion host="x>192.168.1.20"/>'),  # a ">" inside quotes ends no tag
+        ("an IP address", "<Plugin note='x version=\"192.168.1.20'/>"),  # inside quotes names no field
         ("an IP address", "1.2.3.4"),
         ("an IPv6 address", "1::2"),
         ("an IPv6 address", "fe80::1c2a:3b4d:5e6f:7a8b"),
@@ -2366,7 +2377,12 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
                   '<PluginVersion note="a&quot;b">16.7.33.189</PluginVersion>',
                   '<Plugin note="' + "a" * 210 + '" version="16.7.33.189"/>',
                   '<PluginVersion note="' + "a" * 210 + '">16.7.33.189</PluginVersion>',
+                  # a version written into text, after a tag and in CDATA [Codex 2026-10-31]
+                  'Plugin version="16.7.33.189"', '<![CDATA[Plugin version="16.7.33.189"]]>',
+                  'version="16.7.33.189"', '<![CDATA[version="16.7.33.189"]]>',
                   "Look &amp; Feel", "R&amp;D"]
+    for bare in ('Plugin version="16.7.33.189"', 'version="16.7.33.189"'):
+        assert _ipv4(bare) is None, "a version in text with no markup at all: %r" % bare
 
     with tempfile.TemporaryDirectory() as td:
         planted = os.path.join(td, "PLANTS.drp")
