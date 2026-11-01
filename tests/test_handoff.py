@@ -3580,6 +3580,288 @@ def test_place_sfx_read_back_sees_a_neighbour_change_under_the_append():
         w.restore()
 
 
+def test_place_sfx_stops_before_a_row_the_clip_before_ran_into():
+    """[ow-39df46] A conformed clip is accepted one frame long (sfx.expected_lay's
+    tolerance), but every row's collisions were judged before the first write.
+    So the row right behind such a clip was still appended onto the frame the
+    clip now holds, and on a plain track Resolve lays that at the track TAIL
+    (anti-pattern 2). Each row is judged against the track as last read before
+    its append: the run stops there, says which clip ran into it, and keeps the
+    clip that did land on the report and the ledger."""
+    appends = []
+
+    class LongHit(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            appends.append(items[0]["recordFrame"])
+            out = super().AppendToTimeline(items)
+            for x in self._project.GetCurrentTimeline()._tracks[("audio", 3)]:
+                if x.GetName() == "hit.wav" and x.GetStart() == items[0]["recordFrame"]:
+                    x._d += 1                  # 274 frames: inside the +/-1 a conformed lay is allowed
+            return out
+    w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=LongHit)
+    try:
+        # hit.wav (25 fps on 60) is planned 1200..1473 and pop.wav starts on 1473: back to back, no collision
+        plan = _plan(w, [SFX_ROWS[2], ("pop.wav", 0, 13 / 60, 1473)])
+        assert server.place_sfx(plan, dry_run=True)["collisions"] == []
+        r = server.place_sfx(plan)
+        assert not r["ok"] and r["outcome"] == "failed", r
+        assert appends == [1200], appends                                    # pop.wav was never appended
+        assert _lane(w.tl) == [("hit.wav", 1200, 274, 12)], _lane(w.tl)      # and nothing landed at the tail
+        assert [(p["row"], p["laidLength"]) for p in r["placed"]] == [(1, 274)], r["placed"]
+        f = r["failure"]
+        assert f["row"] == 2 and f["landed"] == [] and "'hit.wav'" in f["reason"] and "1200..1474" in f["reason"], f
+        assert r["ledgerWritten"] is True
+    finally:
+        w.restore()
+
+
+def test_place_sfx_an_export_that_raises_keeps_the_report():
+    """[ow-39df46] Both snapshot handlers caught only ResolveError. A disk
+    error from the export (or anything else Export raises) went past them to
+    the server's generic error, which threw away the report of the clips
+    already laid and skipped the ledger. Before any write it is a refusal;
+    after the clips went in, they stay on the report and are recorded — and
+    so when the after-export reads but cannot be compared."""
+    real_snap = rapi.snapshot_otio
+    for which in (1, 2, "compare"):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES))
+        try:
+            real, calls = w.tl.Export, {"n": 0}
+
+            def export(path, *a):
+                calls["n"] += 1
+                if calls["n"] == which:
+                    raise OSError("export I/O failure")
+                return real(path, *a)
+            w.tl.Export = export
+            if which == "compare":     # the second export parses, but as nothing a timeline diff can read
+                rapi.snapshot_otio = lambda res, tl: real_snap(res, tl) if calls["n"] == 0 else {
+                    "tracks": {"children": [42]}}
+            plan = _plan(w, SFX_ROWS)
+            r = server.place_sfx(plan)
+            reason = r.get("failure", {}).get("reason", "")
+            assert not r.get("ok") and ("export I/O failure" in reason or which == "compare"), (which, r)
+            if which == 1:
+                assert r["outcome"] == "refused" and "no before-snapshot" in reason, r
+                assert _lane(w.tl) == [] and not os.path.exists(plan + ".placed.json"), r
+            else:
+                assert r["outcome"] == "failed", r
+                assert ("comparison could not run" if which == "compare" else "after-snapshot failed") in reason, r
+                assert [p["record"] for p in r["placed"]] == [212, 609, 1200] and len(_lane(w.tl)) == 3, r
+                assert r["ledgerWritten"] is True, r
+        finally:
+            rapi.snapshot_otio = real_snap
+            w.restore()
+
+
+def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
+    """[ow-39df46] The ledger was written only for rows in `placed`, and a row
+    went there only when its whole check passed. So when the run's FIRST append
+    put a clip on the track and the check then failed — the right clip with a
+    neighbour nudged under it, a stray at the tail, a track that would not read
+    back after it (answering None, or raising) — nothing was recorded, and once
+    the editor deleted that clip an ordinary re-run laid it again. Each case is
+    now recorded and the plain re-run refuses. A drop that put nothing on the
+    track still records nothing, and so does one during which an editor only
+    moved a clip already there, proved by its readable file and trim [Codex r1,
+    r2, r4 on 0.8.1]. Any other change under the append (a trim, a move that
+    cannot be proved, an item that reads unchanged only because its file or
+    trim did not read [Codex r5]) is recorded by decision [Codex r3], and the
+    failure says how to finish: resume=True, which every cell then proves
+    works."""
+    class Nudge(FakeMediaPool):
+        def AppendToTimeline(self, items):
+            out = super().AppendToTimeline(items)
+            for x in self._project.GetCurrentTimeline()._tracks[("audio", 3)]:
+                if x.GetName() == "theirs.wav":
+                    x._left += 2
+            return out
+
+    class Late(FakeMediaPool):          # an occupant arrives mid-run, so the clip lands at the tail
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].append(FakeItem("hidden.wav", 0, 75))
+            return super().AppendToTimeline(items)
+
+    class Namesake(FakeMediaPool):      # Resolve lays another library's file of the same name
+        decoy_path = "/other/library/check.wav"
+
+        def AppendToTimeline(self, items):
+            decoy = FakeClip("check.wav", 98, fps=60, path=self.decoy_path)
+            return super().AppendToTimeline([dict(items[0], mediaPoolItem=decoy)])
+
+    class StrayAsOneGoes(FakeMediaPool):   # a frame late, while an editor deletes the clip there: counts balance
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].pop(0)
+            return super().AppendToTimeline([dict(items[0], recordFrame=items[0]["recordFrame"] + 1)])
+
+    class NamesakeAsOneGoes(Namesake):  # [Codex r2 on 0.8.1] the namesake lands as an editor deletes the clip there
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)].pop(0)
+            return super().AppendToTimeline(items)
+
+    class PathlessAsOneGoes(NamesakeAsOneGoes):    # the same, and the laid clip's file cannot be read
+        decoy_path = None
+
+    class PathlessInItsPlace(PathlessAsOneGoes):
+        """[Codex r5 on 0.8.1] Another library's file of the same name lands
+        exactly where an editor deletes the clip there, with the same length
+        and trim. Neither file reads, so the track reads unchanged: a read
+        that could not see the file proves nothing about it."""
+        def AppendToTimeline(self, items):
+            gone = self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]
+            return super().AppendToTimeline([dict(items[0], recordFrame=gone._s)])
+
+    class TrimUnreadInItsPlace(FakeMediaPool):
+        """[Codex r5 on 0.8.1] This row's own file lands where an editor
+        deletes a clip of it, the same length but another slice of the sound,
+        and neither trim reads."""
+        def AppendToTimeline(self, items):
+            lane = self._project.GetCurrentTimeline()._tracks[("audio", 3)]
+            gone = lane.pop(0)
+            out = super().AppendToTimeline([dict(items[0], recordFrame=gone._s, startFrame=items[0]["startFrame"] + 5,
+                                                 endFrame=items[0]["endFrame"] + 5)])
+            for x in lane:
+                if x._s == gone._s:
+                    x.GetLeftOffset = lambda subframe_precision=False: None
+            return out
+
+    class Deaf(FakeMediaPool):          # nothing lands: there is nothing to remember
+        def AppendToTimeline(self, items):
+            return [_RemoteObject()]
+
+    class DeafWhileItMoves(FakeMediaPool):
+        """[Codex r1 on 0.8.1] Nothing lands, but an editor moves the clip
+        already on the track while the append runs. A moved item is not one
+        this run laid: counting it would record the plan, and a plain retry
+        after the editor puts it back would be refused. Only a move proved by a
+        readable file and trim counts as one [Codex r4]."""
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 0
+            return [_RemoteObject()]
+
+    class TrimmedAsNothingLands(FakeMediaPool):
+        """[Codex r3 on 0.8.1] Nothing lands while an editor trims a clip of
+        this row's own file. That reads exactly like a clip laid as the editor
+        deleted one, so it is recorded, by decision: the failure says to
+        finish with resume=True, and the resume below proves that it can."""
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._d -= 10
+            return [_RemoteObject()]
+
+    class CopyAsItsTwinMoves(FakeMediaPool):       # a frame late, as an editor moves a clip of the same sound
+        def AppendToTimeline(self, items):
+            self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]._s = 2000
+            return super().AppendToTimeline([dict(items[0], recordFrame=items[0]["recordFrame"] + 1)])
+
+    def unreadable(answer):
+        class Unread(FakeMediaPool):    # the clip lands; the read right after it does not answer
+            def AppendToTimeline(self, items):
+                out = super().AppendToTimeline(items)
+                tl = self._project.GetCurrentTimeline()
+                real = tl.GetItemListInTrack
+
+                def once(kind, idx):
+                    tl.GetItemListInTrack = real
+                    return answer()
+                tl.GetItemListInTrack = once
+                return out
+        return Unread
+
+    def raises():
+        raise RuntimeError("the track went away")
+
+    def own_file(w, path):
+        """The first item already on the track gets a readable source file:
+        "row" = this row's own file (a twin of the sound being laid), and
+        "row, trim unread" the same with a left offset that will not read."""
+        if path:
+            first = w.tl._tracks[("audio", 3)][0]
+            first._media = FakeClip(first._n, 98, fps=60, path=w.paths["check.wav"] if path.startswith("row") else path)
+            if path.endswith("trim unread"):     # the API read fails; the export still has the trim
+                first.GetLeftOffset = lambda subframe_precision=False: None
+
+    # the nudged clip landed exactly as planned, so it is also `placed`. The
+    # last element gives the clip already there a source file: an item of this
+    # row's file that left its place is the case a truncated stray looks like.
+    cells = [("nudged", Nudge, [("theirs.wav", 3000, 40, 0)], "changed under the append", [1], None),
+             ("stray", Late, [], "landed somewhere other", [], None),
+             ("namesake", Namesake, [], "landed somewhere other", [], None),
+             ("stray as one goes", StrayAsOneGoes, [("theirs.wav", 3000, 40, 0)], "changed under the append", [],
+              None),
+             ("namesake as one goes", NamesakeAsOneGoes, [("theirs.wav", 3000, 40, 0)],
+              "changed under the append", [], None),
+             ("namesake as its twin goes", NamesakeAsOneGoes, [("check.wav", 3000, 82, 0)],
+              "changed under the append", [], "row"),
+             ("stray as its twin goes", StrayAsOneGoes, [("check.wav", 3000, 82, 5)], "changed under the append",
+              [], "row"),
+             ("unreadable stray as one goes", PathlessAsOneGoes, [("theirs.wav", 3000, 82, 0)],
+              "changed under the append", [], None),
+             ("unreadable stray as its unreadable twin goes", PathlessAsOneGoes, [("check.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], None),
+             ("stray as a renamed twin goes", StrayAsOneGoes, [("theirs.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], "row"),
+             # [Codex r4] a move whose file or trim cannot be read is not proved a move
+             ("pathless clip moves", DeafWhileItMoves, [("theirs.wav", 3000, 75, 0)],
+              "finish the plan with resume=True", [], None),
+             ("clip with an unread trim moves", DeafWhileItMoves, [("check.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], "row, trim unread"),
+             # [Codex r5] nor does an item that reads unchanged only because its file or trim did not read
+             ("unreadable namesake in its place", PathlessInItsPlace, [("check.wav", 3000, 82, 0)],
+              "could not be read may be one it laid", [], None),
+             ("another slice in its place, trims unread", TrimUnreadInItsPlace, [("check.wav", 3000, 82, 0)],
+              "could not be read may be one it laid", [], "row, trim unread"),
+             ("namesake as its namesake goes", NamesakeAsOneGoes, [("check.wav", 3000, 40, 5)],
+              "finish the plan with resume=True", [], "/other/library/check.wav"),
+             ("trimmed as nothing lands", TrimmedAsNothingLands, [("check.wav", 3000, 82, 0)],
+              "finish the plan with resume=True", [], "row"),
+             ("copy as its twin moves", CopyAsItsTwinMoves, [("check.wav", 3000, 82, 0)],
+              "changed under the append", [], "row"),
+             ("unread", unreadable(lambda: None), [], "could not be read back", [], None),
+             ("raises", unreadable(raises), [], "the track went away", [], None)]
+    for name, cls, lane, why, placed, twin in cells:
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
+        own_file(w, twin)
+        try:
+            plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
+            r = server.place_sfx(plan)
+            assert not r.get("ok") and r.get("outcome") == "failed", (name, r)
+            assert why in r["failure"]["reason"] and r.get("ledgerWritten") is True, (name, r)
+            assert [p["row"] for p in r["placed"]] == placed, (name, r["placed"])
+            with open(plan + ".placed.json") as f:
+                run = json.load(f)["entries"][0]["runs"][0]
+            assert run["outcome"] == "failed" and why in run["failure"]["reason"], (name, run)
+            # the editor deletes what this run put on the track and leaves the rest as it was
+            w.tl._tracks[("audio", 3)][:] = [FakeItem(n, s, d, lo) for n, s, d, lo in lane]
+            again = server.place_sfx(plan)
+            assert again["outcome"] == "refused" and "was laid here on" in again["failure"]["reason"], (name, again)
+            assert _lane(w.tl) == list(lane), (name, _lane(w.tl))
+            # and the way out the refusal names works, once Resolve behaves
+            w.pool.__class__ = FakeMediaPool
+            done = server.place_sfx(plan, resume=True)
+            assert done["outcome"] == "placed" and [p["row"] for p in done["placed"]] == [1], (name, done)
+        finally:
+            w.restore()
+
+    # [Codex r2 on 0.8.1] the clip that moves is one of this row's own file:
+    # still a move, still nothing laid
+    for cls, lane, why, twin in ((Deaf, [], "nothing new on the track", None),
+                                 (DeafWhileItMoves, [("check.wav", 3000, 82, 0)], "changed under the append", "row")):
+        w = _sfx_world(SFX_FILES, pooled=tuple(SFX_FILES), pool_cls=cls, lane=lane)
+        own_file(w, twin)
+        try:
+            plan = _plan(w, [("check.wav", 0, 82 / 60, 30)])
+            r = server.place_sfx(plan)
+            assert why in r["failure"]["reason"] and r["wroteToTrack"] is False and "ledgerWritten" not in r, \
+                (cls.__name__, twin, r)
+            assert not os.path.exists(plan + ".placed.json")
+            w.tl._tracks[("audio", 3)][:] = [FakeItem(n, s, d, lo) for n, s, d, lo in lane]   # put back
+            w.pool.__class__ = FakeMediaPool                                                    # Resolve behaves
+            again = server.place_sfx(plan)
+            assert again["outcome"] == "placed", (cls.__name__, again)
+        finally:
+            w.restore()
+
+
 def test_place_sfx_refuses_when_the_track_and_its_export_disagree():
     """The item list judged the collisions; the export is what the diff will
     compare against. An occupant only one of them shows means neither can be
