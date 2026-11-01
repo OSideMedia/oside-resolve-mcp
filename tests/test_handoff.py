@@ -1835,10 +1835,12 @@ _OCTET =r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
 _QUAD = re.compile(r"(?<![0-9.])(?:" + _OCTET + r"\.){3}" + _OCTET + r"(?![0-9]|\.[0-9])")
 # The field a value sits in: an element, attributes allowed (<PluginVersion id="3">
 # 16.7.33.189), or a name="value" pair (<Plugin Version = "16.7.33.189"/>), with
-# whitespace where XML allows it. These are 993a5ca's two readings with one change: a
-# ">" ends the tag only outside quotes [Codex 2026-10-31: <PluginVersion host="x>
-# 192.168.1.20"/> scanned clean]. Every stricter reading tried since flagged a version
-# 993a5ca excused: in text, in CDATA, in XML-looking CDATA [Codex 2026-10-31, x3].
+# whitespace where XML allows it. These are 993a5ca's two readings with two changes,
+# each a review's finding: a ">" ends the tag only outside quotes [Codex 2026-10-31:
+# <PluginVersion host="x>192.168.1.20"/> scanned clean], and no fixed window, which cut
+# a long tag's name off or cut `conversion="` down to `version="` [Codex 2026-10-31].
+# Every stricter reading tried since flagged a version 993a5ca excused: in text, in
+# CDATA, in XML-looking CDATA [Codex 2026-10-31, x3].
 _ELEMENT_BEFORE = re.compile(r"<([A-Za-z_][\w.:-]*)(?:\s(?:[^<>\"']|\"[^\"]*\"|'[^']*')*)?>\s*$")
 _ATTRIBUTE_BEFORE = re.compile(r"(?:^|[\s>\[])([A-Za-z_][\w.:-]*)\s*=\s*[\"']\s*$")
 
@@ -2317,6 +2319,7 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         ("an IP address", '<Host conversion="192.168.1.20"/>'),     # ends in "version", is not one
         ("an IP address", "<Conversion>192.168.1.20</Conversion>"),
         ("an IP address", '<PluginVersion host="x>192.168.1.20"/>'),  # a ">" inside quotes ends no tag
+        ("an IP address", 'conversion="' + " " * 191 + '192.168.1.20"'),  # a window cut it to version="
         ("an IP address", "1.2.3.4"),
         ("an IPv6 address", "1::2"),
         ("an IPv6 address", "fe80::1c2a:3b4d:5e6f:7a8b"),

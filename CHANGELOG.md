@@ -47,7 +47,7 @@ A rule with no plant of its own fails, checked rule by rule rather than by label
 every plant is also hex- and base64-encoded alone and must be caught in the layer the
 decoder opened. The test checks the lookalikes pass in plain XML and inside Resolve's own
 compressed layers, shows each decoder a path only it can reach, and runs the old Windows
-rule on the same path, where it must miss. Main's scanner catches 8 of the 39 plants,
+rule on the same path, where it must miss. Main's scanner catches 8 of the 40 plants,
 each under a rule it already had (home paths, a volume, email addresses, the escaped
 Windows path, a `.local` name, a credential assignment), and misses the rest. Each guard here was reverted
 alone: every revert turns a test red.
