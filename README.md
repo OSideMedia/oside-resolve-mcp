@@ -38,14 +38,14 @@ on that timeline moved.
   take on its frame at zero tolerance, a marker per shot naming its own shot.
   A build that went wrong is reported as `FAIL`, not as success.
 
-  ![Two verify_import reports. In one, all four checks are ticked (clips in shot order, no stray clips, VO on its frame, each marker names its shot) and it reads PASS. In the other, VO on its frame has failed, so the whole report reads FAIL.](docs/images/gate.jpg)
+  ![Two verify_import reports. In one, all four checks are ticked, so it reads PASS: clips in shot order, no stray clips, VO on its frame (a take pinned to a shot starts on that shot's first frame), and each marker names its shot (every marker this tool laid carries its own shot). In the other, a pinned take is off its frame, so the whole report reads FAIL.](docs/images/gate.jpg)
 - **Lays a spotted SFX pass** onto one existing audio track of the timeline you
   are editing (`place_sfx`, the second recipe). Every collision is judged before
   the first clip is laid, every clip is re-read after it lands, and an export
   before and after proves no other track moved. A ledger beside the plan stops a
   pass you deleted from coming back on a re-run.
 
-  ![A plan of four sound effects, each dropped straight down onto its own spot on the SFX track. The four other tracks are left as they were, and an export of the timeline before the pass matches one after it.](docs/images/sfx-pass.jpg)
+  ![A plan of four sound effects, each dropped straight down onto its own spot on the SFX track. The four other tracks are drawn with padlocks: the tool does not lock them, it proves they did not change, because an export of the timeline before the pass matches one after it.](docs/images/sfx-pass.jpg)
 
 It **never deletes, never overwrites, and never renders.** An existing project
 or timeline name is a hard refusal.
