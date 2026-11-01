@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## 0.8.2 — 2026-10-31
+
+### Fixed — the template leak gate saw two of four leak classes (ow-557456, audit 2026-09-12 R-2)
+
+The gate that keeps the operator's machine out of the published `.drp` templates caught
+home paths and email addresses, and missed the rest:
+
+- **Windows paths.** The rule demanded two literal backslashes, so a real
+  `C:\Users\someone` passed. It now takes one or two, or a forward slash, and network
+  shares (`\\server\share`) get their own rule.
+- **New rules:** local network hostnames (`.lan`, `.home`, `.internal`, `.localdomain`,
+  `.home.arpa` beside `.local`), IP addresses, the names macOS and Windows give a computer
+  out of the box (`Someone's MacBook Pro`, `DESKTOP-XXXXXXX`), and the name of the machine
+  running the test.
+- **The real templates carry Waves plugin versions that are valid dotted quads**, so the
+  address rule excuses a value right after a version element or attribute and never reads
+  a quad out of a longer dotted number. Without either guard the gate blocks the real
+  templates.
+- **Every decoder now runs on every layer.** base64 and gzip join hex, zstd and zlib,
+  nested up to six layers. Past that depth, or past 5000 layers, the member reads
+  UNREADABLE, never clean.
+
+A new test plants a leak for every rule (a rule with no plant fails), checks the
+lookalikes pass in plain XML and inside Resolve's own compressed layers, shows each decoder
+a path only it can reach, and runs the old Windows rule on the same path, where it must
+miss. Main's scanner missed every new plant; fifteen mutations of the new one each turn a
+test red.
+
+### Added — `uv.lock` (audit 2026-09-12 R-14)
+
+Installs now resolve the same package versions every time: `uv sync --locked`. The
+lockfile was checked by hand before it was committed and is refreshed here only for the
+project's own version. `test_the_lockfile_matches_the_project` holds its entry to
+`pyproject.toml` (version, requirements including the `mcp<2` pin, extras); it caught the
+0.8.1 bump the first time main moved under it.
+
 ## 0.8.1 — 2026-10-31
 
 ### Fixed — `place_sfx` after the first write (ow-39df46)
