@@ -675,7 +675,7 @@ def _placeable(rows: list | None) -> int | None:
 def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: bool = True,
                     text_tasks: list | None = None, planned_cues: list | None = None,
                     planned_text_tasks: list | None = None, stock_intent: str | None = None,
-                    sidecar_warnings: list | None = None) -> dict:
+                    sidecar_warnings: list | None = None, fps: float | None = None) -> dict:
     """The acceptance gate. observed:
         {"binVideos": set|None, "binAudio": set|None,
          "timeline": {"name", "v1": [{"name","start","duration"}],
@@ -684,6 +684,8 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
                       "markers": {frame: {...}}} | None}
     VO takes are looked for on EVERY audio track (`audioTracks`; `a1` alone
     for older observations) and each VO row names the track the take sits on.
+    `fps` is the timeline's measured rate, which the VO length row converts
+    seconds at; None falls back to the kind's default (KIND_FPS).
     Returns {"checks": [{check, expected, found, pass, ...}], "overall", "report"}
     — `report` is the pre-v2 shape, kept for callers that read it.
     """
@@ -806,12 +808,19 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
             # 74) — hence the slack, the one-sided test (short only; longer is
             # conform rounding), and pinned-only (an unpinned take is MEANT to
             # slide, and its length is nobody's contract).
+            #
+            # The length is in TIMELINE frames, so the seconds convert at the rate
+            # the timeline actually runs at, measured by verify_import. The kind's
+            # default rate was only right while the timeline happened to match it:
+            # a 3.1 s take wants 186 frames on a 60 fps timeline but 74 at the
+            # cinematic default, so a take cut to 1.2 s passed [audit 2026-09-12 R-6].
             if pinned and delta == 0 and placed_frames is not None:
-                want = seconds_to_clip_frames(a.get("durationSeconds"), kind_fps(manifest))
+                rate = float(fps) if fps else kind_fps(manifest)
+                want = seconds_to_clip_frames(a.get("durationSeconds"), rate)
                 if want is not None:
                     short_by = want - int(placed_frames)
                     check(f"VO {fname} length", want, int(placed_frames),
-                          short_by <= VO_LENGTH_SLACK, shortBy=short_by, track=track,
+                          short_by <= VO_LENGTH_SLACK, shortBy=short_by, track=track, fps=rate,
                           rule=f"a pinned take on its own frame may not be over {VO_LENGTH_SLACK} frames short")
 
     shot_frames = sorted(f for f, m in markers.items() if _is_shot_marker(m))
