@@ -70,9 +70,12 @@ accepted — the live walks happen by hand, and their findings land in
 `export_template` overwrites them from a live Resolve project, so a gate scans
 them before they can ship for filesystem paths (macOS, Linux, Windows and
 network shares), email addresses, local hostnames, IP addresses (IPv4 and IPv6), credentials
-and computer names, including the name of the machine running the tests. It reads every
-layer Resolve hides text in: the zip, hex blobs, base64, zstd, zlib and gzip,
-nested, as UTF-8 and UTF-16, and XML-unescaped. Each rule is proven against a planted leak of its own and
+and computer names, including the name of the machine running the tests. It reads the
+layers Resolve hides text in: the zip, hex blobs, base64, zstd, zlib and gzip,
+nested up to six deep, as UTF-8 and UTF-16, each also XML-unescaped. Nested deeper than
+it reads, a template fails as unreadable rather than passing. The shortest run it decodes
+and its other limits are set, with the reason, in `tests/test_handoff.py`. Each rule is
+proven against a planted leak of its own and
 against the lookalikes the real templates carry (plugin version numbers are
 valid dotted quads). If you re-snapshot, read the diff.
 

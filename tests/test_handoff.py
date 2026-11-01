@@ -1834,10 +1834,13 @@ _OCTET =r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
 # A dotted quad that is not part of a longer dotted number.
 _QUAD = re.compile(r"(?<![0-9.])(?:" + _OCTET + r"\.){3}" + _OCTET + r"(?![0-9]|\.[0-9])")
 # The field a value sits in: an element, attributes allowed (<PluginVersion id="3">
-# 16.7.33.189), or an attribute (Version = "16.7.33.189"), with whitespace where XML
-# allows it.
-_ELEMENT_BEFORE = re.compile(r"<([A-Za-z_][\w.:-]*)(?:\s[^<>]*)?>\s*$")
-_ATTRIBUTE_BEFORE = re.compile(r"(?:^|\s)([A-Za-z_][\w.:-]*)\s*=\s*[\"']\s*$")
+# 16.7.33.189), or an attribute (<Plugin Version = "16.7.33.189"/>), with whitespace
+# where XML allows it. The tag's attributes are read as whole name="value" pairs, so a
+# ">" or a `Version="` inside another attribute's quotes is never taken for the field
+# [Codex 2026-10-31: <PluginVersion host="x>192.168.1.20"/> scanned clean].
+_ATTRS = r"(?:\s+[A-Za-z_][\w.:-]*\s*=\s*(?:\"[^\"]*\"|'[^']*'))*"
+_ELEMENT_BEFORE = re.compile(r"<([A-Za-z_][\w.:-]*)" + _ATTRS + r"\s*>\s*$")
+_ATTRIBUTE_BEFORE = re.compile(r"<[A-Za-z_][\w.:-]*" + _ATTRS + r"\s+([A-Za-z_][\w.:-]*)\s*=\s*[\"']\s*$")
 
 
 def _is_version_field(name):
@@ -1903,11 +1906,14 @@ TEMPLATE_LEAK_PATTERNS = (
      "a Windows computer name"),
     (_ipv4, "an IP address"),
     (_IPV6, "an IPv6 address"),
-    # as an assignment (api_key = …, password: …) or as an XML element holding a value
-    # (<Password>…</Password>, attributes allowed); an empty element holds nothing
+    # as an assignment (api_key = …, password: …) or as an XML element NAMED for one,
+    # holding a value (<Password>…</Password>, attributes allowed). An empty or
+    # self-closing element holds nothing, and a keyword that is only an attribute's
+    # value (<Text name="Secret">) is a title [Codex 2026-10-31: both fired]
     # ponytail: the keyword stands alone, so a compound name (<ProxyPassword>) passes;
     # widen it if a template ever carries one
-    (r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token)\b(?:\s*[:=]|[^<>]*>\s*[^<\s])",
+    (r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]"
+     r"|<(?:password|passwd|secret|api[_-]?key|access[_-]?token)(?:\s[^<>]*)?(?<!/)>\s*[^<\s]",
      "a credential"),
 )
 
@@ -1941,12 +1947,14 @@ def _leak_patterns(names=None):
     with a digit, hyphen or underscore in it is distinctive and is matched as a
     whole word anywhere. A plain word ("Resolve", "Timeline") is also ordinary
     project text, so it is matched only as a whole VALUE: between tags, quotes
-    or `=`, or the control bytes of a binary record [Codex 2026-10-31: a machine
-    named Resolve blocked both real templates]."""
+    or `=`, or the control bytes of a binary record, whitespace around it allowed
+    [Codex 2026-10-31: a machine named Resolve blocked both real templates; then
+    `<Computer> Resolve </Computer>` passed]."""
     rules = []
     for n in sorted(_this_machines_names() if names is None else names):
         if re.fullmatch(r"[A-Za-z]+", n):
-            rule = r"(?i)(?:^|(?<=[>\"'=\x00-\x1f]))" + re.escape(n) + r"(?=$|[<\"'\x00-\x1f])"
+            rule = (r"(?i)(?:^|(?<=[>\"'=\x00-\x1f]))\s*" + re.escape(n)
+                    + r"(?=\s*(?:$|[<\"'\x00-\x1f]))")
         else:
             rule = r"(?i)(?<![A-Za-z0-9-])" + re.escape(n) + r"(?![A-Za-z0-9-])"
         rules.append((rule, "this computer's name"))
@@ -1967,19 +1975,29 @@ def _leak_patterns(names=None):
 #
 # Since 0.8.2 (ow-557456) the same holds for BASE64 runs and GZIP streams, and
 # every decoder runs on every layer, not only the one it was first found in: a
-# path in gzip in base64 in a hex blob is three layers in and still read. The
-# text decoders (hex, base64) read each layer's UTF-16 views too, and every text
-# is also read XML-unescaped (Peter&apos;s MacBook Pro).
+# path in gzip in base64 in a hex blob is three layers in and still read. Each
+# layer is read in every view (UTF-8, UTF-16 at both alignments, each also
+# XML-unescaped: Peter&apos;s MacBook Pro), and the text decoders (hex, base64)
+# read every view too. The reach has edges, each named where it is set: the run
+# floors, the depth and layer limits, and the short-layer rule.
 # ---------------------------------------------------------------------------
 
-_MAX_DEPTH = 6        # layers inside a member; deeper than this is UNREADABLE, never skipped
-_MAX_LAYERS = 5000    # decoded layers per member; more than this is UNREADABLE, never skipped
-# The shortest leak worth finding is about six bytes ("a@b.co"; "/home/a" is seven).
-# Base64 of six bytes is eight characters, hex is twelve, so a shorter run cannot hold
-# one, and a longer floor lets a short leak through without a word [Codex 2026-10-31:
-# "/home/a" in base64, twelve characters, passed a sixteen-character floor].
+# Past either limit a member reads UNREADABLE, never clean. A layer shorter than
+# _MIN_NESTED is the exception: it is still read past the depth limit (it cannot
+# hide a further layer) and is not counted against the layer limit.
+_MAX_DEPTH = 6        # layers inside a member
+_MAX_LAYERS = 5000    # decoded layers per member, _MIN_NESTED bytes or longer
+# The shortest leak a rule matches is four bytes: a Windows path ("C:/a"), an IPv6
+# address ("1::2"), a machine name. Hex of four bytes is eight characters, and so is
+# base64 counted WITH its padding ("QzovYQ=="), so a run of eight can hold one and a
+# longer floor lets a short leak through without a word [Codex 2026-10-31, twice:
+# "/home/a" passed a sixteen-character floor, then "C:/a" passed twelve hex digits and
+# eight base64 characters not counting "=="]. The plants test encodes every plant
+# alone in both, so a rule with a shorter leak, or a higher floor, goes red.
+# ponytail: UNPADDED base64 of four or five bytes (six or seven characters) passes; a
+# six-character floor would decode every six-letter word, so raise it only on a find
 _MIN_B64 = 8
-_MIN_HEX = 12
+_MIN_HEX = 8
 # A decoded layer shorter than the shortest encoded leak (eight characters of base64)
 # cannot hold another one. It is read, but not opened further and not counted against
 # _MAX_LAYERS: the short words of a member decode to a few bytes of noise each.
@@ -2008,9 +2026,11 @@ def _children(data, text_only=False):
             out.append(("hex#%d" % i, bytes.fromhex(run.decode("ascii"))))
         except ValueError:
             continue
-    # a run of the base64 alphabet long enough to hide a leak; an all-hex run is the
-    # hex decoder's, and a run that will not decode is just a word
-    for i, run in enumerate(re.findall(rb"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{%d,}={0,2}" % _MIN_B64, data)):
+    # a run of the base64 alphabet long enough to hide a leak, padding counted; an
+    # all-hex run is the hex decoder's, and a run that will not decode is just a word
+    b64_run = rb"(?<![A-Za-z0-9+/])(?:[A-Za-z0-9+/]{%d,}={0,2}|[A-Za-z0-9+/]{%d}==|[A-Za-z0-9+/]{%d}=)" % (
+        _MIN_B64, _MIN_B64 - 2, _MIN_B64 - 1)
+    for i, run in enumerate(re.findall(b64_run, data)):
         body = run.rstrip(b"=")
         if re.fullmatch(rb"[0-9a-fA-F]+", body):
             continue
@@ -2045,34 +2065,56 @@ def _children(data, text_only=False):
     return out
 
 
+def _views(raw):
+    """Every way one layer's bytes read as text, as (suffix, text): UTF-8, and
+    UTF-16-LE at BOTH byte alignments (a string inside a binary record can start
+    on an odd offset, and a decode from 0 then reads every character as
+    garbage), each of them also XML-unescaped where that changes it: XML
+    escaping is a transform too, and `Peter&apos;s MacBook Pro` is that name
+    [Codex 2026-10-31]. The first is the raw bytes' own reading."""
+    import html
+    out = []
+    for suffix, text in (("", raw.decode("utf-8", "ignore")),
+                         ("/utf16", raw.decode("utf-16-le", "ignore")),
+                         ("/utf16+1", raw[1:].decode("utf-16-le", "ignore"))):
+        out.append((suffix, text))
+        if "&" in text:
+            plain = html.unescape(text)
+            if plain != text:
+                out.append((suffix + "/unescaped", plain))
+    return out
+
+
 def _inner_texts(member_bytes):
     """Every text this member carries, one decode layer at a time: the member
     itself, then every hex, base64, zstd, zlib and gzip layer inside it, and
-    inside those, each read as UTF-8 and as UTF-16-LE at both byte alignments;
-    the hex and base64 decoders read the UTF-16 views as well.
-    Yields (layer, text); a layer that will not open, or a member nested past
-    the scanner's reach, yields text starting UNREADABLE."""
+    inside those, each in every view `_views` reads; the hex and base64
+    decoders read every view as well, so a layer in a view is opened like any
+    other. Yields (layer, text); a layer that will not open, or a member nested
+    past the scanner's reach, yields text starting UNREADABLE. A run shorter
+    than the floors (_MIN_B64, _MIN_HEX) is not decoded, and a decoded layer
+    shorter than _MIN_NESTED is read but neither opened further nor counted
+    against the reach limits."""
     import hashlib
     seen = {hashlib.sha1(member_bytes).digest()}
     stack = [("member", member_bytes, 0)]
     layers = 0
     while stack:
         name, raw, depth = stack.pop()
-        # UTF-16 at BOTH byte alignments: a string inside a binary record can start on
-        # an odd offset, and a decode from 0 then reads every character as garbage
-        views = (("utf16", raw.decode("utf-16-le", "ignore")),
-                 ("utf16+1", raw[1:].decode("utf-16-le", "ignore")))
-        yield (name, raw.decode("utf-8", "ignore"))
-        for view, text in views:
-            yield (name + "/" + view, text)
+        views = _views(raw)
+        for suffix, text in views:
+            yield (name + suffix, text)
         if len(raw) < _MIN_NESTED:
             continue  # read above; too short to hold another encoded leak
         kids = _children(raw)
-        # The text decoders read the UTF-16 views too. A base64 or hex run stored as
+        # The text decoders read every other view too. A base64 or hex run stored as
         # UTF-16 has a NUL between its characters, so it is no run in the raw bytes
-        # [Codex 2026-10-31: a path in base64 in UTF-16 scanned clean].
-        for view, text in views:
-            kids += [(view + "/" + k, d) for k, d in _children(text.encode("utf-8", "ignore"), text_only=True)]
+        # [Codex 2026-10-31: a path in base64 in UTF-16 scanned clean], and an
+        # entity breaks one in escaped XML [Codex 2026-10-31, again:
+        # <B>&#76;2hvbWUvYWxpY2U=</B> scanned clean].
+        for suffix, text in views[1:]:
+            kids += [(suffix.lstrip("/") + "/" + k, d)
+                     for k, d in _children(text.encode("utf-8", "ignore"), text_only=True)]
         if depth >= _MAX_DEPTH:
             # a layer too short to nest is still read; anything longer is past reach
             if any(d is None or len(d) >= _MIN_NESTED for _k, d in kids):
@@ -2101,7 +2143,6 @@ def _scan_drp(path, patterns=None):
     then decodes every layer inside each member (hex, base64, zstd, zlib, gzip),
     which is where the 2026-09-08 audit's "clean" templates held the operator's
     home directory (R-1). `patterns` defaults to _leak_patterns()."""
-    import html
     import zipfile
     patterns = _leak_patterns() if patterns is None else patterns
     hits = []
@@ -2124,19 +2165,14 @@ def _scan_drp(path, patterns=None):
                 if text.startswith("UNREADABLE"):
                     hits.append((member + " :: " + layer, "unreadable", text[:80]))
                     continue
-                views = [(layer, text)]
-                # XML escaping is a transform too: `Peter&apos;s MacBook Pro` is that
-                # name, and the rule reads the plain text [Codex 2026-10-31]
-                if "&" in text:
-                    plain = html.unescape(text)
-                    if plain != text:
-                        views.append((layer + "/unescaped", plain))
-                for view, body in views:
-                    for rule, kind in patterns:
-                        found = _rule_search(rule, body)
-                        if found is not None and (layer, kind) not in seen:
-                            seen.add((layer, kind))
-                            hits.append((member + " :: " + view, kind, found[:80]))
+                # one report per layer and kind: a hit in a text and in its
+                # unescaped view is one leak
+                key = layer[:-len("/unescaped")] if layer.endswith("/unescaped") else layer
+                for rule, kind in patterns:
+                    found = _rule_search(rule, text)
+                    if found is not None and (key, kind) not in seen:
+                        seen.add((key, kind))
+                        hits.append((member + " :: " + layer, kind, found[:80]))
     return hits
 
 
@@ -2242,8 +2278,12 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         ("a Windows path", real_windows),
         ("a Windows path", "C:\\\\Users\\\\someone\\\\cut.mov"),     # escaped, as JSON writes it
         ("a Windows path", "D:/Projects/client/cut.mov"),
+        ("a Windows path", "C:/a"),                                    # the shortest a rule matches
         ("a Windows network share", "\\\\NAS01\\footage\\clip.mov"),
+        ("a Windows network share", "\\\\a\\b"),
         ("an email address", "client@agency.com"),
+        ("an email address", "a@b.co"),
+        ("a local network hostname", "a.lan"),
         ("a local network hostname", "studio.local"),
         ("a local network hostname", "render-box.lan"),
         ("a local network hostname", "nas.home.arpa"),
@@ -2259,6 +2299,9 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         ("an IP address", "<Host>10.0.0.5</Host>"),
         ("an IP address", '<Host conversion="192.168.1.20"/>'),     # ends in "version", is not one
         ("an IP address", "<Conversion>192.168.1.20</Conversion>"),
+        ("an IP address", '<PluginVersion host="x>192.168.1.20"/>'),  # a ">" inside quotes ends no tag
+        ("an IP address", "1.2.3.4"),
+        ("an IPv6 address", "1::2"),
         ("an IPv6 address", "fe80::1c2a:3b4d:5e6f:7a8b"),
         ("an IPv6 address", "<Host>2001:db8:85a3::8a2e:370:7334</Host>"),
         ("an IPv6 address", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
@@ -2298,6 +2341,9 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
                   "Timeline.xml", "<TC>01:00:00:00</TC>", "<TC>00:59:58:12</TC>", "std::vector",
                   "Cafe::Bead", "Blur1::Add", "<Note>take 2::3rd pass</Note>", "::1", "fe80::",
                   "<Password/>", "<Password></Password>", "<PasswordHint>x</PasswordHint>",
+                  '<Text name="Secret">Ordinary title</Text>', "<Settings><Password/>default</Settings>",
+                  "<Settings><Password />default</Settings>",
+                  '<PluginVersion note="a>b">16.7.33.189</PluginVersion>',
                   "Look &amp; Feel", "R&amp;D"]
 
     with tempfile.TemporaryDirectory() as td:
@@ -2311,6 +2357,25 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         for i, (kind, sample) in enumerate(plants):
             assert kind in by_member.get("p%02d.xml" % i, set()), \
                 "%s not caught in %r (caught: %r)" % (kind, sample, by_member.get("p%02d.xml" % i))
+
+        # every plant, hex- and base64-encoded ALONE, is caught in the decoded layer:
+        # the run floors answer to the shortest plant, and the plants carry the
+        # shortest leak a rule matches (C:/a, 1::2, a.lan) [Codex 2026-10-31]
+        encoded = os.path.join(td, "ENCODED.drp")
+        with zipfile.ZipFile(encoded, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, (_k, sample) in enumerate(plants):
+                z.writestr("hex%02d.xml" % i, "<B>%s</B>" % sample.encode().hex())
+                z.writestr("b64%02d.xml" % i, "<B>%s</B>" % base64.b64encode(sample.encode()).decode())
+        decoded = {}
+        for m, kind, _s in _scan_drp(encoded):
+            member, layer = m.split(" :: ")
+            if member[:3] + "#" in layer:   # the hit is in the layer that decoder opened
+                decoded.setdefault(member, set()).add(kind)
+        for i, (kind, sample) in enumerate(plants):
+            for enc in ("hex", "b64"):
+                assert kind in decoded.get("%s%02d.xml" % (enc, i), set()), \
+                    "%s not caught in %r encoded as %s alone (caught: %r)" % (
+                        kind, sample, enc, decoded.get("%s%02d.xml" % (enc, i)))
 
         # the lookalikes pass, in plain XML AND where the real ones sit: UTF-16
         # in a zstd frame in a hex blob, and in a zlib stream
@@ -2336,6 +2401,8 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         utf16_b64 = ("<B>%s</B>" % b64).encode("utf-16-le")
         short_zlib = (bytes(44) + zlib.compress(b"/Users/alice")).hex()
         utf16_b64_deep = ((b"\x00" * 44) + zstandard.ZstdCompressor().compress(utf16_b64)).hex()
+        # an entity inside a run: the run exists only in the unescaped view
+        escaped_b64 = "&#%d;%s" % (ord(b64[0]), b64[1:])
         deep = os.path.join(td, "DECODERS.drp")
         with zipfile.ZipFile(deep, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("b64.xml", "<SM_Project><Blob>%s</Blob></SM_Project>" % b64)
@@ -2347,6 +2414,7 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
             z.writestr("short_zlib.xml", "<FieldsBlob>%s</FieldsBlob>" % short_zlib)
             z.writestr("utf16_b64.xml", utf16_b64)
             z.writestr("utf16_b64_deep.xml", "<SM_Project><FieldsBlob>%s</FieldsBlob></SM_Project>" % utf16_b64_deep)
+            z.writestr("escaped_b64.xml", "<B>%s</B>" % escaped_b64)
         homes = {}
         for m, kind, _s in _scan_drp(deep):
             if kind in ("a macOS home path", "a Linux home path"):
@@ -2355,7 +2423,8 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         for member, via in (("b64.xml", "b64#"), ("gzip.xml", "/gzip@"), ("nested.xml", "/b64#0/gzip@"),
                             ("whole.gz", "gzip@0"), ("short_b64.xml", "b64#0"), ("short_hex.xml", "hex#0"),
                             ("short_zlib.xml", "/zlib@44"), ("utf16_b64.xml", "utf16/b64#0"),
-                            ("utf16_b64_deep.xml", "/zstd@44/utf16/b64#0")):
+                            ("utf16_b64_deep.xml", "/zstd@44/utf16/b64#0"),
+                            ("escaped_b64.xml", "unescaped/b64#0")):
             assert homes.get(member), "the scanner cannot see a path in %s: %r" % (member, homes)
             # only the new decoder shows it: no layer without it in its name does
             assert all(via in layer for layer in homes[member]), (member, homes[member])
@@ -2369,10 +2438,12 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         with zipfile.ZipFile(named, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("value.xml", "<Computer>Resolve</Computer>")
             z.writestr("attr.xml", '<Host name="Timeline"/>')
+            z.writestr("padded.xml", "<Computer>\n  Resolve\n</Computer>")   # pretty-printed
+            z.writestr("padded_attr.xml", '<Host name="Resolve "/>')
             z.writestr("prose.xml", "<Note>rendered on edit-bay-07 tonight</Note>")
             z.writestr("words.xml", "<App>DaVinci Resolve 21.1.2</App><Name>Timeline 1</Name>")
         hit_in = lambda pats: {m.split(" :: ")[0] for m, _k, _s in _scan_drp(named, patterns=pats)}  # noqa: E731
-        assert hit_in(word_names) == {"value.xml", "attr.xml"}, hit_in(word_names)
+        assert hit_in(word_names) == {"value.xml", "attr.xml", "padded.xml", "padded_attr.xml"}, hit_in(word_names)
         assert hit_in(odd_name) == {"prose.xml"}, hit_in(odd_name)
         for p in sorted(glob.glob(os.path.join(os.path.dirname(HERE), "templates", "*.drp"))):
             assert _scan_drp(p, patterns=word_names) == [], (p, _scan_drp(p, patterns=word_names))
@@ -2391,6 +2462,13 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
             for _ in range(_MAX_DEPTH):
                 edge = base64.b64encode(edge)
             z.writestr("edge.xml", b"<B>" + edge + b"</B>")
+            # a leak too short to hide another layer, one layer PAST the depth limit, is
+            # still read: only a layer that could nest further is beyond reach [Codex
+            # 2026-10-31: edge.xml's path also shows in its parent, so it could not tell]
+            short_leaf = b"/home/a"
+            for _ in range(_MAX_DEPTH + 1):
+                short_leaf = base64.b64encode(short_leaf)
+            z.writestr("short_leaf.xml", b"<B>" + short_leaf + b"</B>")
             # thousands of short words decode to a few bytes of noise each; they are
             # read, and do not spend the layer budget meant for real nesting
             z.writestr("words.xml", b" ".join(b"Wd%06d" % i for i in range(_MAX_LAYERS + 1000)))
@@ -2398,8 +2476,9 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
         kinds = {m.split(" :: ")[0]: (kind, s) for m, kind, s in hits if kind == "unreadable"}
         assert "nested deeper" in kinds.get("deep.xml", ("", ""))[1], kinds
         assert "decoded layers" in kinds.get("wide.xml", ("", ""))[1], kinds
-        assert "edge.xml" not in kinds and "words.xml" not in kinds, kinds
+        assert "edge.xml" not in kinds and "words.xml" not in kinds and "short_leaf.xml" not in kinds, kinds
         assert any(m.startswith("edge.xml") and k == "a Linux home path" for m, k, _s in hits), hits
+        assert any(m.startswith("short_leaf.xml") and k == "a Linux home path" for m, k, _s in hits), hits
 
 
 def test_the_lockfile_matches_the_project():
@@ -2408,7 +2487,8 @@ def test_the_lockfile_matches_the_project():
     pyproject: a lock left behind by a version bump or a changed requirement
     is stale, and `uv sync --locked` refuses it. This compares the lock's own
     entry for this project with pyproject: version, Python requirement, each
-    requirement (extras, specifier, marker), the dependency edges, the extras.
+    requirement (extras, specifier, marker), the dependency edges by name, the
+    extras. A stale lock is the subject; a hand-edited one is not (see below).
     Red-proof: the lock as it sat untracked on main (root version 0.6.1) fails."""
     try:
         import tomllib
@@ -2467,6 +2547,12 @@ def test_the_lockfile_matches_the_project():
     # and the resolved graph has an edge for each requirement: requires-dist is only
     # what the lock was ASKED, `dependencies` is what it installs [Codex 2026-10-31:
     # deleting the mcp edge passed]
+    # ponytail: edges are compared by NAME. An edge's marker and extras are the
+    # resolver's output, not a copy of requires-dist (oside-blender-mcp's lock forks
+    # numpy on python_full_version, a marker its requires-dist never states), so a
+    # hand-edited edge marker or extra passes here — and passes `uv lock --check` too
+    # (uv 0.12.5, measured 2026-10-31). The lock is uv's to write: re-run `uv lock`,
+    # never hand-edit it; compare edges only by re-resolving
     edges = {norm(d["name"]) for d in entry.get("dependencies", [])}
     assert edges == {r[0] for r in base}, "uv.lock installs %r for %s, pyproject asks for %r — run `uv lock`" % (
         sorted(edges), project["name"], sorted({r[0] for r in base}))
