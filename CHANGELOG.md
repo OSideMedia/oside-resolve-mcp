@@ -23,9 +23,10 @@ home paths and email addresses, and missed the rest:
 - **The real templates carry Waves plugin versions that are valid dotted quads**, so the
   address rule judges the field a quad sits in: a version element or attribute
   (`PluginVersion`, `version="…"`, whitespace allowed) excuses it, `conversion` does not,
-  and a quad inside a longer dotted number is never read. The tag's attributes are read as
-  quoted pairs, so a `>` inside another attribute's value cannot pass for the field's own.
-  Without that the gate blocks the real templates. The IPv6 rule takes the compressed
+  and a quad inside a longer dotted number is never read. The field is read from the tag's
+  own `<`, however long the tag, and from the escaped text, where its quoting is intact;
+  its attributes are read as quoted pairs, so a `>` inside another attribute's value
+  cannot pass for the field's own. Without that the gate blocks the real templates. The IPv6 rule takes the compressed
   forms with two groups or more and wants a decimal digit or three groups, so
   `fdab:cafe::beef` and `2001:db8::` are caught, while a timecode, `Blur1::Add` or
   `Cafe::Bead` is not an address.
@@ -39,13 +40,15 @@ home paths and email addresses, and missed the rest:
   eight bytes is the exception: it cannot hide another, so it is read wherever it sits and
   is not counted against either limit.
 
-A new test plants a leak for every rule, including the shortest each rule matches. A rule
-with no plant of its own fails, checked rule by rule rather than by label, and every plant
-is also hex- and base64-encoded alone and must be caught in the layer the decoder opened.
-The test checks the lookalikes pass in plain XML and inside Resolve's own compressed
-layers, shows each decoder a path only it can reach, and runs the old Windows rule on the
-same path, where it must miss. Main's scanner missed every new plant, and each guard here
-was reverted alone: every revert turns a test red.
+A new test plants a leak for every rule, some as short as any rule matches (four bytes).
+A rule with no plant of its own fails, checked rule by rule rather than by label, and
+every plant is also hex- and base64-encoded alone and must be caught in the layer the
+decoder opened. The test checks the lookalikes pass in plain XML and inside Resolve's own
+compressed layers, shows each decoder a path only it can reach, and runs the old Windows
+rule on the same path, where it must miss. Main's scanner catches 7 of the 39 plants,
+each under a rule it already had (home paths, a volume, email addresses, the escaped
+Windows path, a credential assignment), and misses the rest. Each guard here was reverted
+alone: every revert turns a test red.
 
 ### Added — `uv.lock` (audit 2026-09-12 R-14)
 

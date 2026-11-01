@@ -1856,15 +1856,28 @@ def _ipv4(text):
     (<PluginVersion>16.7.33.189</PluginVersion>, measured 2026-10-31 in
     000_TIMELINES' zlib layer), so each quad is judged by the field it sits in.
     A regex cannot say that: Python's lookbehind is fixed-width, and the
-    whitespace XML allows around `>` and `=` is not."""
+    whitespace XML allows around `>` and `=` is not. The field is read from the
+    last "<" before the quad, however far back: a fixed window cut a long tag's
+    name off and called a version an address [Codex 2026-10-31]. Outside a tag
+    no field excuses a quad.
+
+    It reads XML STRUCTURE, so `_scan_drp` gives it escaped text only
+    (`reads_markup`): unescaping turns an attribute's &quot; into a quote that
+    ends nothing, and a version beside it read as an address [Codex 2026-10-31]."""
     # ponytail: version fields are excused by name; a real address inside one would
     # pass. Parse the XML and excuse by element if that ever matters
     for m in _QUAD.finditer(text):
-        before = text[max(0, m.start() - 200):m.start()]
-        field = _ELEMENT_BEFORE.search(before) or _ATTRIBUTE_BEFORE.search(before)
+        lt = text.rfind("<", 0, m.start())
+        field = lt >= 0 and (_ELEMENT_BEFORE.match(text, lt, m.start())
+                             or _ATTRIBUTE_BEFORE.match(text, lt, m.start()))
         if not (field and _is_version_field(field.group(1))):
             return m.group(0)
     return None
+
+
+# ponytail: escaped text only, so an address written with entity-escaped digits or
+# dots (&#49;92.168.1.20) passes; no XML writer escapes those
+_ipv4.reads_markup = True
 
 
 # An IPv6 address: all eight groups, or one "::" with groups on one side or both, two
@@ -2167,8 +2180,11 @@ def _scan_drp(path, patterns=None):
                     continue
                 # one report per layer and kind: a hit in a text and in its
                 # unescaped view is one leak
-                key = layer[:-len("/unescaped")] if layer.endswith("/unescaped") else layer
+                unescaped = layer.endswith("/unescaped")
+                key = layer[:-len("/unescaped")] if unescaped else layer
                 for rule, kind in patterns:
+                    if unescaped and getattr(rule, "reads_markup", False):
+                        continue  # it judges XML structure, which unescaping breaks (_ipv4)
                     found = _rule_search(rule, text)
                     if found is not None and (key, kind) not in seen:
                         seen.add((key, kind))
@@ -2344,6 +2360,12 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
                   '<Text name="Secret">Ordinary title</Text>', "<Settings><Password/>default</Settings>",
                   "<Settings><Password />default</Settings>",
                   '<PluginVersion note="a>b">16.7.33.189</PluginVersion>',
+                  # an escaped quote in another attribute, and a long tag before the
+                  # version, each called a version an address [Codex 2026-10-31]
+                  '<Plugin note="a&quot;b" version="16.7.33.189"/>',
+                  '<PluginVersion note="a&quot;b">16.7.33.189</PluginVersion>',
+                  '<Plugin note="' + "a" * 210 + '" version="16.7.33.189"/>',
+                  '<PluginVersion note="' + "a" * 210 + '">16.7.33.189</PluginVersion>',
                   "Look &amp; Feel", "R&amp;D"]
 
     with tempfile.TemporaryDirectory() as td:
@@ -2359,8 +2381,8 @@ def test_each_leak_rule_catches_a_planted_leak_and_spares_its_lookalikes():
                 "%s not caught in %r (caught: %r)" % (kind, sample, by_member.get("p%02d.xml" % i))
 
         # every plant, hex- and base64-encoded ALONE, is caught in the decoded layer:
-        # the run floors answer to the shortest plant, and the plants carry the
-        # shortest leak a rule matches (C:/a, 1::2, a.lan) [Codex 2026-10-31]
+        # the run floors answer to the shortest plant, and the plants hold leaks as
+        # short as any rule matches, four bytes (C:/a, 1::2) [Codex 2026-10-31]
         encoded = os.path.join(td, "ENCODED.drp")
         with zipfile.ZipFile(encoded, "w", zipfile.ZIP_DEFLATED) as z:
             for i, (_k, sample) in enumerate(plants):
