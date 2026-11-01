@@ -36,16 +36,18 @@ code and each now held by a test that fails on 0.8.0:
   append (Codex r1, r2: counting it would have refused a plain retry after the editor put
   it back). A move is an item that left its place and reappears with the same name, file,
   length and trim, the file and trim both readable (an unreadable one proves nothing, Codex
-  r4). Any other change under the append counts as a clip laid, a trim
-  included, by decision (Codex r3): a clip laid as an editor deletes one reads exactly like
-  that clip trimmed, and missing a laid clip lets a re-run put back what the editor
-  deleted, while recording a run that laid nothing only refuses a plain retry. That
+  r4). The same goes for an item that reads as not having changed at all: with its file or
+  trim unread it may be a different sound laid where an editor deleted one, so a failed
+  append over it is recorded too (Codex r5). Any other change under the append counts as a
+  clip laid, a trim included, by decision (Codex r3): a clip laid as an editor deletes one
+  reads exactly like that clip trimmed, and missing a laid clip lets a re-run put back what
+  the editor deleted, while recording a run that laid nothing only refuses a plain retry. That
   failure says so and names the way out, `resume=True`. The one case the run cannot see is
-  an exact copy of a clip deleted in the same instant, which reads as that clip moving; it
-  is marked in the code.
+  an exact copy of a clip deleted in the same instant, its file and trim read, which looks
+  like that clip staying put or moving; it is marked in the code.
   The README's advice on `failure.landed` now says how to sort it: the row laid right
   (keep), a moved neighbour (put back), a stray (remove).
-- `tests/redproof_place_sfx.py`: nineteen new mutations, one per guard above; 70 of 70 go red.
+- `tests/redproof_place_sfx.py`: twenty-three new mutations, one per guard above; 74 of 74 go red.
 
 ## 0.8.0 — 2026-10-25
 

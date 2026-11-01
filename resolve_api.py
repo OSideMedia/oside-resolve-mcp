@@ -1362,11 +1362,15 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                                  f"unchecked: {e}"}
             break
         pool = [key(it) for it in before]
-        new = []
+        new, blind = [], False
         for it in after:
             k = key(it)
             if k in pool:
                 pool.remove(k)
+                # an item that reads unchanged is the same clip only by what was
+                # read: with its file or trim unread, it may be a different
+                # sound this run laid where an editor deleted one [Codex r5]
+                blind = blind or it["path"] is None or it["leftOffset"] is None
             else:
                 new.append(it)
         # the new item is the row only if sfx.same_clip says so: right file, frame, length, trim
@@ -1381,8 +1385,9 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
         # retry, and the failure below says to pass resume=True; missing a run
         # that laid something lets a re-run put back a clip the editor deleted.
         # ponytail: an append that lands an exact copy of a clip deleted in the
-        # same instant reads as that clip moving; a per-item id would close it,
-        # and GetUniqueId's stability across reads is unmeasured.
+        # same instant (its file and trim read) reads as that clip staying put
+        # or moving; a per-item id would close it, and GetUniqueId's stability
+        # across reads is unmeasured.
         gone, laid = list(pool), []
         for it in new:
             twin = None
@@ -1394,7 +1399,7 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                 laid.append(it)
             else:
                 gone.remove(twin)
-        wrote = wrote or mine is not None or bool(laid)
+        wrote = wrote or mine is not None or bool(laid) or blind
         if mine is not None:
             # it landed right even if its append also moved something: it is on the track as planned
             placed.append({**_public(r), "placedAt": mine["start"], "laidLength": mine["duration"],
@@ -1405,10 +1410,11 @@ def place_sfx(resolve, project, plan: dict, dry_run: bool = False, resume: bool 
                        "reason": "nothing new on the track" if not new else
                                  "the clip landed somewhere other than its frame, length or trim"
                                  if not pool else "an item already on the track changed under the append"}
-            if pool and laid and mine is None:
-                failure["reason"] += ("; this run counts as having laid a clip, because one it laid cannot be "
-                                      "told from that change. If none of its clips is on the track, finish the "
-                                      "plan with resume=True")
+            if mine is None and ((pool and laid) or blind):
+                cause = ("one it laid cannot be told from that change" if pool and laid else
+                         "an item on the track whose file or trim could not be read may be one it laid")
+                failure["reason"] += (f"; this run counts as having laid a clip, because {cause}. If none of "
+                                      "its clips is on the track, finish the plan with resume=True")
             break
         before = after
 

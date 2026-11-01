@@ -3492,8 +3492,10 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
     track still records nothing, and so does one during which an editor only
     moved a clip already there, proved by its readable file and trim [Codex r1,
     r2, r4 on 0.8.1]. Any other change under the append (a trim, a move that
-    cannot be proved) is recorded by decision [Codex r3], and the failure says
-    how to finish: resume=True, which every cell then proves works."""
+    cannot be proved, an item that reads unchanged only because its file or
+    trim did not read [Codex r5]) is recorded by decision [Codex r3], and the
+    failure says how to finish: resume=True, which every cell then proves
+    works."""
     class Nudge(FakeMediaPool):
         def AppendToTimeline(self, items):
             out = super().AppendToTimeline(items)
@@ -3526,6 +3528,29 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
 
     class PathlessAsOneGoes(NamesakeAsOneGoes):    # the same, and the laid clip's file cannot be read
         decoy_path = None
+
+    class PathlessInItsPlace(PathlessAsOneGoes):
+        """[Codex r5 on 0.8.1] Another library's file of the same name lands
+        exactly where an editor deletes the clip there, with the same length
+        and trim. Neither file reads, so the track reads unchanged: a read
+        that could not see the file proves nothing about it."""
+        def AppendToTimeline(self, items):
+            gone = self._project.GetCurrentTimeline()._tracks[("audio", 3)][0]
+            return super().AppendToTimeline([dict(items[0], recordFrame=gone._s)])
+
+    class TrimUnreadInItsPlace(FakeMediaPool):
+        """[Codex r5 on 0.8.1] This row's own file lands where an editor
+        deletes a clip of it, the same length but another slice of the sound,
+        and neither trim reads."""
+        def AppendToTimeline(self, items):
+            lane = self._project.GetCurrentTimeline()._tracks[("audio", 3)]
+            gone = lane.pop(0)
+            out = super().AppendToTimeline([dict(items[0], recordFrame=gone._s, startFrame=items[0]["startFrame"] + 5,
+                                                 endFrame=items[0]["endFrame"] + 5)])
+            for x in lane:
+                if x._s == gone._s:
+                    x.GetLeftOffset = lambda subframe_precision=False: None
+            return out
 
     class Deaf(FakeMediaPool):          # nothing lands: there is nothing to remember
         def AppendToTimeline(self, items):
@@ -3607,6 +3632,11 @@ def test_place_sfx_records_a_clip_that_landed_when_its_check_failed():
               "finish the plan with resume=True", [], None),
              ("clip with an unread trim moves", DeafWhileItMoves, [("check.wav", 3000, 82, 0)],
               "finish the plan with resume=True", [], "row, trim unread"),
+             # [Codex r5] nor does an item that reads unchanged only because its file or trim did not read
+             ("unreadable namesake in its place", PathlessInItsPlace, [("check.wav", 3000, 82, 0)],
+              "could not be read may be one it laid", [], None),
+             ("another slice in its place, trims unread", TrimUnreadInItsPlace, [("check.wav", 3000, 82, 0)],
+              "could not be read may be one it laid", [], "row, trim unread"),
              ("namesake as its namesake goes", NamesakeAsOneGoes, [("check.wav", 3000, 40, 5)],
               "finish the plan with resume=True", [], "/other/library/check.wav"),
              ("trimmed as nothing lands", TrimmedAsNothingLands, [("check.wav", 3000, 82, 0)],
