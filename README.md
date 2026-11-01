@@ -1,4 +1,4 @@
-[![version](https://img.shields.io/badge/version-0.8.2-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.8.3-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-Studio%2021.1%20(measured)-e8552d)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![platform](https://img.shields.io/badge/platform-MCP%20%7C%20Claude%20Code-8a3ffc)](https://modelcontextprotocol.io)
@@ -466,8 +466,13 @@ appear in the tool's `error` field.
 | `Unknown kind 'X' — templates.json knows …` | the manifest's `kind` has no template; before 2026-09-06 a dry run blessed it and only `create_project` refused | use a listed kind, or add a template (`export_template`) and its `templates.json` row |
 | `manifest.videos must be a list of entries` (also `audio`) | the key holds an object or a string instead of a list | `videos` and `audio` are lists of `{file, bin, …}` entries |
 | `manifest.videos[i] must be an entry object` / `has no `file`` | an entry is a bare string, or lost its `file` key | every entry is `{file, bin, …}` with a relative `file` |
+| `manifest.videos[i].outcome must be text` | a take's outcome is a number or a list — a hand edit; before 2026-10-31 the planner died on a Python error | the studio writes `outcome` as text (`approved`, `pending`, …) or null; fix the value or re-export |
+| `manifest.audio[i].placements must be a list of shot pins` | a VO line's pins are a string or an object instead of a list; before 2026-10-31 the planner died on a Python error | `placements` is a list of `{sceneIndex, shotIndex, videoFile, …}` pins, `[]` for a board-wide line; re-export |
+| `manifest.audio[i].placements[j] must be a pin object` / `manifest.audio[i].placements[j].videoFile must be the pinned shot's package file or null` | a pin is a bare string, or its `videoFile` is a number | each pin is an object; `videoFile` is the shot's relative package file, or null when that shot has no clip |
 | `manifest.cues must be the worklist's filename` (also `textTasks`) | the key holds a list or object instead of a CSV filename — before 2026-09-06 that dropped the whole worklist silently and the gate expected zero markers | point the key at the CSV the studio wrote beside the manifest |
 | `manifest.look must be an object` | the look block is a string or a list — a hand edit | the studio writes `look: {schema, hex, shares, targets, …}`; drop the key or re-export |
+| `manifest.look has no `schema`` | the look block lost its `schema` — a hand edit or another producer; before 2026-10-31 it was read as v1 without a word | re-export from the studio, which writes `schema: oside-look/1` on every look block |
+| `manifest.look.stockIntent must be an object with a `label`` | `stockIntent` is a string or a number; before 2026-10-31 it was dropped as "no stock" without a word | the studio writes `stockIntent: {id, label, balance, note}`, or leaves it out |
 | `manifest.look.schema 'X' is not oside-look/1` | the package carries a newer look block than this MCP reads | update oside-resolve-mcp, or re-export from a studio build that writes v1 |
 | `pipeline crashed before a report could be built: …` | an exception past the manifest load — the report still prints, with the Python error in `error` | read the error; if it names a manifest key, it is a shape this table does not know yet — file it |
 | `Refusing to save 'Untitled Project'` | `save_project` on the default project — it has no location, the call cannot succeed, and headless it blocks indefinitely | `create_project` first; the pipeline always names its project |

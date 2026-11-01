@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.8.3 — 2026-10-31
+
+### Fixed — the audit's smaller findings (audit 2026-09-12 R-3, R-6 to R-10, R-13)
+
+Each fix carries a test that fails on the code before it:
+
+- **The VO length row reads the timeline's own rate (R-6).** It converted a take's
+  seconds at the kind's default rate, which is right only while the timeline happens to
+  match it: a 3.1 s take wants 186 frames on a 60 fps timeline but 74 at the cinematic
+  default, so a take cut to 1.2 s passed. `verify_import` now passes the rate it measures
+  on the timeline, falling back to the project's. The check stays short-only with its
+  2-frame slack: a longer take is Resolve rounding the length when it conforms the file
+  to the timeline, and no take has been seen coming in too long.
+- **The shape check reads one level further in (R-7).** A take's `outcome` that is not
+  text, a VO line's `placements` that is not a list, a pin that is not an object, and a
+  pin's `videoFile` that is neither text nor null each reached the operator as a Python
+  error. Each is now refused with a sentence, and each has a row in the README's error
+  table. The studio's own shapes still load.
+- **A look block with no `schema`, or a `stockIntent` that is not an object, is refused
+  (R-8).** The first was read as `oside-look/1` without a word; the studio writes the
+  schema on every look block, so a missing one is a hand edit or another producer. The
+  second dropped the film-stock marker as "no stock".
+- **A marker names its shot whatever the take's outcome says (R-9).** The naming check
+  recognised the outcome suffix only when it was capitals, `_` or `-`, so
+  `shot 2 · NEEDS WORK TAKE` failed the naming row on a correct build. A marker now names
+  its shot when it is the shot's name from the manifest, or that name and one
+  ` · <outcome> TAKE`. Any outcome text without a `·` in it counts: the outcome is the
+  studio's word, not a list this repo owns, and the studio writes none with a `·`. The
+  shot's name is never guessed from the marker, because shot numbers are free text too:
+  `shot 2 · alt · PENDING TAKE` names shot `2 · alt`, not shot `2`.
+- **The UNKNOWN-is-not-a-pass test runs the runner (R-3).** It searched its own file for
+  the right words. The runner is now `run(tests)`, returning its tally, and the test hands
+  it a pass, an UNKNOWN and a failure and checks each is counted on its own. The printed
+  lines are unchanged, so the `place_sfx` mutation harness still reads them.
+- **R-10, checked: deliberate.** A pins-only package puts VO PINS on A2 because it has no
+  spine lane; lanes are told apart by name, never by slot. The comment now says so.
+- **R-13.** A comment claimed a missing skill shows as a visible skip under pytest. pytest
+  has no UNKNOWN, and a run on 2026-10-31 (pytest 9.1.1, skill absent) failed both cases
+  with and without `CI=1`. The comment now says that.
+
 ## 0.8.2 — 2026-10-31
 
 ### Fixed — the template leak gate saw two of four leak classes (ow-557456, audit 2026-09-12 R-2)

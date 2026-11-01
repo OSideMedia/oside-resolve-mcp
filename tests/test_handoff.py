@@ -1424,6 +1424,52 @@ def test_gate_fails_when_a_shot_marker_names_the_wrong_picture():
     assert by["shot markers"]["pass"] and by["shot marker positions"]["pass"]
 
 
+def test_a_marker_names_its_shot_whatever_the_take_outcome_says():
+    """[audit 2026-09-12 R-9] The marker name carries any outcome but approved
+    ("shot 2 · PENDING TAKE"), and the naming row accepts the shot's name with
+    or without that suffix. It recognised capitals, `_` and `-` only, so an
+    outcome with a space or a digit ("needs work", "take 2") went unrecognised
+    and a CORRECT build failed "shot markers name their own shot". The outcome
+    is the studio's word, not a vocabulary this repo owns, so any text without
+    a "·" is one. Shot
+    numbers are free text too, so the shot's own name comes from the manifest:
+    "2 · alt" is a shot number, not the start of a suffix [Codex 2026-10-31].
+
+    Counterexample: a wrong shot under a suffix still fails, and so does a
+    shot whose number is another's plus " · alt"."""
+    manifest, _base = _fixture()
+    sw = handoff.shot_word(manifest)
+    for outcome in ("pending", "rejected", "needs work", "take 2", "re-shoot", "needs_work", "v2.1 alt", "NG"):
+        v = {"shotNumber": "2A", "outcome": outcome}
+        assert handoff.marker_names_shot(handoff.shot_marker_name(sw, v), f"{sw} 2A"), (outcome, handoff.shot_marker_name(sw, v))
+    assert handoff.marker_names_shot(f"{sw} 2A", f"{sw} 2A")   # a pre-0.6.0 name, no suffix
+    # a shot number holding the separator names that shot, and only that shot
+    alt = handoff.shot_marker_name(sw, {"shotNumber": "2 · alt", "outcome": "pending"})
+    assert alt == f"{sw} 2 · alt · PENDING TAKE", alt
+    assert handoff.marker_names_shot(alt, f"{sw} 2 · alt"), alt
+    assert not handoff.marker_names_shot(alt, f"{sw} 2"), alt
+    # an approved take carries no suffix, even when its number ends in " TAKE"
+    retake = handoff.shot_marker_name(sw, {"shotNumber": "2 · RE TAKE", "outcome": "approved"})
+    assert handoff.marker_names_shot(retake, f"{sw} 2 · RE TAKE"), retake
+    assert not handoff.marker_names_shot(f"{sw} 1A · PENDING TAKE", f"{sw} 2A")
+
+    v1, a1, markers, vo, pins = _good_timeline()
+    shot2 = next(v for v in manifest["videos"] if v["file"].endswith("scene01_shot2.mp4"))
+    for outcome in ("needs work", "take 2"):
+        shot2["outcome"] = outcome
+        named = dict(markers)
+        named[120] = {**markers[120], "name": handoff.shot_marker_name(sw, shot2)}
+        out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, named, vo=vo, pins=pins), cues_expected=False)
+        row = {c["check"]: c for c in out["checks"]}["shot markers name their own shot"]
+        assert row["pass"], (outcome, named[120]["name"], row)
+        # the wrong shot under the same suffix is still caught
+        wrong = dict(named)
+        wrong[120] = {**markers[120], "name": f"{sw} 1A · {outcome.upper()} TAKE"}
+        out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, wrong, vo=vo, pins=pins), cues_expected=False)
+        row = {c["check"]: c for c in out["checks"]}["shot markers name their own shot"]
+        assert not row["pass"] and len(row["mismatched"]) == 1, (outcome, row)
+
+
 def test_gate_does_not_fail_a_build_that_skipped_a_task_by_design():
     """`expected` must mean what the build INTENDED to place. Scoring against
     the raw worklist made a deliberate, correct skip read as a failure."""
@@ -1685,6 +1731,54 @@ def test_the_vo_length_gate_can_actually_fail():
         out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins))
         got = {c["check"]: c for c in out["checks"]}["VO vo02_scene01-shot2_ada.mp3 length"]
         assert got["pass"] is want_pass, (short, got)
+
+
+def test_the_vo_length_row_reads_the_timelines_own_rate():
+    """[audit 2026-09-12 R-6] The length row converted seconds at the kind's
+    default rate (23.976 for a cinematic package), not the rate verify_import
+    measures. On a 60 fps timeline Ada's 3.1 s take wants 186 frames, and the
+    default asked for 74, so a take cut to 1.2 s passed. The short-only test
+    and its slack stay as they are: a longer take is Resolve rounding the
+    length when it conforms the file to the timeline."""
+    manifest, base = _fixture()
+    cues, _ = handoff.load_cues(manifest, base)
+    name = "VO vo02_scene01-shot2_ada.mp3 length"
+
+    def row(placed, fps):
+        v1, a1, markers, vo, pins = _good_timeline()
+        pins[0]["duration"] = placed
+        out = handoff.evaluate_verify(manifest, cues, _observed(v1, a1, markers, vo=vo, pins=pins), fps=fps)
+        return {c["check"]: c for c in out["checks"]}[name]
+
+    # at the measured 60 fps the take wants 186; a 1.2 s take (72 frames) is short
+    short = row(72, 60.0)
+    assert short["expected"] == 186 and short["pass"] is False and short["shortBy"] == 114, short
+    assert short["fps"] == 60.0, short
+    # the full take passes, and so does one within the slack; one past it does not
+    assert row(186, 60.0)["pass"] and row(184, 60.0)["pass"] and not row(183, 60.0)["pass"]
+    # longer still passes: conform rounding, kept one-sided on purpose
+    assert row(190, 60.0)["pass"]
+    # no measured rate: the kind's default, as before
+    fallback = row(74, None)
+    assert fallback["expected"] == 74 and fallback["pass"] and fallback["fps"] == handoff.KIND_FPS["cinematic"]
+
+    # END TO END: verify_import hands the gate the timeline's OWN rate. The
+    # project says 23.976; the built timeline runs at 60, and Ada sits on it at
+    # the 74 frames a 23.976 lay gives her, which is 1.2 s short at 60.
+    project, restore = _fake_resolve()
+    try:
+        assert server.build_timeline(FIXTURE, "EDIT 01")["ok"]
+        tl = project.GetCurrentTimeline()
+        ver = server.verify_import(FIXTURE, "EDIT 01")
+        got = {c["check"]: c for c in ver["checks"]}[name]
+        assert got["pass"] and got["expected"] == 74 and got["fps"] == 23.976, got   # control: rates agree
+        tl._fps = 60
+        ver = server.verify_import(FIXTURE, "EDIT 01")
+        got = {c["check"]: c for c in ver["checks"]}[name]
+        assert got["expected"] == 186 and got["found"] == 74 and got["pass"] is False, got
+        assert ver["overall"] == "FAIL"
+    finally:
+        restore()
 
 
 
@@ -2740,9 +2834,14 @@ def test_a_resolve_without_versions_falls_back_and_says_so():
 # follow a stale sequence.
 #
 # The skill is tracked in another repo (claude-commands), so this repo's CI
-# cannot see it. Unreachable is UNKNOWN, never a pass: under pytest that is a
-# visible skip. Registered as `python3 -m pytest -q tests`, which is the path
-# that matters.
+# cannot see it. Unreachable is UNKNOWN, never a pass. CI runs THIS FILE's
+# runner (`python tests/test_handoff.py`, with CI=1), which counts an UNKNOWN on
+# its own line. Without CI=1 a missing skill is a FAIL that names what to
+# install. claude-commands' run-all-selftests runs the suite as
+# `python3 -m pytest -q tests` on the owner's machine, where the skill is
+# installed; pytest has no UNKNOWN, so there a missing skill is a FAILURE with or
+# without CI=1, never a skip [measured 2026-10-31, pytest 9.1.1: skill absent, 2
+# failed either way; audit 2026-09-12 R-13 caught the old "visible skip" claim].
 # ---------------------------------------------------------------------------
 
 import ast  # noqa: E402
@@ -2972,17 +3071,39 @@ def test_corrupt_manifest_shapes_are_refused_with_a_readme_sentence():
         ("unknown kind (RM-5)", lambda m: m.__setitem__("kind", "documentary"), "Unknown kind 'documentary'"),
         ("look v2 (RM-4)", lambda m: m.__setitem__("look", {"schema": "oside-look/2", "hex": []}), "manifest.look.schema 'oside-look/2' is not oside-look/1"),
         ("look as string", lambda m: m.__setitem__("look", "warm"), "manifest.look must be an object"),
+        # one level further in [audit 2026-09-12 R-7]: each of these reached
+        # the operator as a Python sentence ("'str' object has no attribute
+        # 'get'", "'int' object has no attribute 'strip'") before 0.8.3
+        ("outcome as number (R-7)", lambda m: m["videos"][0].__setitem__("outcome", 3), "manifest.videos[0].outcome must be text"),
+        ("outcome as list (R-7)", lambda m: m["videos"][0].__setitem__("outcome", ["approved"]), "manifest.videos[0].outcome must be text"),
+        ("placements as string (R-7)", lambda m: m["audio"][1].__setitem__("placements", "videos/scene01_shot2.mp4"), "manifest.audio[1].placements must be a list of shot pins"),
+        ("placements as object (R-7)", lambda m: m["audio"][1].__setitem__("placements", {"videoFile": "videos/scene01_shot2.mp4"}), "manifest.audio[1].placements must be a list of shot pins"),
+        ("pin as string (R-7)", lambda m: m["audio"][1].__setitem__("placements", ["videos/scene01_shot2.mp4"]), "manifest.audio[1].placements[0] must be a pin object"),
+        ("pin videoFile as number (R-7)", lambda m: m["audio"][1]["placements"][0].__setitem__("videoFile", 7), "manifest.audio[1].placements[0].videoFile must be the pinned shot's package file or null"),
+        # [audit 2026-09-12 R-8]: both were accepted without a word before 0.8.3
+        ("look without schema (R-8)", lambda m: m.__setitem__("look", {"hex": ["#aa8844"]}), "manifest.look has no `schema`"),
+        ("stockIntent as string (R-8)", lambda m: m.__setitem__("look", {"schema": "oside-look/1", "hex": ["#aa8844"], "stockIntent": "Portra 400"}), "manifest.look.stockIntent must be an object with a `label`"),
     ]
     # the README row each sentence lands in (a row may cover a key family)
     readme_row = {
         "manifest.audio must be a list": "manifest.videos must be a list of entries",
         "manifest.textTasks must be the worklist's filename": "manifest.cues must be the worklist's filename",
+        "manifest.videos[i] has no `file`": "/ `has no `file``",
     }
+
+    def readme_form(s):
+        # README names indices [i] then [j]; the sentence carries real ones
+        names = iter("ij")
+        return re.sub(r"\[\d+\]", lambda _m: f"[{next(names)}]", s)
+
     for label, mutate, expect in cases:
         msg = _refusal(mutate)
         assert expect in msg, f"{label}: {msg!r}"
-        # the README row is keyed on the sentence's stable head (before any quoted value)
-        head = expect.split(" '")[0].split("[0]")[0]
+        # the README row is keyed on the sentence's stable head (before any
+        # quoted value), indices written as README writes them. Cutting at the
+        # first index instead left 'manifest.audio' as the head, which every
+        # row about audio already satisfied.
+        head = readme_form(expect.split(" '")[0])
         head = readme_row.get(head, head)
         assert _readme_has(head), f"{label}: README's error table has no row for {head!r}"
 
@@ -2996,16 +3117,81 @@ def test_shape_check_accepts_the_fixture_and_the_optional_keys_absent():
         server._load_manifest(path)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    # the R-7/R-8 refusals must not fire on what the studio writes: a null
+    # outcome or pin file, an absent or empty pin list, a look with its schema
+    # and no stock, a null stock, and a half-filled stock (read defensively by
+    # stock_intent_note, not refused)
+    look = {"schema": "oside-look/1", "hex": ["#aa8844"]}
+    studio_shapes = [
+        lambda m: m["videos"][0].__setitem__("outcome", None),
+        lambda m: m["videos"][0].pop("outcome"),
+        lambda m: m["audio"][1].__setitem__("placements", None),
+        lambda m: m["audio"][1].pop("placements"),
+        lambda m: m["audio"][1].__setitem__("placements", []),
+        lambda m: m["audio"][1]["placements"][0].__setitem__("videoFile", None),
+        lambda m: m.__setitem__("look", dict(look)),
+        lambda m: m.__setitem__("look", {**look, "stockIntent": None}),
+        lambda m: m.__setitem__("look", {**look, "stockIntent": {}}),
+        lambda m: m.__setitem__("look", {**look, "stockIntent": {"id": "p400", "label": "Portra 400",
+                                                                  "balance": "daylight", "note": "n"}}),
+    ]
+    for n, mutate in enumerate(studio_shapes):
+        path, tmp = _mutated_package(mutate)
+        try:
+            server._load_manifest(path)
+        except rapi.ResolveError as e:
+            raise AssertionError(f"studio shape {n} was refused: {e}") from None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_unknown_is_never_counted_as_a_pass():
-    """RM-2: the runner tallies UNKNOWN on its own line; without CI the skip
-    is a FAIL that names the missing skill."""
-    src = os.path.join(HERE, "test_handoff.py")
-    with open(src, encoding="utf-8") as fh:
-        body = fh.read()
-    assert "unknown (not passes)" in body and "except Unknown as e:" in body
-    assert 'if not os.environ.get("CI")' in body
+    """RM-2, now RUN rather than read (audit 2026-09-12 R-3). The runner gets a
+    pass, an UNKNOWN and a failure and must count each on its own; `_skip` is
+    an UNKNOWN with CI=1 and a FAIL that names what is missing without it."""
+    def ok():
+        pass
+
+    def absent():
+        raise Unknown("the subject is not on this machine")
+
+    def broken():
+        raise AssertionError("red")
+
+    def tally(tests):
+        lines = []
+        got = run(tests, say=lines.append, trace=lambda: None)
+        return got, lines
+
+    got, lines = tally([("ok", ok), ("absent", absent), ("broken", broken)])
+    assert (got["passed"], got["unknown"], got["failed"], got["code"]) == (1, 1, 1, 1), got
+    assert got["summary"] == "1 passed, 1 unknown (not passes), 1 failed — of 3", got
+    assert lines[:3] == ["PASS  ok", "UNKNOWN  absent — the subject is not on this machine", "FAIL  broken"], lines
+
+    # an UNKNOWN alone does not fail the run, and is never folded into the passes
+    got, _ = tally([("ok", ok), ("absent", absent)])
+    assert (got["passed"], got["unknown"], got["failed"], got["code"]) == (1, 1, 0, 0), got
+    assert got["summary"] == "1 passed, 1 unknown (not passes), 0 failed — of 2", got
+
+    saved = os.environ.pop("CI", None)
+    try:
+        # without CI a missing subject FAILS, and says what to install
+        got, _ = tally([("skipped", lambda: _skip("no skill here"))])
+        assert (got["passed"], got["unknown"], got["failed"], got["code"]) == (0, 0, 1, 1), got
+        try:
+            _skip("no skill here")
+        except AssertionError as e:
+            assert "no skill here" in str(e) and "An absent subject is not a green gate" in str(e), e
+        else:
+            raise AssertionError("_skip returned without CI: an absent subject read as a pass")
+        # with CI=1 it is an UNKNOWN, counted as one
+        os.environ["CI"] = "1"
+        got, _ = tally([("skipped", lambda: _skip("no skill here"))])
+        assert (got["passed"], got["unknown"], got["failed"], got["code"]) == (0, 1, 0, 0), got
+    finally:
+        os.environ.pop("CI", None)
+        if saved is not None:
+            os.environ["CI"] = saved
 
 def test_verify_sidecar_keys_every_clip_by_generation_id():
     """step (e): the verdict reaches a file OSIDE can read — one row per clip by
@@ -4421,22 +4607,33 @@ def test_snapshot_timeline_writes_a_new_file_and_never_overwrites():
         w.restore()
 
 
-if __name__ == "__main__":
-    tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
-    failed = 0
-    unknown = 0
+def run(tests, say=print, trace=traceback.print_exc) -> dict:
+    """The self-test runner, as a function so its one rule can be tested by
+    RUNNING it (audit 2026-09-12 R-3): an UNKNOWN is never a pass. The old
+    test of that rule searched this file for three strings, so the pre-RM-2
+    behaviour restored with the strings left in a comment still read 81/81.
+    An UNKNOWN alone does not fail the run — CI has no skill by construction —
+    but it is counted on its own, and the summary never says N/N over one."""
+    failed = unknown = 0
     for name, fn in tests:
         try:
             fn()
-            print(f"PASS  {name}")
+            say(f"PASS  {name}")
         except Unknown as e:
             unknown += 1
-            print(f"UNKNOWN  {name} — {e}")
+            say(f"UNKNOWN  {name} — {e}")
         except Exception:  # noqa: BLE001
             failed += 1
-            print(f"FAIL  {name}")
-            traceback.print_exc()
+            say(f"FAIL  {name}")
+            trace()
     passed = len(tests) - failed - unknown
     # never "N/N" over unknowns: the line says what ran, what could not, what broke
-    print(f"\n{passed} passed, {unknown} unknown (not passes), {failed} failed — of {len(tests)}")
-    sys.exit(1 if failed else 0)
+    summary = f"{passed} passed, {unknown} unknown (not passes), {failed} failed — of {len(tests)}"
+    say(f"\n{summary}")
+    return {"passed": passed, "unknown": unknown, "failed": failed, "summary": summary,
+            "code": 1 if failed else 0}
+
+
+if __name__ == "__main__":
+    sys.exit(run([(n, f) for n, f in sorted(globals().items())
+                  if n.startswith("test_") and callable(f)])["code"])

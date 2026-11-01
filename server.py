@@ -137,8 +137,9 @@ def _check_shape(manifest: dict) -> None:
     handoff.py:405; a wrong-TYPE `cues` value silently lost the whole worklist
     while a missing file warned loudly; `kind: documentary` rehearsed green in
     a dry run and was refused only by create_project; `oside-look/2` was
-    consumed as v1 without a word. Every sentence here has a row in README's
-    error table."""
+    consumed as v1 without a word. Audit 2026-09-12 R-7/R-8 took it one level
+    further in (a VO line's pins, a take's outcome, a schema-less look, a bare
+    stockIntent). Every sentence here has a row in README's error table."""
     project = manifest.get("project")
     if project is not None and not isinstance(project, dict):
         raise rapi.ResolveError(
@@ -167,6 +168,40 @@ def _check_shape(manifest: dict) -> None:
                 )
             if not isinstance(e.get("file"), str) or not e.get("file"):
                 raise rapi.ResolveError(f"manifest.{key}[{i}] has no `file` — every entry names its package file.")
+            # One level further in, where the planner and the gate read without
+            # a guard: a wrong-typed outcome died on `.strip`, a pin list that
+            # was a string or held a string died on `.get` — RM-3's Python
+            # sentence again, on four shapes [audit 2026-09-12 R-7]. The studio
+            # writes outcome as text, placements as a list of objects and
+            # videoFile as text or null; anything else is refused here.
+            if key == "videos":
+                outcome = e.get("outcome")
+                if outcome is not None and not isinstance(outcome, str):
+                    raise rapi.ResolveError(
+                        f"manifest.videos[{i}].outcome must be text, such as 'approved', or null "
+                        f"(got {type(outcome).__name__})."
+                    )
+                continue
+            pins = e.get("placements")
+            if pins is None:
+                continue
+            if not isinstance(pins, list):
+                raise rapi.ResolveError(
+                    f"manifest.audio[{i}].placements must be a list of shot pins (got {type(pins).__name__}) — "
+                    "re-export the package from the studio."
+                )
+            for j, p in enumerate(pins):
+                if not isinstance(p, dict):
+                    raise rapi.ResolveError(
+                        f"manifest.audio[{i}].placements[{j}] must be a pin object with a `videoFile` "
+                        f"(got {type(p).__name__})."
+                    )
+                vf = p.get("videoFile")
+                if vf is not None and not isinstance(vf, str):
+                    raise rapi.ResolveError(
+                        f"manifest.audio[{i}].placements[{j}].videoFile must be the pinned shot's package "
+                        f"file or null (got {type(vf).__name__})."
+                    )
     for key in ("cues", "textTasks"):
         v = manifest.get(key)
         if v is not None and not isinstance(v, str):
@@ -179,10 +214,30 @@ def _check_shape(manifest: dict) -> None:
         if not isinstance(look, dict):
             raise rapi.ResolveError(f"manifest.look must be an object (got {type(look).__name__}).")
         schema = look.get("schema")
-        if schema is not None and schema != handoff.LOOK_SCHEMA:
+        # A look with NO schema was consumed as v1 — the class RM-4 closed for
+        # `oside-look/2`, left open by the `is not None` [audit 2026-09-12
+        # R-8]. The studio has written `schema: 'oside-look/1'` on every look
+        # block since its first one (lib/export/lookBlock.ts, 2026-08-16), so a
+        # missing schema is a hand edit or another producer, and the version is
+        # not guessed.
+        if schema is None:
+            raise rapi.ResolveError(
+                f"manifest.look has no `schema` — this MCP reads {handoff.LOOK_SCHEMA} only and will "
+                "not guess a look's version; re-export from the studio."
+            )
+        if schema != handoff.LOOK_SCHEMA:
             raise rapi.ResolveError(
                 f"manifest.look.schema {schema!r} is not {handoff.LOOK_SCHEMA} — this MCP reads "
                 f"{handoff.LOOK_SCHEMA} only; update oside-resolve-mcp or re-export."
+            )
+        # stockIntent is additive and may be absent or half-filled (read
+        # defensively by stock_intent_note); a non-object was swallowed as "no
+        # stock" without a word [audit 2026-09-12 R-8].
+        intent = look.get("stockIntent")
+        if intent is not None and not isinstance(intent, dict):
+            raise rapi.ResolveError(
+                f"manifest.look.stockIntent must be an object with a `label` (got {type(intent).__name__}) — "
+                "a bare value would drop the film-stock marker silently."
             )
 
 
@@ -599,7 +654,10 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             # actually needs it) so that VO always precedes VO PINS in the track
             # order: lazy creation would put whichever door the manifest happens
             # to list first at A2, and an editor should not have to guess which
-            # lane is which from package to package.
+            # lane is which from package to package. A2 is not reserved for VO: a
+            # pins-only package has no spine lane, so VO PINS takes A2 by design.
+            # Lanes are told apart by NAME, never by slot (audit 2026-09-12 R-10,
+            # checked: deliberate).
             has_head = any(p["recordFrame"] is None for p in placements)
             vo_track = rapi.ensure_vo_track(timeline) if has_head else None
             vo_report = rapi.append_audio(media_pool, timeline, placements, vo_track)
@@ -726,7 +784,7 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
         # the build intended to place" rather than "how many lines the CSV holds".
         # Scoring against the raw worklist made the gate FAIL builds that had
         # correctly refused to put a marker on the wrong shot [audit 2026-08-24].
-        planned_cues = planned_tasks = None
+        planned_cues = planned_tasks = tl_fps = None
         if tl_observed:
             landed = {it["name"]: it["start"] for it in tl_observed["v1"]}
             lengths = {it["name"]: it["duration"] for it in tl_observed["v1"]}
@@ -737,11 +795,20 @@ def verify_import(manifest_path: str, timeline_name: str | None = None, cues: bo
             planned_cues = handoff.cue_rows(manifest, cue_list, landed, lengths, fps)
             planned_tasks = handoff.text_task_rows(manifest, task_list, planned_cues,
                                                   landed, lengths)
+            # The VO length row converts seconds at the rate the takes actually
+            # sit in: the timeline's own, which falls back to the project's.
+            # The cue rows above keep the project rate, because that is the rate
+            # the build planned them at [audit 2026-09-12 R-6].
+            try:
+                tl_fps = rapi.timeline_fps(project, timeline)
+            except rapi.ResolveError:
+                tl_fps = fps
         result = handoff.evaluate_verify(
             manifest, cue_list, observed, cues_expected=cues, text_tasks=task_list,
             planned_cues=planned_cues, planned_text_tasks=planned_tasks,
             stock_intent=handoff.stock_intent_note(manifest),
             sidecar_warnings=[w for w in (cue_warn, task_warn) if w],
+            fps=tl_fps,
         )
         # step (e): the verdict is WRITTEN beside the manifest, per clip by
         # generationId, so OSIDE's build door can read it back onto the row.

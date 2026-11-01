@@ -300,11 +300,22 @@ def shot_marker_name(sw: str, v: dict) -> str:
     return base + (f" · {outcome.upper()} TAKE" if outcome and outcome != "approved" else "")
 
 
-def base_marker_name(name: str) -> str:
-    """A marker name without its outcome suffix — the naming CONTRACT compares
-    the base ("shot 2"), so a timeline built before 0.6.0 (no suffix) and one
-    built after ("shot 2 · PENDING TAKE") both name their own shot."""
-    return re.sub(r"\s·\s[A-Z_-]+ TAKE$", "", name or "")
+def marker_names_shot(name: str, base: str) -> bool:
+    """Does a marker named `name` name the shot whose base name is `base`
+    ("shot 2")? The naming CONTRACT is the base: a timeline built before 0.6.0
+    (no suffix), an approved take, and one built after ("shot 2 · PENDING
+    TAKE") all name their own shot. So the name is the base, or the base and
+    ONE outcome suffix, " · <outcome> TAKE".
+
+    The outcome is the studio's word, not a vocabulary this repo owns, so any
+    text is one: capitals, `_` and `-` only left "shot 2 · NEEDS WORK TAKE"
+    unrecognised, and a correct build failed the naming row [audit 2026-09-12
+    R-9]. The base comes from the manifest and is never guessed from the name:
+    shot numbers are free text, and cutting at the first " · " failed a correct
+    "shot 2 · alt · PENDING TAKE" and passed it for shot 2 [Codex 2026-10-31].
+    An outcome holding "·" fails the row; the studio writes none."""
+    name = name or ""
+    return name == base or re.fullmatch(re.escape(base) + r"\s·\s[^·]+ TAKE", name) is not None
 
 
 def no_frame_reason(vf: str | None, starts_by_file: dict, start) -> str:
@@ -675,7 +686,7 @@ def _placeable(rows: list | None) -> int | None:
 def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: bool = True,
                     text_tasks: list | None = None, planned_cues: list | None = None,
                     planned_text_tasks: list | None = None, stock_intent: str | None = None,
-                    sidecar_warnings: list | None = None) -> dict:
+                    sidecar_warnings: list | None = None, fps: float | None = None) -> dict:
     """The acceptance gate. observed:
         {"binVideos": set|None, "binAudio": set|None,
          "timeline": {"name", "v1": [{"name","start","duration"}],
@@ -684,6 +695,8 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
                       "markers": {frame: {...}}} | None}
     VO takes are looked for on EVERY audio track (`audioTracks`; `a1` alone
     for older observations) and each VO row names the track the take sits on.
+    `fps` is the timeline's measured rate, which the VO length row converts
+    seconds at; None falls back to the kind's default (KIND_FPS).
     Returns {"checks": [{check, expected, found, pass, ...}], "overall", "report"}
     — `report` is the pre-v2 shape, kept for callers that read it.
     """
@@ -806,12 +819,19 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
             # 74) — hence the slack, the one-sided test (short only; longer is
             # conform rounding), and pinned-only (an unpinned take is MEANT to
             # slide, and its length is nobody's contract).
+            #
+            # The length is in TIMELINE frames, so the seconds convert at the rate
+            # the timeline actually runs at, measured by verify_import. The kind's
+            # default rate was only right while the timeline happened to match it:
+            # a 3.1 s take wants 186 frames on a 60 fps timeline but 74 at the
+            # cinematic default, so a take cut to 1.2 s passed [audit 2026-09-12 R-6].
             if pinned and delta == 0 and placed_frames is not None:
-                want = seconds_to_clip_frames(a.get("durationSeconds"), kind_fps(manifest))
+                rate = float(fps) if fps else kind_fps(manifest)
+                want = seconds_to_clip_frames(a.get("durationSeconds"), rate)
                 if want is not None:
                     short_by = want - int(placed_frames)
                     check(f"VO {fname} length", want, int(placed_frames),
-                          short_by <= VO_LENGTH_SLACK, shortBy=short_by, track=track,
+                          short_by <= VO_LENGTH_SLACK, shortBy=short_by, track=track, fps=rate,
                           rule=f"a pinned take on its own frame may not be over {VO_LENGTH_SLACK} frames short")
 
     shot_frames = sorted(f for f, m in markers.items() if _is_shot_marker(m))
@@ -848,7 +868,7 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
               if (m.get("customData") or "") == SHOT_TAG}
     mismatched = sorted(
         f"frame {f}: expected {want!r}, found {tagged.get(f, '(no marker)')!r}"
-        for f, want in expected_named.items() if f in tagged and base_marker_name(tagged[f]) != want
+        for f, want in expected_named.items() if f in tagged and not marker_names_shot(tagged[f], want)
     )
     check("shot markers name their own shot", expected_named, tagged, not mismatched,
           mismatched=mismatched,
