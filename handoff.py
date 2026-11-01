@@ -300,16 +300,22 @@ def shot_marker_name(sw: str, v: dict) -> str:
     return base + (f" · {outcome.upper()} TAKE" if outcome and outcome != "approved" else "")
 
 
-def base_marker_name(name: str) -> str:
-    """A marker name without its outcome suffix — the naming CONTRACT compares
-    the base ("shot 2"), so a timeline built before 0.6.0 (no suffix) and one
-    built after ("shot 2 · PENDING TAKE") both name their own shot.
+def marker_names_shot(name: str, base: str) -> bool:
+    """Does a marker named `name` name the shot whose base name is `base`
+    ("shot 2")? The naming CONTRACT is the base: a timeline built before 0.6.0
+    (no suffix), an approved take, and one built after ("shot 2 · PENDING
+    TAKE") all name their own shot. So the name is the base, or the base and
+    ONE outcome suffix, " · <outcome> TAKE".
 
-    The suffix is cut from the first " · " whatever the outcome says: it is the
-    studio's word, not a vocabulary this repo owns. Capitals, `_` and `-` only
-    left "shot 2 · NEEDS WORK TAKE" whole, and a correct build failed the
-    naming row [audit 2026-09-12 R-9]."""
-    return re.sub(r"\s·\s.+ TAKE$", "", name or "")
+    The outcome is the studio's word, not a vocabulary this repo owns, so any
+    text is one: capitals, `_` and `-` only left "shot 2 · NEEDS WORK TAKE"
+    unrecognised, and a correct build failed the naming row [audit 2026-09-12
+    R-9]. The base comes from the manifest and is never guessed from the name:
+    shot numbers are free text, and cutting at the first " · " failed a correct
+    "shot 2 · alt · PENDING TAKE" and passed it for shot 2 [Codex 2026-10-31].
+    An outcome holding "·" fails the row; the studio writes none."""
+    name = name or ""
+    return name == base or re.fullmatch(re.escape(base) + r"\s·\s[^·]+ TAKE", name) is not None
 
 
 def no_frame_reason(vf: str | None, starts_by_file: dict, start) -> str:
@@ -862,7 +868,7 @@ def evaluate_verify(manifest: dict, cues: list, observed: dict, cues_expected: b
               if (m.get("customData") or "") == SHOT_TAG}
     mismatched = sorted(
         f"frame {f}: expected {want!r}, found {tagged.get(f, '(no marker)')!r}"
-        for f, want in expected_named.items() if f in tagged and base_marker_name(tagged[f]) != want
+        for f, want in expected_named.items() if f in tagged and not marker_names_shot(tagged[f], want)
     )
     check("shot markers name their own shot", expected_named, tagged, not mismatched,
           mismatched=mismatched,

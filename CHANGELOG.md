@@ -23,10 +23,12 @@ Each fix carries a test that fails on the code before it:
   schema on every look block, so a missing one is a hand edit or another producer. The
   second dropped the film-stock marker as "no stock".
 - **A marker names its shot whatever the take's outcome says (R-9).** The naming check
-  cut the outcome suffix only when it was capitals, `_` or `-`, so
-  `shot 2 · NEEDS WORK TAKE` stayed whole and a correct build failed the naming row. The
-  suffix is now cut at the first ` · `: the outcome is the studio's word, not a list this
-  repo owns.
+  recognised the outcome suffix only when it was capitals, `_` or `-`, so
+  `shot 2 · NEEDS WORK TAKE` failed the naming row on a correct build. A marker now names
+  its shot when it is the shot's name from the manifest, or that name and one
+  ` · <outcome> TAKE`, whatever the outcome says: it is the studio's word, not a list this
+  repo owns. The shot's name is never guessed from the marker, because shot numbers are
+  free text too: `shot 2 · alt · PENDING TAKE` names shot `2 · alt`, not shot `2`.
 - **The UNKNOWN-is-not-a-pass test runs the runner (R-3).** It searched its own file for
   the right words. The runner is now `run(tests)`, returning its tally, and the test hands
   it a pass, an UNKNOWN and a failure and checks each is counted on its own. The printed

@@ -1430,15 +1430,27 @@ def test_a_marker_names_its_shot_whatever_the_take_outcome_says():
     compares. The stripper took capitals, `_` and `-` only, so an outcome with a
     space or a digit ("needs work", "take 2") left the suffix on and a CORRECT
     build failed "shot markers name their own shot". The outcome is the
-    studio's word, not a vocabulary this repo owns, so any text strips.
+    studio's word, not a vocabulary this repo owns, so any text is one. Shot
+    numbers are free text too, so the shot's own name comes from the manifest:
+    "2 · alt" is a shot number, not the start of a suffix [Codex 2026-10-31].
 
-    Counterexample: a wrong shot under a suffix still fails."""
+    Counterexample: a wrong shot under a suffix still fails, and so does a
+    shot whose number is another's plus " · alt"."""
     manifest, _base = _fixture()
     sw = handoff.shot_word(manifest)
     for outcome in ("pending", "rejected", "needs work", "take 2", "re-shoot", "needs_work", "v2.1 alt", "NG"):
         v = {"shotNumber": "2A", "outcome": outcome}
-        assert handoff.base_marker_name(handoff.shot_marker_name(sw, v)) == f"{sw} 2A", (outcome, handoff.shot_marker_name(sw, v))
-    assert handoff.base_marker_name(f"{sw} 2A") == f"{sw} 2A"   # a pre-0.6.0 name, no suffix
+        assert handoff.marker_names_shot(handoff.shot_marker_name(sw, v), f"{sw} 2A"), (outcome, handoff.shot_marker_name(sw, v))
+    assert handoff.marker_names_shot(f"{sw} 2A", f"{sw} 2A")   # a pre-0.6.0 name, no suffix
+    # a shot number holding the separator names that shot, and only that shot
+    alt = handoff.shot_marker_name(sw, {"shotNumber": "2 · alt", "outcome": "pending"})
+    assert alt == f"{sw} 2 · alt · PENDING TAKE", alt
+    assert handoff.marker_names_shot(alt, f"{sw} 2 · alt"), alt
+    assert not handoff.marker_names_shot(alt, f"{sw} 2"), alt
+    # an approved take carries no suffix, even when its number ends in " TAKE"
+    retake = handoff.shot_marker_name(sw, {"shotNumber": "2 · RE TAKE", "outcome": "approved"})
+    assert handoff.marker_names_shot(retake, f"{sw} 2 · RE TAKE"), retake
+    assert not handoff.marker_names_shot(f"{sw} 1A · PENDING TAKE", f"{sw} 2A")
 
     v1, a1, markers, vo, pins = _good_timeline()
     shot2 = next(v for v in manifest["videos"] if v["file"].endswith("scene01_shot2.mp4"))
