@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.3 — 2026-10-31
+
 ### Fixed — the audit's smaller findings (audit 2026-09-12 R-3, R-6 to R-10, R-13)
 
 Each fix carries a test that fails on the code before it:
@@ -39,6 +41,68 @@ Each fix carries a test that fails on the code before it:
 - **R-13.** A comment claimed a missing skill shows as a visible skip under pytest. pytest
   has no UNKNOWN, and a run on 2026-10-31 (pytest 9.1.1, skill absent) failed both cases
   with and without `CI=1`. The comment now says that.
+
+## 0.8.2 — 2026-10-31
+
+### Fixed — the template leak gate saw two of four leak classes (ow-557456, audit 2026-09-12 R-2)
+
+The gate that keeps the operator's machine out of the published `.drp` templates caught
+home paths and email addresses, and missed the rest:
+
+- **Windows paths.** The rule demanded two literal backslashes, so a real
+  `C:\Users\someone` passed. It now takes one or two, or a forward slash, and network
+  shares (`\\server\share`) get their own rule.
+- **New rules:** local network hostnames (`.lan`, `.home`, `.internal`, `.localdomain`,
+  `.home.arpa` beside `.local`), IP addresses (IPv4 and IPv6), the names macOS and Windows
+  give a computer out of the box (`Someone's MacBook Pro`, `DESKTOP-XXXXXXX`, lowercased
+  too), and the name of the machine running the test. A machine name that is a plain word
+  is matched only as a whole value (whitespace around it allowed), so a machine called
+  `Resolve` does not block the templates. The credential rule also reads an XML element
+  named for one and holding a value (`<Password>…</Password>`), not only an assignment;
+  an empty or self-closing element, or the keyword as an attribute's value, is not one.
+- **The real templates carry Waves plugin versions that are valid dotted quads**, so the
+  address rule judges the field a quad sits in: a version element or attribute
+  (`PluginVersion`, `version="…"`, whitespace allowed) excuses it, `conversion` does not,
+  and a quad inside a longer dotted number is never read. The field is read from the last
+  `<` before the quad, however long the tag, and from the escaped text, where its quoting
+  is intact. A `>` inside quotes does not end a tag, so a `>` inside another attribute's
+  value cannot pass for a version element. A `version="…"` pair counts wherever it is
+  written: in a tag, in text, in CDATA or a comment. Without that the gate blocks the
+  real templates. The IPv6 rule takes the compressed
+  forms with two groups or more and wants a decimal digit or three groups, so
+  `fdab:cafe::beef` and `2001:db8::` are caught, while a timecode, `Blur1::Add` or
+  `Cafe::Bead` is not an address.
+- **Every decoder now runs on every layer.** base64 and gzip join hex, zstd and zlib,
+  nested up to six layers. Each layer is read as UTF-8 and UTF-16, each also
+  XML-unescaped, and the text decoders read every one of those views. A run of eight
+  characters is decoded, base64 counted with its padding: the shortest leak a rule matches
+  is four bytes (`C:/a`). Unpadded base64 of four or five bytes is the one short form
+  left unread. A zlib stream that reaches its end is kept however short. Past six layers,
+  or past 5000 decoded layers, the member reads UNREADABLE, never clean. A layer under
+  eight bytes is the exception: it cannot hide another, so it is read wherever it sits and
+  is not counted against either limit.
+
+A new test plants a leak for every rule, some as short as any rule matches (four bytes).
+A rule with no plant of its own fails, checked rule by rule rather than by label, and
+every plant is also hex- and base64-encoded alone and must be caught in the layer the
+decoder opened. The test checks the lookalikes pass in plain XML and inside Resolve's own
+compressed layers, shows each decoder a path only it can reach, and runs the old Windows
+rule on the same path, where it must miss. Main's scanner catches 8 of the 40 plants,
+each under a rule it already had (home paths, a volume, email addresses, the escaped
+Windows path, a `.local` name, a credential assignment), and misses the rest. Each guard here was reverted
+alone: every revert turns a test red.
+
+### Added — `uv.lock` (audit 2026-09-12 R-14)
+
+Installs now resolve the same package versions every time: `uv sync --locked`. The
+lockfile was checked by hand before it was committed and is refreshed here only for the
+project's own version. `test_the_lockfile_matches_the_project` catches a stale lock, one
+left behind by a change to `pyproject.toml`. It holds the lock's entry to the version, the
+Python requirement, every requirement with its extras, specifier (the `mcp<2` pin) and
+marker, the names of the dependency edges the lock installs, and the extras it provides.
+It caught the 0.8.1 bump the first time main moved under it. A hand-edited edge marker
+or extra passes it, as it passes `uv lock --check` (uv 0.12.5): uv writes the lock, so
+re-run `uv lock`, never edit it.
 
 ## 0.8.1 — 2026-10-31
 
