@@ -14,6 +14,10 @@ each shot, narration laid on its own audio lanes at the right frames, an
 optional colour balance on every clip — and an **acceptance gate** that reports
 `PASS` or `FAIL` per check rather than assuming any of it worked.
 
+Once you are editing, it does one more job: it lays a spotted **sound-effects
+pass** onto a track of the timeline you already have, and proves nothing else
+on that timeline moved.
+
 ## What it does
 
 - **Builds the project** from your own `.drp` template, so settings and the bin
@@ -29,6 +33,11 @@ optional colour balance on every clip — and an **acceptance gate** that report
 - **Verifies the result and can fail.** Clip order, stray clips, every pinned
   take on its frame at zero tolerance, a marker per shot naming its own shot.
   A build that went wrong is reported as `FAIL`, not as success.
+- **Lays a spotted SFX pass** onto one existing audio track of the timeline you
+  are editing (`place_sfx`, the second recipe). Every collision is judged before
+  the first clip is laid, every clip is re-read after it lands, and an export
+  before and after proves no other track moved. A ledger beside the plan stops a
+  pass you deleted from coming back on a re-run.
 
 It **never deletes, never overwrites, and never renders.** An existing project
 or timeline name is a hard refusal.
@@ -388,9 +397,12 @@ every file into `missing where:"bin"`.
 
 Drives the dry run against `tests/fixtures/pkg` (a fixture package with empty
 media files) and the whole build → verify path against a fake Resolve. The
-fake reproduces two behaviours measured on Resolve 21.0.4.5: a video clip
-with embedded audio also fills A1, and a clip-info append aimed at an
-occupied frame answers a truthy `[<PyRemoteObject>]` while placing nothing.
+fake follows Blackmagic's documented contract and reproduces the behaviours
+measured on Resolve: a video clip with embedded audio also fills A1, and a
+clip-info append aimed at an occupied frame answers a truthy
+`[<PyRemoteObject>]` while placing nothing (21.0.4.5), or, on a plain audio
+track, lays the clip at the track's tail (21.1). `tests/redproof_place_sfx.py`
+(not in CI) removes each `place_sfx` guard in turn and checks a test goes red.
 `OSIDE_RESOLVE_OFFLINE=1` (set by the test module) keeps the offline cases
 offline even with a real Resolve running.
 
@@ -431,6 +443,16 @@ Claude: resolve_status()                          ← preconditions + capabiliti
   there and headless it blocks forever rather than returning.
 - Manifest entries may not be absolute, may not resolve outside the package, and
   may not share a clip name (Resolve matches clips by basename alone).
+- `place_sfx` lays into the open project's current timeline only, on one
+  existing track. Files the pool lacks are imported into the plan's existing
+  bin; files already in the pool are used where they are. It never creates
+  tracks or bins, refuses a row that would run past the timeline's end, never
+  saves, and never deletes a clip it laid wrong: a clip Resolve put somewhere
+  else (its tail included) is left there and reported. The one file it keeps
+  outside Resolve is the plan's ledger, `<plan>.placed.json`, beside the plan;
+  the before and after exports go to a temporary folder (`oside-sfx-*`) that is
+  removed as soon as they are read, on a best-effort basis: a removal that fails
+  is not reported.
 - stdio transport only; nothing listens on the network.
 
 ## Known errors

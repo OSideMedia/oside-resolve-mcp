@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- README: the overview and the guardrails now cover the second recipe
+  (`place_sfx`), which they had left out since 0.7.0. The self-test section names
+  the 21.1 tail mode the fake reproduces, and the `place_sfx` mutation harness.
+
 ## 0.8.3 — 2026-10-31
 
 ### Fixed — the audit's smaller findings (audit 2026-09-12 R-3, R-6 to R-10, R-13)
