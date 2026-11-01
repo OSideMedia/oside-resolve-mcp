@@ -654,7 +654,10 @@ def build_timeline(manifest_path: str, timeline_name: str = "EDIT 01",
             # actually needs it) so that VO always precedes VO PINS in the track
             # order: lazy creation would put whichever door the manifest happens
             # to list first at A2, and an editor should not have to guess which
-            # lane is which from package to package.
+            # lane is which from package to package. A2 is not reserved for VO: a
+            # pins-only package has no spine lane, so VO PINS takes A2 by design.
+            # Lanes are told apart by NAME, never by slot (audit 2026-09-12 R-10,
+            # checked: deliberate).
             has_head = any(p["recordFrame"] is None for p in placements)
             vo_track = rapi.ensure_vo_track(timeline) if has_head else None
             vo_report = rapi.append_audio(media_pool, timeline, placements, vo_track)

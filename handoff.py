@@ -303,8 +303,13 @@ def shot_marker_name(sw: str, v: dict) -> str:
 def base_marker_name(name: str) -> str:
     """A marker name without its outcome suffix — the naming CONTRACT compares
     the base ("shot 2"), so a timeline built before 0.6.0 (no suffix) and one
-    built after ("shot 2 · PENDING TAKE") both name their own shot."""
-    return re.sub(r"\s·\s[A-Z_-]+ TAKE$", "", name or "")
+    built after ("shot 2 · PENDING TAKE") both name their own shot.
+
+    The suffix is cut from the first " · " whatever the outcome says: it is the
+    studio's word, not a vocabulary this repo owns. Capitals, `_` and `-` only
+    left "shot 2 · NEEDS WORK TAKE" whole, and a correct build failed the
+    naming row [audit 2026-09-12 R-9]."""
+    return re.sub(r"\s·\s.+ TAKE$", "", name or "")
 
 
 def no_frame_reason(vf: str | None, starts_by_file: dict, start) -> str:

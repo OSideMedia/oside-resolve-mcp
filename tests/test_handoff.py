@@ -1424,6 +1424,39 @@ def test_gate_fails_when_a_shot_marker_names_the_wrong_picture():
     assert by["shot markers"]["pass"] and by["shot marker positions"]["pass"]
 
 
+def test_a_marker_names_its_shot_whatever_the_take_outcome_says():
+    """[audit 2026-09-12 R-9] The marker name carries any outcome but approved
+    ("shot 2 · PENDING TAKE"), and the naming row strips that suffix before it
+    compares. The stripper took capitals, `_` and `-` only, so an outcome with a
+    space or a digit ("needs work", "take 2") left the suffix on and a CORRECT
+    build failed "shot markers name their own shot". The outcome is the
+    studio's word, not a vocabulary this repo owns, so any text strips.
+
+    Counterexample: a wrong shot under a suffix still fails."""
+    manifest, _base = _fixture()
+    sw = handoff.shot_word(manifest)
+    for outcome in ("pending", "rejected", "needs work", "take 2", "re-shoot", "needs_work", "v2.1 alt", "NG"):
+        v = {"shotNumber": "2A", "outcome": outcome}
+        assert handoff.base_marker_name(handoff.shot_marker_name(sw, v)) == f"{sw} 2A", (outcome, handoff.shot_marker_name(sw, v))
+    assert handoff.base_marker_name(f"{sw} 2A") == f"{sw} 2A"   # a pre-0.6.0 name, no suffix
+
+    v1, a1, markers, vo, pins = _good_timeline()
+    shot2 = next(v for v in manifest["videos"] if v["file"].endswith("scene01_shot2.mp4"))
+    for outcome in ("needs work", "take 2"):
+        shot2["outcome"] = outcome
+        named = dict(markers)
+        named[120] = {**markers[120], "name": handoff.shot_marker_name(sw, shot2)}
+        out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, named, vo=vo, pins=pins), cues_expected=False)
+        row = {c["check"]: c for c in out["checks"]}["shot markers name their own shot"]
+        assert row["pass"], (outcome, named[120]["name"], row)
+        # the wrong shot under the same suffix is still caught
+        wrong = dict(named)
+        wrong[120] = {**markers[120], "name": f"{sw} 1A · {outcome.upper()} TAKE"}
+        out = handoff.evaluate_verify(manifest, [], _observed(v1, a1, wrong, vo=vo, pins=pins), cues_expected=False)
+        row = {c["check"]: c for c in out["checks"]}["shot markers name their own shot"]
+        assert not row["pass"] and len(row["mismatched"]) == 1, (outcome, row)
+
+
 def test_gate_does_not_fail_a_build_that_skipped_a_task_by_design():
     """`expected` must mean what the build INTENDED to place. Scoring against
     the raw worklist made a deliberate, correct skip read as a failure."""
