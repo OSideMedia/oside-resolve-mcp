@@ -1,0 +1,31 @@
+# /building reads this file; nothing in this repo does. With no file here, /building already draws
+# the whole repo as one floor, F1 "Whole repo"; this keeps that floor as it is and adds a key.
+# What the file changes in /building: the "no floor list yet" note goes; a ledger item for this
+# repo that names none of its files shows under "no floor" instead of on F1; `where` and `lint`
+# work here; the overview may fold the repo into "Other repos" when it is in no project and has
+# nothing waiting, unknown or short of a passing check; and a page marked seen before the file
+# landed says the repo was "not found since your last look" until that page is marked seen again.
+# building and owed_repo are left out: both default to the folder name, as they do with no file.
+key = "resolve-mcp"  # the name other repos use for this one in /building
+
+[[floor]]
+id = "F1"
+name = "Whole repo"
+paths = ["**"]
+
+# What this repo relies on in other repos, for /building's Connections view. Display only: no
+# milestone, state, count or digest reads it. "from" is the other repo's key in its floors.toml.
+
+# evidence: server.py:123 refuses any manifest that is not "oside-davinci/v1", the package OSIDE's
+# app/api/export/davinci/route.ts:594 writes
+[[uses]]
+from = "oside:F11"
+what = "the oside-davinci/v1 export package"
+kind = "runtime"
+
+# evidence: handoff.py:945 load_look_cdl reads look-cdl.json (:958); its docstring (:946) names Depth Converter's
+# `depthc look-compare --emit-cdl` as the writer (Depth Converter depthc/cli.py:1356)
+[[uses]]
+from = "depth-converter"
+what = "look-cdl.json files"
+kind = "runtime"
